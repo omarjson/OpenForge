@@ -5,16 +5,36 @@ use openforge_core::Vec3;
 use openforge_io::{export_path, import_path, MeshData};
 use std::fs;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Monotonic counter so concurrent tests never share a directory, even within
+/// the same clock tick.
+static DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Create a fresh, guaranteed-unique temp directory.
+///
+/// A timestamp alone is not enough: on fast machines two parallel tests can
+/// read the same clock value, land on the same path, and then one test's
+/// cleanup deletes the other's files mid-read. We combine an atomic counter
+/// with a create-or-retry loop so `create_dir` (which fails if the directory
+/// already exists) is the source of truth for uniqueness.
 fn temp_dir() -> std::path::PathBuf {
-    let mut d = std::env::temp_dir();
-    // Unique per call so parallel tests don't clobber each other.
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    d.push(format!("openforge_test_{}_{}", std::process::id(), nanos));
-    fs::create_dir_all(&d).expect("create temp dir");
-    d
+    let base = std::env::temp_dir();
+    let pid = std::process::id();
+    for attempt in 0..u32::MAX {
+        let n = DIR_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = base.join(format!("openforge_test_{}_{}", pid, n));
+        // `create_dir` errors if it already exists — exactly the guarantee we
+        // want. Retry with the next counter value on any collision.
+        if fs::create_dir(&candidate).is_ok() {
+            return candidate;
+        }
+        let _ = attempt;
+    }
+    // Unreachable in practice; fall back to a create_all path.
+    let fallback = base.join(format!("openforge_test_{}_{}", pid, DIR_COUNTER.load(Ordering::Relaxed)));
+    fs::create_dir_all(&fallback).expect("create temp dir");
+    fallback
 }
 
 fn sample_mesh() -> Mesh {
