@@ -1,0 +1,16 @@
+[package]
+name = "openforge-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core scene graph, geometry, and editing model for OpenForge."
+
+[dependencies]
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "glam/serde"]

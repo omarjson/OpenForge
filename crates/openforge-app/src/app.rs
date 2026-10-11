@@ -1,0 +1,777 @@
+//! The OpenForge application: UI layout, viewport interaction, and the glue
+//! between egui and the openforge-core scene model.
+
+use crate::viewport::{self, Camera};
+use eframe::egui;
+use glam::Vec3;
+use openforge_core::mesh::{self, Mesh};
+use openforge_core::node::NodeKind;
+use openforge_core::scene::Scene;
+use openforge_core::selection::{SelectLevel, Selection};
+use openforge_core::tool::{Pointer, SelectTool, Tool, ToolContext, TransformMode, TransformTool};
+use openforge_core::undo::UndoStack;
+use openforge_core::NodeId;
+use std::path::PathBuf;
+
+/// Which tool is active.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ActiveTool {
+    Select,
+    Move,
+    Scale,
+    Rotate,
+}
+
+pub struct OpenForgeApp {
+    scene: Scene,
+    selection: Selection,
+    undo: UndoStack,
+    camera: Camera,
+    tool: ActiveTool,
+    /// Scene state captured at the start of the current edit (for undo).
+    edit_before: Option<Scene>,
+    status: String,
+    current_file: Option<PathBuf>,
+    /// Cached triangles for the frame being painted.
+    tris: Vec<viewport::Tri>,
+    /// Whether the viewport was interacted with this frame (drives repaint).
+    dirty: bool,
+    show_outliner: bool,
+    show_properties: bool,
+}
+
+impl OpenForgeApp {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Dark theme by default; egui respects the native theme otherwise.
+        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let mut scene = Scene::new();
+        // Seed with a cube so the viewport isn't empty on first run.
+        let cube = mesh::uv_sphere(1.0, 24, 16);
+        scene.create_mesh("Sphere", cube);
+        Self {
+            scene,
+            selection: Selection::new(),
+            undo: UndoStack::new(100),
+            camera: Camera::default(),
+            tool: ActiveTool::Select,
+            edit_before: None,
+            status: "Ready. Left-drag selects; middle-drag orbits; scroll zooms.".into(),
+            current_file: None,
+            tris: Vec::new(),
+            dirty: true,
+            show_outliner: true,
+            show_properties: true,
+        }
+    }
+
+    fn active_tool(&mut self) -> Box<dyn Tool> {
+        match self.tool {
+            ActiveTool::Select => Box::new(SelectTool { additive: false }),
+            ActiveTool::Move => Box::new(TransformTool::new(TransformMode::Move)),
+            ActiveTool::Scale => Box::new(TransformTool::new(TransformMode::Scale)),
+            ActiveTool::Rotate => Box::new(TransformTool::new(TransformMode::Rotate)),
+        }
+    }
+
+    /// Run a closure that may edit the scene, capturing undo state around it.
+    fn with_edit(&mut self, label: &str, f: impl FnOnce(&mut Self)) {
+        let before = self.scene.clone();
+        f(self);
+        // Only record if something actually changed.
+        if !self.scene.content_eq(&before) {
+            self.undo.push(label, before, self.scene.clone());
+            self.dirty = true;
+        }
+    }
+
+    // --- Commands -----------------------------------------------------------------
+
+    fn new_scene(&mut self) {
+        self.scene = Scene::new();
+        self.selection.clear();
+        self.undo.clear();
+        self.current_file = None;
+        self.status = "New scene.".into();
+        self.dirty = true;
+    }
+
+    fn create_primitive(&mut self, kind: &str) {
+        let m = match kind {
+            "Box" => primitive_box(1.0),
+            "Sphere" => mesh::uv_sphere(1.0, 24, 16),
+            "Cylinder" => primitive_cylinder(1.0, 2.0, 24),
+            "Cone" => primitive_cone(1.0, 2.0, 24),
+            "Plane" => primitive_plane(2.0, 2.0),
+            _ => primitive_box(1.0),
+        };
+        let name = format!("{} {}", kind, self.scene.node_count() + 1);
+        self.with_edit(&format!("Create {}", kind), |app| {
+            let id = app.scene.create_mesh(name, m);
+            app.selection.clear();
+            app.selection.select_node(id);
+        });
+        self.status = format!("Created {}.", kind);
+    }
+
+    fn delete_selected(&mut self) {
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if ids.is_empty() {
+            return;
+        }
+        self.with_edit("Delete", |app| {
+            for id in ids {
+                app.scene.remove_subtree(id);
+            }
+            app.selection.clear();
+        });
+        self.status = "Deleted selection.".into();
+    }
+
+    fn undo_edit(&mut self) {
+        if let Some(scene) = self.undo.undo() {
+            self.scene = scene;
+            self.selection.clear();
+            self.dirty = true;
+            self.status = format!(
+                "Undo{}",
+                self.undo.undo_label().map(|l| format!(": {}", l)).unwrap_or_default()
+            );
+        }
+    }
+
+    fn redo_edit(&mut self) {
+        if let Some(scene) = self.undo.redo() {
+            self.scene = scene;
+            self.selection.clear();
+            self.dirty = true;
+            self.status = format!(
+                "Redo{}",
+                self.undo.redo_label().map(|l| format!(": {}", l)).unwrap_or_default()
+            );
+        }
+    }
+
+    fn import_file(&mut self, path: PathBuf) {
+        match openforge_io::import_path(&path) {
+            Ok(loaded) => {
+                let count = loaded.mesh_count();
+                self.with_edit("Import", |app| {
+                    for md in loaded.meshes {
+                        app.scene.create_mesh(md.name, md.mesh);
+                    }
+                });
+                self.status = format!("Imported {} mesh(es) from {}.", count, path.display());
+            }
+            Err(e) => self.status = format!("Import failed: {}", e),
+        }
+    }
+
+    fn export_selected(&mut self, path: PathBuf) {
+        let Some(id) = self.selection.selected_nodes().next() else {
+            self.status = "Select a mesh node to export.".into();
+            return;
+        };
+        let Some(mesh) = self.scene.get(id).ok().and_then(|n| n.mesh()).cloned() else {
+            self.status = "Selected node has no mesh.".into();
+            return;
+        };
+        let name = self.scene.get(id).map(|n| n.name.clone()).unwrap_or_else(|_| "mesh".into());
+        let data = openforge_io::MeshData { name, mesh, material: None };
+        match openforge_io::export_path(&path, &data) {
+            Ok(()) => self.status = format!("Exported to {}.", path.display()),
+            Err(e) => self.status = format!("Export failed: {}", e),
+        }
+    }
+
+    // --- Viewport interaction ----------------------------------------------------
+
+    fn handle_viewport_input(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let response = ui.interact(rect, ui.id().with("viewport"), egui::Sense::click_and_drag());
+        let aspect = rect.width() / rect.height().max(1.0);
+
+        // Camera controls: middle mouse orbits, shift+middle pans, scroll zooms.
+        let middle = response.dragged_by(egui::PointerButton::Middle);
+        if middle {
+            let d = response.drag_delta();
+            if ui.input(|i| i.modifiers.shift) {
+                self.camera.pan(d.x, d.y);
+            } else {
+                self.camera.orbit(d.x, d.y);
+            }
+            self.dirty = true;
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.raw_scroll_delta.y);
+            if scroll.abs() > 0.0 {
+                self.camera.zoom(scroll * 0.01);
+                self.dirty = true;
+            }
+        }
+
+        // Build the active tool and a context borrowing the scene + selection.
+        let mut tool = self.active_tool();
+        let mut tctx = ToolContext {
+            scene: &mut self.scene,
+            selection: &mut self.selection,
+            drag: None,
+        };
+
+        // Primary (left) button drives the active tool.
+        let primary = response.dragged_by(egui::PointerButton::Primary)
+            || response.drag_started_by(egui::PointerButton::Primary);
+        let mut pending_undo: Option<(String, Scene)> = None;
+        if let Some(pos) = response.interact_pointer_pos() {
+            let ndc_x = ((pos.x - rect.left()) / rect.width()) * 2.0 - 1.0;
+            let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height()) * 2.0;
+            let ray = self.camera.ray_from_ndc(ndc_x, ndc_y, aspect);
+            let pointer = Pointer { ray, ndc: glam::Vec2::new(ndc_x, ndc_y) };
+
+            if response.drag_started_by(egui::PointerButton::Primary) {
+                if self.edit_before.is_none() {
+                    self.edit_before = Some(tctx.scene.clone());
+                }
+                tool.on_pointer_down(&mut tctx, &pointer);
+                self.dirty = true;
+            } else if response.dragged_by(egui::PointerButton::Primary) {
+                tool.on_pointer_move(&mut tctx, &pointer);
+                self.dirty = true;
+            } else if response.drag_stopped() && primary {
+                if let Some(outcome) = tool.on_pointer_up(&mut tctx, &pointer) {
+                    let before = self.edit_before.take();
+                    pending_undo = before.map(|b| (outcome.label, b));
+                    self.dirty = true;
+                }
+            } else if response.clicked() && matches!(self.tool, ActiveTool::Select) {
+                // Plain click with select tool.
+                tool.on_pointer_down(&mut tctx, &pointer);
+                tool.on_pointer_up(&mut tctx, &pointer);
+                self.dirty = true;
+            }
+        }
+        drop(tctx);
+
+        // Record the undo entry now that the scene borrow is released.
+        if let Some((label, before)) = pending_undo {
+            self.undo.push(label, before, self.scene.clone());
+        }
+
+        self.status = match self.tool {
+            ActiveTool::Select => {
+                format!("Select — {} object(s) selected.", self.selection.node_count())
+            }
+            ActiveTool::Move => "Move — drag to translate selection.".into(),
+            ActiveTool::Scale => "Scale — drag to scale selection.".into(),
+            ActiveTool::Rotate => "Rotate — drag to rotate selection.".into(),
+        };
+    }
+
+    fn paint_viewport(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+        let size = [rect.width(), rect.height()];
+        let aspect = size[0] / size[1].max(1.0);
+        let vp = self.camera.view_proj(aspect);
+        let painter = ui.painter_at(rect);
+
+        // Clip to the viewport.
+        painter.rect_filled(rect, 0.0, egui::Color32::from_gray(24));
+
+        // Ground grid.
+        self.paint_grid(&painter, vp, rect);
+
+        // Collect and depth-sort triangles (painter's algorithm).
+        self.tris = viewport::collect_triangles(&mut self.scene, &self.selection);
+        let cam = self.camera.eye();
+        let mut order: Vec<(f32, usize)> = Vec::with_capacity(self.tris.len());
+        for (i, t) in self.tris.iter().enumerate() {
+            let centroid = (t.v[0].pos + t.v[1].pos + t.v[2].pos) / 3.0;
+            order.push((centroid.distance(cam), i));
+        }
+        // Draw far-to-near.
+        order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        let light = Vec3::new(0.4, 0.8, 0.5).normalize();
+        for (_, i) in order {
+            let t = &self.tris[i];
+            let mut pts: Vec<egui::Pos2> = Vec::with_capacity(3);
+            let mut behind = false;
+            for v in &t.v {
+                match viewport::project(vp, v.pos, size) {
+                    Some((x, y, _)) => pts.push(egui::pos2(rect.left() + x, rect.top() + y)),
+                    None => {
+                        behind = true;
+                        break;
+                    }
+                }
+            }
+            if behind || pts.len() < 3 {
+                continue;
+            }
+            let shade = (t.v[0].normal.dot(light).clamp(-1.0, 1.0) * 0.5 + 0.5).clamp(0.15, 1.0);
+            let base = if t.selected {
+                egui::Color32::from_rgb(80, 170, 255)
+            } else {
+                egui::Color32::from_rgb(170, 170, 178)
+            };
+            let (r, g, b) = (base.r() as f32, base.g() as f32, base.b() as f32);
+            let color = egui::Color32::from_rgb(
+                (r * shade) as u8,
+                (g * shade) as u8,
+                (b * shade) as u8,
+            );
+            let shape = egui::Shape::convex_polygon(pts, color, egui::Stroke::new(0.5_f32, color.gamma_multiply(0.6)));
+            painter.add(shape);
+        }
+
+        // Overlay label.
+        let label = format!(
+            "Perspective  |  {} tris  |  {} selected",
+            self.tris.len(),
+            self.selection.node_count()
+        );
+        painter.text(
+            rect.left_top() + egui::vec2(8.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::monospace(12.0),
+            egui::Color32::from_gray(200),
+        );
+    }
+
+    fn paint_grid(&self, painter: &egui::Painter, vp: glam::Mat4, rect: egui::Rect) {
+        let size = [rect.width(), rect.height()];
+        let half = 10;
+        let step = 1.0f32;
+        let grid_color = egui::Color32::from_gray(45);
+        let axis_x = egui::Color32::from_rgb(180, 70, 70);
+        let axis_z = egui::Color32::from_rgb(70, 120, 180);
+        for i in -half..=half {
+            let f = i as f32 * step;
+            // Line parallel to X (varying z).
+            if let (Some(a), Some(b)) = (
+                viewport::project(vp, Vec3::new(-half as f32, 0.0, f), size),
+                viewport::project(vp, Vec3::new(half as f32, 0.0, f), size),
+            ) {
+                let color = if i == 0 { axis_z } else { grid_color };
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + a.0, rect.top() + a.1),
+                        egui::pos2(rect.left() + b.0, rect.top() + b.1),
+                    ],
+                    egui::Stroke::new(if i == 0 { 1.5_f32 } else { 1.0_f32 }, color),
+                );
+            }
+            // Line parallel to Z (varying x).
+            if let (Some(a), Some(b)) = (
+                viewport::project(vp, Vec3::new(f, 0.0, -half as f32), size),
+                viewport::project(vp, Vec3::new(f, 0.0, half as f32), size),
+            ) {
+                let color = if i == 0 { axis_x } else { grid_color };
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + a.0, rect.top() + a.1),
+                        egui::pos2(rect.left() + b.0, rect.top() + b.1),
+                    ],
+                    egui::Stroke::new(if i == 0 { 1.5_f32 } else { 1.0_f32 }, color),
+                );
+            }
+        }
+    }
+}
+
+impl eframe::App for OpenForgeApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.handle_menu(ctx);
+        self.handle_shortcuts(ctx);
+        self.handle_top_toolbar(ctx);
+        self.handle_side_panels(ctx);
+        self.handle_central_viewport(ctx);
+        self.handle_status_bar(ctx);
+        if self.dirty {
+            ctx.request_repaint();
+            self.dirty = false;
+        }
+    }
+}
+
+impl OpenForgeApp {
+    fn handle_menu(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("menu").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("New").clicked() {
+                        self.new_scene();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Import…").clicked() {
+                        if let Some(path) = rfd_pick_file() {
+                            self.import_file(path);
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Export selected…").clicked() {
+                        if let Some(path) = rfd_save_file() {
+                            self.export_selected(path);
+                        }
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    let can_undo = self.undo.can_undo();
+                    let can_redo = self.undo.can_redo();
+                    if ui.add_enabled(can_undo, egui::Button::new("Undo")).clicked() {
+                        self.undo_edit();
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(can_redo, egui::Button::new("Redo")).clicked() {
+                        self.redo_edit();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(self.selection.node_count() > 0, egui::Button::new("Delete"))
+                        .clicked()
+                    {
+                        self.delete_selected();
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Create", |ui| {
+                    for kind in ["Box", "Sphere", "Cylinder", "Cone", "Plane"] {
+                        if ui.button(kind).clicked() {
+                            self.create_primitive(kind);
+                            ui.close_menu();
+                        }
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    if ui.button("Frame All (F)").clicked() {
+                        self.frame_all();
+                        ui.close_menu();
+                    }
+                    if ui.button("Reset Camera").clicked() {
+                        self.camera = Camera::default();
+                        self.dirty = true;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Help", |ui| {
+                    ui.label("OpenForge — clean-room open-source 3D modeler.");
+                    ui.label("A from-scratch reimplementation of a node/scene editing model.");
+                });
+            });
+        });
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+            self.undo_edit();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::Z)) {
+            self.redo_edit();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.delete_selected();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F)) {
+            self.frame_all();
+        }
+        // Tool hotkeys.
+        if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
+            self.tool = ActiveTool::Select;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::W)) {
+            self.tool = ActiveTool::Move;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::E)) {
+            self.tool = ActiveTool::Scale;
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
+            self.tool = ActiveTool::Rotate;
+        }
+    }
+
+    fn handle_top_toolbar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Tools:");
+                tool_button(ui, &mut self.tool, ActiveTool::Select, "Select (Q)");
+                tool_button(ui, &mut self.tool, ActiveTool::Move, "Move (W)");
+                tool_button(ui, &mut self.tool, ActiveTool::Scale, "Scale (E)");
+                tool_button(ui, &mut self.tool, ActiveTool::Rotate, "Rotate (R)");
+                ui.separator();
+                ui.label("Level:");
+                ui.selectable_value(&mut self.selection.level, SelectLevel::Object, "Object");
+                ui.selectable_value(&mut self.selection.level, SelectLevel::Vertex, "Vertex");
+                ui.selectable_value(&mut self.selection.level, SelectLevel::Face, "Face");
+                ui.separator();
+                if ui.button("Frame All").clicked() {
+                    self.frame_all();
+                }
+            });
+        });
+    }
+
+    fn handle_side_panels(&mut self, ctx: &egui::Context) {
+        // Outliner on the left.
+        if self.show_outliner {
+            egui::SidePanel::left("outliner")
+                .default_width(220.0)
+                .show(ctx, |ui| {
+                    ui.heading("Scene");
+                    ui.separator();
+                    let roots = self.scene.roots().to_vec();
+                    for id in roots {
+                        self.outliner_node(ui, id);
+                    }
+                });
+        }
+        // Properties on the right.
+        if self.show_properties {
+            egui::SidePanel::right("properties")
+                .default_width(260.0)
+                .show(ctx, |ui| {
+                    ui.heading("Properties");
+                    ui.separator();
+                    self.properties_panel(ui);
+                });
+        }
+    }
+
+    fn outliner_node(&mut self, ui: &mut egui::Ui, id: NodeId) {
+        // Snapshot the node's display data so we don't hold a borrow on the
+        // scene while recursively painting children.
+        let (name, icon, has_children, children) = match self.scene.get(id) {
+            Ok(node) => {
+                let icon = match &node.kind {
+                    NodeKind::Group => "[] ",
+                    NodeKind::Dummy => "() ",
+                    NodeKind::Mesh { .. } => "/\\ ",
+                };
+                (node.name.clone(), icon, !node.children.is_empty(), node.children.clone())
+            }
+            Err(_) => return,
+        };
+        let selected = self.selection.is_node_selected(id);
+
+        ui.push_id(id.0, |ui| {
+            let resp = ui.selectable_label(selected, format!("{}{}", icon, name));
+            if resp.clicked() {
+                self.selection.clear();
+                self.selection.select_node(id);
+            }
+            if has_children {
+                ui.indent(id.0, |ui| {
+                    for child in children {
+                        self.outliner_node(ui, child);
+                    }
+                });
+            }
+        });
+    }
+
+    fn properties_panel(&mut self, ui: &mut egui::Ui) {
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if ids.is_empty() {
+            ui.label("Nothing selected.");
+            ui.separator();
+            ui.label(format!("Nodes: {}", self.scene.node_count()));
+            let meshes = self.scene.mesh_names().len();
+            ui.label(format!("Mesh nodes: {}", meshes));
+            return;
+        }
+        for &id in &ids {
+            let Ok(node) = self.scene.get(id) else { continue };
+            ui.label(format!("Node: {}", node.name));
+            ui.label(format!("Id: {}", id.0));
+            if let NodeKind::Mesh { mesh, .. } = &node.kind {
+                ui.label(format!("Vertices: {}", mesh.vertex_count()));
+                ui.label(format!("Faces: {}", mesh.face_count()));
+                ui.label(format!("Triangles: {}", mesh.triangulated_count()));
+            }
+            ui.separator();
+        }
+
+        // Edit the transform of a single selected node.
+        if ids.len() == 1 {
+            let id = ids[0];
+            let before = self.scene.clone();
+            let mut changed = false;
+            if let Ok(node) = self.scene.get_mut(id) {
+                ui.label("Transform");
+                let mut t = node.transform.translation;
+                let resp = ui.add(egui::DragValue::new(&mut t.x).prefix("X ").speed(0.05))
+                    .changed()
+                    | ui.add(egui::DragValue::new(&mut t.y).prefix("Y ").speed(0.05)).changed()
+                    | ui.add(egui::DragValue::new(&mut t.z).prefix("Z ").speed(0.05)).changed();
+                if resp {
+                    node.transform.translation = t;
+                    changed = true;
+                }
+            }
+            if changed {
+                self.undo.push("Move", before, self.scene.clone());
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn handle_central_viewport(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none())
+            .show(ctx, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                self.handle_viewport_input(ui, rect);
+                self.paint_viewport(ui, rect);
+            });
+    }
+
+    fn handle_status_bar(&self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(&self.status);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let file = self
+                        .current_file
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "untitled".into());
+                    ui.label(file);
+                });
+            });
+        });
+    }
+
+    fn frame_all(&mut self) {
+        let ids = self.scene.all_ids();
+        let b = self.scene.world_bounds(&ids);
+        if !b.is_empty() {
+            self.camera.target = b.center();
+            let radius = b.size().length() * 0.5;
+            self.camera.distance = (radius * 2.5).clamp(1.0, 500.0);
+            self.dirty = true;
+        }
+    }
+}
+
+fn tool_button(ui: &mut egui::Ui, current: &mut ActiveTool, value: ActiveTool, label: &str) {
+    let selected = *current == value;
+    if ui.selectable_label(selected, label).clicked() {
+        *current = value;
+    }
+}
+
+// --- Primitive builders ---------------------------------------------------------
+
+fn primitive_box(size: f32) -> Mesh {
+    let h = size * 0.5;
+    let mut m = Mesh::new();
+    // 8 corners.
+    let v = [
+        Vec3::new(-h, -h, -h),
+        Vec3::new(h, -h, -h),
+        Vec3::new(h, h, -h),
+        Vec3::new(-h, h, -h),
+        Vec3::new(-h, -h, h),
+        Vec3::new(h, -h, h),
+        Vec3::new(h, h, h),
+        Vec3::new(-h, h, h),
+    ];
+    for p in v {
+        m.add_vertex(p);
+    }
+    let quads = [
+        [0, 1, 2, 3], // back
+        [4, 7, 6, 5], // front
+        [0, 4, 5, 1], // bottom
+        [3, 2, 6, 7], // top
+        [0, 3, 7, 4], // left
+        [1, 5, 6, 2], // right
+    ];
+    for q in quads {
+        m.add_face(&q);
+    }
+    m.compute_flat_normals();
+    m
+}
+
+fn primitive_plane(w: f32, d: f32) -> Mesh {
+    let mut m = Mesh::new();
+    m.add_vertex(Vec3::new(-w * 0.5, 0.0, -d * 0.5));
+    m.add_vertex(Vec3::new(w * 0.5, 0.0, -d * 0.5));
+    m.add_vertex(Vec3::new(w * 0.5, 0.0, d * 0.5));
+    m.add_vertex(Vec3::new(-w * 0.5, 0.0, d * 0.5));
+    m.add_face(&[0, 1, 2, 3]);
+    m.compute_flat_normals();
+    m
+}
+
+fn primitive_cylinder(radius: f32, height: f32, segments: u32) -> Mesh {
+    let mut m = Mesh::new();
+    let segments = segments.max(3);
+    let h = height * 0.5;
+    // Side vertices (two rings).
+    for ring_y in [-h, h] {
+        for s in 0..segments {
+            let a = (s as f32 / segments as f32) * std::f32::consts::TAU;
+            m.add_vertex(Vec3::new(a.cos() * radius, ring_y, a.sin() * radius));
+        }
+    }
+    // Side quads.
+    for s in 0..segments {
+        let s2 = (s + 1) % segments;
+        let a = s;
+        let b = s2;
+        let c = segments + s2;
+        let d = segments + s;
+        m.add_face(&[a, b, c, d]);
+    }
+    // Caps as triangle fans.
+    let top_center = m.add_vertex(Vec3::new(0.0, h, 0.0));
+    let bot_center = m.add_vertex(Vec3::new(0.0, -h, 0.0));
+    for s in 0..segments {
+        let s2 = (s + 1) % segments;
+        m.add_face(&[top_center, segments + s, segments + s2]);
+        m.add_face(&[bot_center, s2, s]);
+    }
+    m.compute_flat_normals();
+    m
+}
+
+fn primitive_cone(radius: f32, height: f32, segments: u32) -> Mesh {
+    let mut m = Mesh::new();
+    let segments = segments.max(3);
+    let h = height * 0.5;
+    let apex = m.add_vertex(Vec3::new(0.0, h, 0.0));
+    let base_start = m.vertex_count() as u32;
+    for s in 0..segments {
+        let a = (s as f32 / segments as f32) * std::f32::consts::TAU;
+        m.add_vertex(Vec3::new(a.cos() * radius, -h, a.sin() * radius));
+    }
+    let base_center = m.add_vertex(Vec3::new(0.0, -h, 0.0));
+    for s in 0..segments {
+        let s2 = (s + 1) % segments;
+        m.add_face(&[apex, base_start + s, base_start + s2]);
+        m.add_face(&[base_center, base_start + s2, base_start + s]);
+    }
+    m.compute_flat_normals();
+    m
+}
+
+// --- File dialogs (rfd) ---------------------------------------------------------
+
+fn rfd_pick_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("3D models", &["obj", "glb", "gltf", "ply", "stl"])
+        .pick_file()
+}
+
+fn rfd_save_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("3D models", &["obj", "glb", "ply", "stl"])
+        .set_file_name("export.obj")
+        .save_file()
+}

@@ -1,0 +1,24 @@
+[package]
+name = "openforge-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The OpenForge desktop modeling application (winit + wgpu + egui)."
+
+[[bin]]
+name = "openforge"
+path = "src/main.rs"
+
+[dependencies]
+openforge-core = { path = "../openforge-core" }
+openforge-io = { path = "../openforge-io" }
+glam.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+# GUI + rendering. eframe bundles winit (windowing), wgpu (GPU) and egui
+# (immediate-mode UI) with versions known to work together, giving us
+# Windows/macOS/Linux support from one codebase.
+eframe = "0.29"
+egui = "0.29"
+rfd = "0.15"

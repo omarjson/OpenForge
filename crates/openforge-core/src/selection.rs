@@ -1,0 +1,109 @@
+//! Selection state: which nodes and which sub-elements are selected.
+
+use crate::NodeId;
+use std::collections::{BTreeSet, HashMap};
+
+/// The granularity the user is selecting at.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SelectLevel {
+    Object,
+    Vertex,
+    Edge,
+    #[default]
+    Face,
+}
+
+/// Element selections keyed by owning mesh node.
+#[derive(Clone, Debug, Default)]
+pub struct Selection {
+    pub level: SelectLevel,
+    nodes: BTreeSet<NodeId>,
+    /// Per-node selected element indices (vertex/edge/face depending on level).
+    elements: HashMap<NodeId, BTreeSet<u32>>,
+}
+
+impl Selection {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn clear(&mut self) {
+        self.nodes.clear();
+        self.elements.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty() && self.elements.is_empty()
+    }
+
+    pub fn selected_nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
+        self.nodes.iter().copied()
+    }
+
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn select_node(&mut self, id: NodeId) {
+        self.nodes.insert(id);
+    }
+
+    pub fn deselect_node(&mut self, id: NodeId) {
+        self.nodes.remove(&id);
+        self.elements.remove(&id);
+    }
+
+    pub fn toggle_node(&mut self, id: NodeId) {
+        if !self.nodes.remove(&id) {
+            self.nodes.insert(id);
+        } else {
+            self.elements.remove(&id);
+        }
+    }
+
+    pub fn is_node_selected(&self, id: NodeId) -> bool {
+        self.nodes.contains(&id)
+    }
+
+    pub fn select_elements(&mut self, id: NodeId, idx: impl IntoIterator<Item = u32>) {
+        self.nodes.insert(id);
+        self.elements.entry(id).or_default().extend(idx);
+    }
+
+    pub fn selected_elements(&self, id: NodeId) -> Option<&BTreeSet<u32>> {
+        self.elements.get(&id)
+    }
+
+    pub fn element_count(&self, id: NodeId) -> usize {
+        self.elements.get(&id).map(|s| s.len()).unwrap_or(0)
+    }
+
+    pub fn total_element_count(&self) -> usize {
+        self.elements.values().map(|s| s.len()).sum()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_node() {
+        let mut s = Selection::new();
+        let id = NodeId(1);
+        s.toggle_node(id);
+        assert!(s.is_node_selected(id));
+        s.toggle_node(id);
+        assert!(!s.is_node_selected(id));
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn element_selection() {
+        let mut s = Selection::new();
+        let id = NodeId(7);
+        s.select_elements(id, [0u32, 2, 4]);
+        assert_eq!(s.element_count(id), 3);
+        assert_eq!(s.total_element_count(), 3);
+    }
+}
