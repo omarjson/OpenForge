@@ -50,6 +50,20 @@ cargo run -p openforge-app --release
 cargo test
 ```
 
+### Packaging an installable app
+
+`cargo build` produces a bare binary. To get a real, double-clickable app
+bundle, use the packaging script:
+
+```bash
+./scripts/build-app.sh --release
+```
+
+- **macOS** → `dist/OpenForge.app` (ad-hoc signed). Install with
+  `cp -R dist/OpenForge.app /Applications/`, or launch with `open dist/OpenForge.app`.
+- **Windows** → `dist/OpenForge.exe` (wrap in an installer such as Inno Setup or MSIX).
+- **Linux** → `dist/OpenForge` (package as an AppImage or `.deb`).
+
 ### Cross-platform targets
 
 The `openforge-core` and `openforge-io` crates are pure Rust and cross-compile
