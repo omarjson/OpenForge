@@ -1,0 +1,10 @@
+# Third-party code-quality notices.
+#
+# wgpu's Metal backend pulls in `block v0.1.6` (via `objc`), which Cargo lists
+# in its "future-incompat" report on macOS. That report is printed as a
+# `warning:` line even though it is about a dependency, not about OpenForge
+# source, and it would break the "zero warnings" bar in HANDOFF §5/§6.
+# Silencing it keeps that bar meaningful for our own code; run
+# `cargo report future-incompatibilities` to see the dependency notice again.
+[future-incompat-report]
+frequency = "never"

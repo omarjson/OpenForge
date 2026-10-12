@@ -1,8 +1,10 @@
 //! The OpenForge application: UI layout, viewport interaction, and the glue
 //! between egui and the openforge-core scene model.
 
+use crate::gpu_viewport::{self, GpuViewport};
 use crate::viewport::{self, Camera};
 use eframe::egui;
+use eframe::egui_wgpu::RenderState;
 use glam::Vec3;
 use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
@@ -12,6 +14,7 @@ use openforge_core::tool::{Pointer, SelectTool, Tool, ToolContext, TransformMode
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
+use openforge_render::FrameStats;
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use std::path::PathBuf;
 
@@ -34,8 +37,10 @@ pub struct OpenForgeApp {
     edit_before: Option<Scene>,
     status: String,
     current_file: Option<PathBuf>,
-    /// Cached triangles for the frame being painted.
+    /// Cached triangles for the frame being painted (CPU viewport only).
     tris: Vec<viewport::Tri>,
+    /// The wgpu viewport, when eframe is running the wgpu backend.
+    gpu: Option<GpuViewport>,
     /// Whether the viewport was interacted with this frame (drives repaint).
     dirty: bool,
     show_outliner: bool,
@@ -63,6 +68,10 @@ impl OpenForgeApp {
         // Seed with a cube so the viewport isn't empty on first run.
         let cube = mesh::uv_sphere(1.0, 24, 16);
         scene.create_mesh("Sphere", cube);
+        // eframe hands us a live wgpu device when it runs the wgpu backend;
+        // otherwise `gpu` stays `None` and the CPU painter takes over.
+        let gpu = cc.wgpu_render_state.as_ref().map(GpuViewport::new);
+        let backend = if gpu.is_some() { "wgpu" } else { "CPU" };
         Self {
             scene,
             selection: Selection::new(),
@@ -70,9 +79,12 @@ impl OpenForgeApp {
             camera: Camera::default(),
             tool: ActiveTool::Select,
             edit_before: None,
-            status: "Ready. Left-drag selects; middle-drag orbits; scroll zooms. Face level: X extrude, I inset, O poke, S subdivide, Del delete.".into(),
+            status: format!(
+                "{backend} viewport. Left-drag selects; middle-drag orbits; scroll zooms. Face level: X extrude, I inset, O poke, S subdivide, Del delete."
+            ),
             current_file: None,
             tris: Vec::new(),
+            gpu,
             dirty: true,
             show_outliner: true,
             show_properties: true,
@@ -786,30 +798,7 @@ impl OpenForgeApp {
         }
 
         // Overlay selected vertices as small dots (vertex level editing aid).
-        if self.selection.level == SelectLevel::Vertex {
-            let dot = 3.0f32;
-            for id in self.selection.selected_nodes() {
-                let Ok(world) = self.scene.world_matrix(id) else { continue };
-                let selected = self.selection.selected_elements(id).cloned();
-                let Ok(node) = self.scene.get(id) else { continue };
-                let Some(mesh) = node.mesh() else { continue };
-                for (vi, p) in mesh.positions.iter().enumerate() {
-                    let wp = world.transform_point3(*p);
-                    let Some((x, y, _)) = viewport::project(vp, wp, size) else { continue };
-                    let is_sel = selected
-                        .as_ref()
-                        .map(|s| s.contains(&(vi as u32)))
-                        .unwrap_or(false);
-                    let center = egui::pos2(rect.left() + x, rect.top() + y);
-                    let (rad, color) = if is_sel {
-                        (dot + 1.0, egui::Color32::from_rgb(255, 170, 60))
-                    } else {
-                        (dot, egui::Color32::from_rgb(120, 200, 255))
-                    };
-                    painter.circle_filled(center, rad, color);
-                }
-            }
-        }
+        self.paint_vertex_dots(&painter, rect);
 
         // Overlay label.
         let label = format!(
@@ -868,12 +857,12 @@ impl OpenForgeApp {
 }
 
 impl eframe::App for OpenForgeApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.handle_menu(ctx);
         self.handle_shortcuts(ctx);
         self.handle_top_toolbar(ctx);
         self.handle_side_panels(ctx);
-        self.handle_central_viewport(ctx);
+        self.handle_central_viewport(ctx, frame.wgpu_render_state());
         self.handle_status_bar(ctx);
         if self.dirty {
             ctx.request_repaint();
@@ -1332,14 +1321,107 @@ impl OpenForgeApp {
         }
     }
 
-    fn handle_central_viewport(&mut self, ctx: &egui::Context) {
+    fn handle_central_viewport(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
+                if rect.width() < 1.0 || rect.height() < 1.0 {
+                    return;
+                }
                 self.handle_viewport_input(ui, rect);
-                self.paint_viewport(ui, rect);
+
+                // Render offscreen with wgpu when a device is available, and
+                // fall back to the CPU painter when it is not. Both paths show
+                // the same scene through the same camera state, so the only
+                // difference is shading quality and depth correctness.
+                let rendered = match (render_state, self.gpu.as_mut()) {
+                    (Some(state), Some(gpu)) => {
+                        let scale = ui.ctx().pixels_per_point();
+                        let size = [rect.width() * scale, rect.height() * scale];
+                        let camera = gpu_viewport::orbit_camera(&self.camera);
+                        let time = ui.input(|i| i.time) as f32;
+                        Some(gpu.render(state, size, &mut self.scene, &self.selection, &camera, time))
+                    }
+                    _ => None,
+                };
+
+                match rendered {
+                    Some((texture_id, stats)) => {
+                        self.paint_gpu_viewport(ui, rect, texture_id, stats)
+                    }
+                    None => self.paint_viewport(ui, rect),
+                }
             });
+    }
+
+    /// Present the wgpu-rendered image and draw the CPU overlays on top of it:
+    /// the vertex-level dots and the stats label.
+    fn paint_gpu_viewport(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        texture_id: egui::TextureId,
+        stats: FrameStats,
+    ) {
+        let painter = ui.painter_at(rect);
+        // The offscreen image covers the whole viewport. egui samples user
+        // textures with normalized uv and a top-left origin, which is exactly
+        // how wgpu's targets are laid out, so no flip is needed.
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(texture_id, rect, uv, egui::Color32::WHITE);
+
+        self.paint_vertex_dots(&painter, rect);
+
+        let label = format!(
+            "Perspective  |  wgpu  |  {} tris  |  {} draws  |  {} selected",
+            stats.indices / 3,
+            stats.draws,
+            self.selection.node_count()
+        );
+        painter.text(
+            rect.left_top() + egui::vec2(8.0, 8.0),
+            egui::Align2::LEFT_TOP,
+            label,
+            egui::FontId::monospace(12.0),
+            egui::Color32::from_gray(200),
+        );
+    }
+
+    /// Vertex-level editing aid: a dot per vertex of each selected mesh,
+    /// highlighted when that vertex is part of the selection.
+    ///
+    /// Shared by both viewports — each projects to the same normalized device
+    /// coordinates, so the dots land in the same place either way.
+    fn paint_vertex_dots(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.selection.level != SelectLevel::Vertex {
+            return;
+        }
+        let dot = 3.0f32;
+        let size = [rect.width(), rect.height()];
+        let aspect = size[0] / size[1].max(1.0);
+        let vp = self.camera.view_proj(aspect);
+        for id in self.selection.selected_nodes() {
+            let Ok(world) = self.scene.world_matrix(id) else { continue };
+            let selected = self.selection.selected_elements(id).cloned();
+            let Ok(node) = self.scene.get(id) else { continue };
+            let Some(mesh) = node.mesh() else { continue };
+            for (vi, p) in mesh.positions.iter().enumerate() {
+                let wp = world.transform_point3(*p);
+                let Some((x, y, _)) = viewport::project(vp, wp, size) else { continue };
+                let is_sel = selected
+                    .as_ref()
+                    .map(|s| s.contains(&(vi as u32)))
+                    .unwrap_or(false);
+                let center = egui::pos2(rect.left() + x, rect.top() + y);
+                let (rad, color) = if is_sel {
+                    (dot + 1.0, egui::Color32::from_rgb(255, 170, 60))
+                } else {
+                    (dot, egui::Color32::from_rgb(120, 200, 255))
+                };
+                painter.circle_filled(center, rad, color);
+            }
+        }
     }
 
     fn handle_status_bar(&self, ctx: &egui::Context) {

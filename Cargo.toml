@@ -24,6 +24,10 @@ description = "A clean-room, cross-platform open-source 3D modeling application.
 
 [workspace.dependencies]
 glam = "0.29"
+# GPU viewport. Kept in the workspace so eframe (which re-exports the same
+# wgpu) and openforge-render always resolve to one wgpu instance; mismatching
+# versions would make their `wgpu` types incompatible.
+wgpu = "22"
 thiserror = "2"
 bytemuck = { version = "1", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

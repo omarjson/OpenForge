@@ -16,13 +16,20 @@ openforge-materials = { path = "../openforge-materials" }
 openforge-ops = { path = "../openforge-ops" }
 openforge-boolean = { path = "../openforge-boolean" }
 openforge-rig = { path = "../openforge-rig" }
+# The GPU viewport backend: camera/uniform/vertex plumbing plus the actual
+# wgpu renderer behind the `gpu` feature.
+openforge-render = { path = "../openforge-render", features = ["gpu"] }
 glam.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
 # GUI + rendering. eframe bundles winit (windowing), wgpu (GPU) and egui
 # (immediate-mode UI) with versions known to work together, giving us
-# Windows/macOS/Linux support from one codebase.
-eframe = "0.29"
+# Windows/macOS/Linux support from one codebase. The `wgpu` feature selects
+# eframe's GPU backend, which the viewport renders through.
+eframe = { version = "0.29", features = ["wgpu"] }
 egui = "0.29"
 rfd = "0.15"
+# Same wgpu instance eframe uses (pinned once in the workspace), so the device
+# and texture types handed to openforge-render line up exactly.
+wgpu.workspace = true

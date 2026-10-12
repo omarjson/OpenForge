@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn turtle_draws_one_segment_per_F() {
+    fn turtle_draws_one_segment_per_forward_command() {
         let segs = turtle_segments("F", 90.0, 1.0);
         assert_eq!(segs.len(), 1);
         assert_eq!(segs[0].0, Vec3::ZERO);

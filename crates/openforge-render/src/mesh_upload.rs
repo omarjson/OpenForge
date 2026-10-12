@@ -44,6 +44,14 @@ impl MeshBuffers {
         b
     }
 
+    /// Append `other`'s geometry to this buffer, rebasing its indices so the
+    /// merged buffer stays drawable as one `draw_indexed` call.
+    pub fn append(&mut self, other: &MeshBuffers) {
+        let base = self.vertices.len() as u32;
+        self.vertices.extend_from_slice(&other.vertices);
+        self.indices.extend(other.indices.iter().map(|i| i + base));
+    }
+
     /// Build GPU geometry for `mesh`, transformed into world space by
     /// `world` and colored with `base_color`.
     ///
@@ -257,6 +265,37 @@ mod tests {
         assert!(buf.is_empty());
         assert!(buf.vertices.is_empty());
         assert!(buf.bounds().is_empty());
+    }
+
+    #[test]
+    fn append_rebases_indices_and_keeps_geometry() {
+        let a = MeshBuffers::build(&unit_quad(), Mat4::IDENTITY, DEFAULT_BASE_COLOR);
+        let b = MeshBuffers::build(&unit_quad(), Mat4::from_translation(Vec3::new(3.0, 0.0, 0.0)), SELECTION_COLOR);
+        let mut merged = MeshBuffers::default();
+        merged.append(&a);
+        merged.append(&b);
+        assert_eq!(merged.vertices.len(), a.vertices.len() + b.vertices.len());
+        assert_eq!(merged.indices.len(), a.indices.len() + b.indices.len());
+        // The first quad's indices are untouched, the second's are offset by
+        // 4 (the quad's vertex count) and stay in range.
+        assert_eq!(&merged.indices[..6], &a.indices[..]);
+        assert!(merged.indices[6..].iter().all(|&i| i >= 4));
+        assert!(merged.indices.iter().all(|&i| (i as usize) < merged.vertices.len()));
+        // Vertex colors survive the merge.
+        assert_eq!(merged.vertices[4].color, SELECTION_COLOR);
+        assert!(!merged.is_empty());
+    }
+
+    #[test]
+    fn append_into_empty_buffer_is_a_copy() {
+        let a = MeshBuffers::build(&unit_quad(), Mat4::IDENTITY, DEFAULT_BASE_COLOR);
+        let mut merged = MeshBuffers::default();
+        merged.append(&a);
+        assert_eq!(merged, a);
+        // Appending nothing changes nothing.
+        let before = merged.clone();
+        merged.append(&MeshBuffers::default());
+        assert_eq!(merged, before);
     }
 
     #[test]

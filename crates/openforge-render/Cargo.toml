@@ -5,11 +5,22 @@ edition.workspace = true
 license.workspace = true
 description = "GPU (wgpu) viewport renderer backend for OpenForge."
 
+[features]
+default = []
+# The actual wgpu backend (pipelines, offscreen targets, draw passes). Off by
+# default so the crate — and its camera/geometry unit tests — stay buildable
+# and fast without pulling in wgpu, naga and the graphics backends.
+gpu = ["dep:wgpu"]
+
 [dependencies]
 openforge-core = { path = "../openforge-core" }
 glam.workspace = true
 bytemuck.workspace = true
 log.workspace = true
-# Note: wgpu/winit/egui are intentionally NOT added here yet. The renderer is
-# developed against openforge-core math first; the GPU integration layer is
-# wired in by the app once the interface is stable.
+wgpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Blocks on the async wgpu device/adapter futures in the headless GPU test.
+pollster = "0.4"
+# Validates the WGSL shader sources in a test that needs no GPU at all.
+naga = { version = "22", features = ["wgsl-in"] }
