@@ -12,6 +12,7 @@ use openforge_core::tool::{Pointer, SelectTool, Tool, ToolContext, TransformMode
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
+use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use std::path::PathBuf;
 
 /// Which tool is active.
@@ -43,6 +44,15 @@ pub struct OpenForgeApp {
     deform_axis: usize,
     /// Deformer amount: taper factor, or twist/bend angle in radians.
     deform_amount: f32,
+    /// Rig state for the active skinned mesh.
+    rig_skeleton: Option<Skeleton>,
+    rig_weights: Option<SkinWeights>,
+    /// Bind (rest) pose vertex positions, skinned from on every pose change.
+    rig_bind: Vec<Vec3>,
+    rig_node: Option<NodeId>,
+    rig_bone: usize,
+    rig_angle: f32,
+    rig_bones: usize,
 }
 
 impl OpenForgeApp {
@@ -68,6 +78,13 @@ impl OpenForgeApp {
             show_properties: true,
             deform_axis: 1,
             deform_amount: 0.5,
+            rig_skeleton: None,
+            rig_weights: None,
+            rig_bind: Vec::new(),
+            rig_node: None,
+            rig_bone: 0,
+            rig_angle: 0.0,
+            rig_bones: 4,
         }
     }
 
@@ -390,6 +407,149 @@ impl OpenForgeApp {
             }
             Err(e) => self.status = format!("Boolean failed: {}", e),
         }
+    }
+
+    // --- Rigging -----------------------------------------------------------------
+
+    /// Build a vertical bone chain spanning the active mesh and auto-weight its
+    /// vertices by height (smooth two-bone blend at each joint).
+    fn rig_create(&mut self) {
+        let Some(id) = self.active_mesh_node() else {
+            self.status = "Select a mesh to rig.".into();
+            return;
+        };
+        let Some(mesh) = self.scene.get(id).ok().and_then(|n| n.mesh()) else {
+            self.status = "Could not read the mesh.".into();
+            return;
+        };
+        let positions = mesh.positions.clone();
+        if positions.is_empty() {
+            self.status = "Mesh has no vertices.".into();
+            return;
+        }
+        let (mut min_y, mut max_y) = (f32::INFINITY, f32::NEG_INFINITY);
+        for p in &positions {
+            min_y = min_y.min(p.y);
+            max_y = max_y.max(p.y);
+        }
+        if !min_y.is_finite() || !max_y.is_finite() {
+            min_y = 0.0;
+            max_y = 0.0;
+        }
+        let bones = self.rig_bones.max(1);
+        let span = (max_y - min_y).max(1e-4);
+        let step = if bones >= 2 { span / (bones as f32 - 1.0) } else { 0.0 };
+
+        // Chain along Y: root sits at min_y, each child advances by `step`.
+        let mut sk = Skeleton::new();
+        for i in 0..bones {
+            let parent = if i == 0 { None } else { Some(i - 1) };
+            let t = if i == 0 {
+                LocalTransform::from_translation(Vec3::new(0.0, min_y, 0.0))
+            } else {
+                LocalTransform::from_translation(Vec3::new(0.0, step, 0.0))
+            };
+            let _ = sk.add_bone(Bone::with_transform(format!("bone_{i}"), parent, t));
+        }
+
+        // Auto-weight each vertex by its height along the chain.
+        let mut w = SkinWeights::new(positions.len(), bones);
+        for (vi, p) in positions.iter().enumerate() {
+            let s = if step > 1e-6 {
+                ((p.y - min_y) / step).clamp(0.0, (bones - 1) as f32)
+            } else {
+                0.0
+            };
+            let lower = (s.floor() as usize).min(bones - 1);
+            let frac = (s - lower as f32).clamp(0.0, 1.0);
+            if bones == 1 || frac < 1e-3 {
+                let _ = w.set_weights(vi, &[(lower, 1.0)]);
+            } else {
+                let upper = (lower + 1).min(bones - 1);
+                let _ = w.set_weights(vi, &[(lower, 1.0 - frac), (upper, frac)]);
+            }
+        }
+
+        self.rig_bind = positions;
+        self.rig_skeleton = Some(sk);
+        self.rig_weights = Some(w);
+        self.rig_node = Some(id);
+        self.rig_bone = 0;
+        self.rig_angle = 0.0;
+        self.status = format!("Rig created: {} bones, auto-weighted.", bones);
+    }
+
+    /// Pose the selected bone and re-skin the mesh from its bind pose. This is
+    /// a live preview driven by the angle slider, so it does not push undo.
+    fn rig_apply_pose(&mut self) {
+        let Some(node) = self.rig_node else { return };
+        let Some(bone_count) = self.rig_skeleton.as_ref().map(|s| s.len()) else { return };
+        if bone_count == 0 {
+            return;
+        }
+        let bone = self.rig_bone.min(bone_count - 1);
+        let angle = self.rig_angle;
+        let newpos = {
+            let sk = self.rig_skeleton.as_mut().unwrap();
+            let _ = sk.set_pose_rotation(bone, Quat::from_rotation_x(angle));
+            let matrices = sk.skinning_matrices();
+            let w = self.rig_weights.as_ref().unwrap();
+            skin_positions(&self.rig_bind, &matrices, w).ok()
+        };
+        if let Some(newpos) = newpos {
+            if let Ok(n) = self.scene.get_mut(node) {
+                if let Some(mesh) = n.mesh_mut() {
+                    if mesh.positions.len() == newpos.len() {
+                        mesh.positions = newpos;
+                        mesh.compute_flat_normals();
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Return the rig (and its mesh) to the rest pose.
+    fn rig_reset(&mut self) {
+        let Some(node) = self.rig_node else { return };
+        self.rig_angle = 0.0;
+        if let Some(sk) = self.rig_skeleton.as_mut() {
+            sk.reset_pose();
+        }
+        let bind = self.rig_bind.clone();
+        if let Ok(n) = self.scene.get_mut(node) {
+            if let Some(mesh) = n.mesh_mut() {
+                if mesh.positions.len() == bind.len() {
+                    mesh.positions = bind;
+                    mesh.compute_flat_normals();
+                    self.dirty = true;
+                }
+            }
+        }
+        self.status = "Rig reset to rest pose.".into();
+    }
+
+    /// Restore the mesh to its bind pose and drop the rig.
+    fn rig_clear(&mut self) {
+        if let Some(node) = self.rig_node {
+            let bind = self.rig_bind.clone();
+            if let Ok(n) = self.scene.get_mut(node) {
+                if let Some(mesh) = n.mesh_mut() {
+                    if mesh.positions.len() == bind.len() {
+                        mesh.positions = bind;
+                        mesh.compute_flat_normals();
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
+        self.rig_skeleton = None;
+        self.rig_weights = None;
+        self.rig_bind.clear();
+        self.rig_node = None;
+        self.rig_bone = 0;
+        self.rig_angle = 0.0;
+        self.status = "Rig cleared.".into();
     }
 
     fn undo_edit(&mut self) {
@@ -1018,6 +1178,50 @@ impl OpenForgeApp {
                         .clicked()
                     {
                         self.boolean_selected(kind);
+                    }
+                }
+            });
+            // Fourth row: rigging and skinning.
+            ui.separator();
+            ui.horizontal(|ui| {
+                let has_mesh = self.active_mesh_node().is_some();
+                let has_rig = self.rig_skeleton.is_some();
+                ui.label("Rig:");
+                ui.label("Bones:");
+                ui.add(egui::DragValue::new(&mut self.rig_bones).range(1..=16));
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Create Rig"))
+                    .on_hover_text("Build a bone chain along Y and auto-weight the active mesh")
+                    .clicked()
+                {
+                    self.rig_create();
+                }
+                if has_rig {
+                    let bone_count = self.rig_skeleton.as_ref().map(|s| s.len()).unwrap_or(0);
+                    ui.label("Bone:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.rig_bone)
+                            .range(0..=bone_count.saturating_sub(1)),
+                    );
+                    let posed = ui
+                        .add(
+                            egui::Slider::new(&mut self.rig_angle, -3.0..=3.0)
+                                .fixed_decimals(2)
+                                .text("Angle"),
+                        )
+                        .changed();
+                    if posed {
+                        self.rig_apply_pose();
+                    }
+                    if ui
+                        .button("Reset")
+                        .on_hover_text("Return the rig to its rest pose")
+                        .clicked()
+                    {
+                        self.rig_reset();
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.rig_clear();
                     }
                 }
             });

@@ -15,6 +15,7 @@ openforge-io = { path = "../openforge-io" }
 openforge-materials = { path = "../openforge-materials" }
 openforge-ops = { path = "../openforge-ops" }
 openforge-boolean = { path = "../openforge-boolean" }
+openforge-rig = { path = "../openforge-rig" }
 glam.workspace = true
 log.workspace = true
 env_logger.workspace = true
