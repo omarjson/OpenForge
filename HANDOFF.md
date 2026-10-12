@@ -41,7 +41,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 11 crates (270 tests total, all green)
+## 4. Repo layout — 11 crates (285 tests total, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -52,10 +52,10 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-render` | 51 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target, scene/grid/gizmo pipelines, frame stats. |
 | `openforge-animation` | 51 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
-| `openforge-uv` | 31 | Planar/cylindrical/spherical/box projections, unwrap, pack. |
+| `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
-| `openforge-app` | 3 (bin) | eframe/egui GUI. `app.rs` (~1520 lines) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge). |
+| `openforge-app` | 12 (bin) | eframe/egui GUI. `app.rs` (~1900 lines) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -81,6 +81,13 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   only format `egui_wgpu` accepts for native textures) and the shaders write
   *linear* colour. Anything authored as sRGB bytes must go through
   `openforge_render::gpu::linear_from_srgb_u8`; clear colours likewise.
+- **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
+  the canvas math and panel state, `app.rs` owns the wiring). See §8 for its
+  gotchas: canvas rect construction, the placeholder UV slot, and one undo entry
+  per drag.
+- **Bottom-panel order is load-bearing.** Add the status bar first, then other
+  bottom panels, then the side panels, and the central viewport last: that is
+  what keeps the viewport's rect clear of the panels below it.
 - **`wgpu` is pinned once**, in `[workspace.dependencies]`, and must stay in
   lockstep with the wgpu eframe re-exports — otherwise the device/texture types
   crossing between eframe and `openforge-render` stop being the same types.
@@ -112,8 +119,15 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** baseline commit `2a201c8`. Full workspace builds with **0 warnings**,
-**270 tests pass**, CI green on all 3 platforms. This session took work-stream
-#1 — the wgpu viewport — to done:
+**285 tests pass**, CI green on all 3 platforms. This session took two
+work-streams to done — the **wgpu viewport** (#1) and the **interactive UV
+editor** (#2) — and added a progress report:
+
+- **`scripts/progress.sh`** draws a progress bar per parity area and can
+  rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
+  (crates, test fns, lines of Rust) separate from *curated* per-area scores,
+  because parity has no machine-checkable definition. Run it after every
+  work-stream and re-score the area you touched.
 
 - **`openforge-render` grew a real GPU backend** behind the `gpu` feature.
   `gpu::GpuRenderer` builds pipelines from the existing WGSL, keeps a growable
@@ -133,26 +147,44 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   test that needs no GPU, so CI checks shader correctness on GPU-less runners.
 - `.cargo/config.toml` and one `lsystem.rs` test rename keep both the build and
   the test build warning-free.
+- **A working interactive UV editor.** `openforge-uv` gained per-selection ops —
+  `uv_transform_selected` (scale, then rotate about a pivot, then translate),
+  `uv_face_uvs` and `uv_bounds_selected` — because the existing `UvOps` could
+  only transform *every* UV. `openforge-app` gained `uv_editor.rs` (canvas math
+  + panel state + drawing) and an `app.rs` panel: a 2D canvas with the `0..1`
+  tile, a quarter grid, the UV wireframe and a dot per UV; click and
+  rubber-band selection (Shift adds); drag to move (one undo entry per drag);
+  and buttons for the six projections, Normalize, Flip V, Pack (grid 1..8) and
+  a scale/rotate transform about the selection's centre.
+- **15 more tests** (6 in `openforge-uv`, 9 in `openforge-app`), all pure: the
+  affine selection maths and subset queries, plus the canvas mapping, picking,
+  band selection and selection-retarget rules.
 
 **Verified this session:** `cargo build --workspace` → 0 warnings;
-`cargo test --workspace` → 270 pass; `cargo build --release -p openforge-app`
-(the CI build job) succeeds; the app was launched locally and logged
-`eframe: ... Using wgpu.` with a Metal adapter and **no** `egui_wgpu` warnings.
-**Not verified:** how the window actually looks (the agent has no display
-access) — the offscreen pixel-readback test is the stand-in for that, so a human
-should eyeball the viewport once.
+`cargo test --workspace` → 285 pass; `cargo build --release -p openforge-app`
+(the CI build job) succeeds; `cargo clippy` reports nothing in
+`openforge-render`, `openforge-uv` or `openforge-app`; the app was launched
+locally and logged `eframe: ... Using wgpu.` with a Metal adapter and **no**
+`egui_wgpu` warnings. The UV panel was exercised by temporarily opening it with
+a mesh selected and tracing its canvas rect: it drew for 82 frames as a 300x300
+square directly above the status bar, with no panic.
+**Not verified:** how the window actually looks, and the UV canvas by eye — the
+agent has no display access, so a human should look at both once.
 
-**Progress toward full ZModeler parity: ~45%.** The engine layer is essentially
-done and the viewport is no longer the bottleneck; what remains is still mostly
-application surface. Prioritized next steps:
+**Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
+the per-area bars (`scripts/progress.sh --write` regenerates it). The engine
+layer is essentially done, and the two largest application-surface gaps — the
+GPU viewport and the UV editor — now have real implementations. Prioritized
+next steps:
 
-1. **Interactive UV editor** (best next value). The UV math (`openforge-uv`)
-   exists; build a click-drag panel (select UVs, move/scale/rotate, pack, live
-   preview). The GPU viewport makes a UV overlay cheap to add.
-2. **Deepen the GPU viewport.** It renders shaded geometry; the editor surface
-   around it is still missing — GPU selection outlines/wireframe, MSAA,
-   materials-driven shaders instead of the single hard-coded Lambert pass, and
-   depth-buffer picking. All additive to `GpuRenderer`.
+1. **Deepen the GPU viewport** (best next value). It renders shaded geometry;
+   the editor surface around it is still missing — GPU selection outlines and
+   wireframe, MSAA, a materials-driven shader instead of the single hard-coded
+   Lambert pass, and depth-buffer picking so sub-object picking matches exactly
+   what is drawn. All additive to `GpuRenderer`.
+2. **Deepen the UV editor.** No texture background yet, no island-level ops
+   (weld/split/mirror), no snapping, and the 3D face selection is pushed into
+   the UV selection on demand rather than staying in sync.
 3. **Plugin/service host.** ZModeler's core idea: 23 services + pluggable tools.
    Design an `openforge-plugin` trait + registry so tools/formats become
    pluggable instead of hard-wired. This is the long road to true parity.
@@ -185,6 +217,22 @@ deltas and are many work-streams, not one push.
   the GPU path would silently never activate and the app would quietly stay on
   the CPU fallback. (`glow` could be dropped from `eframe` to trim CI/build
   time; the defaults are kept for safety.)
+- **The UV editor is its own panel, not a viewport mode.** `uv_editor.rs`
+  owns the canvas math (`v` grows *upward*; UV↔canvas mapping, picking, rubber
+  band) and the panel state; `app.rs` owns the wiring and pushes committed
+  edits through `with_edit`. A live drag mutates directly and pushes **one**
+  undo entry on release, the same rule the 3D transforms follow.
+- **Panel order in `update()` matters.** The status bar is added first so it
+  owns the bottom edge, then the UV editor, then the side panels, and the
+  central viewport last. That is what keeps the viewport's rect — and its mouse
+  input — clear of the bottom panels.
+- **An unprojected mesh still has one UV slot.** `Mesh::ensure_attributes`
+  installs a placeholder `Vec2::ZERO` so corner indices stay valid, so "has real
+  UVs" is `uvs.len() > 1`, not `> 0`.
+- **Use `egui::Rect::from_two_pos`, not `from_min_max`, for canvas rects.**
+  `from_min_max` is a raw constructor that does *not* normalize; feeding it
+  bottom-left/top-right (which is what a `v`-up canvas produces) yields an
+  inverted rect with a negative height.
 - **Build a `GpuRenderer` from the device eframe hands you**
   (`cc.wgpu_render_state` / `frame.wgpu_render_state()`), not from a wgpu
   `Instance` of your own. The headless test is the one place that creates its

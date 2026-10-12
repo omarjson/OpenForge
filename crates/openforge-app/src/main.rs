@@ -4,6 +4,7 @@
 
 mod app;
 mod gpu_viewport;
+mod uv_editor;
 mod viewport;
 
 fn main() -> eframe::Result {

@@ -2,10 +2,11 @@
 //! between egui and the openforge-core scene model.
 
 use crate::gpu_viewport::{self, GpuViewport};
+use crate::uv_editor::{self, UvEditor};
 use crate::viewport::{self, Camera};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
 use openforge_core::scene::Scene;
@@ -16,6 +17,7 @@ use openforge_core::NodeId;
 use openforge_ops::MeshOps;
 use openforge_render::FrameStats;
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
+use openforge_uv::UvOps;
 use std::path::PathBuf;
 
 /// Which tool is active.
@@ -41,6 +43,8 @@ pub struct OpenForgeApp {
     tris: Vec<viewport::Tri>,
     /// The wgpu viewport, when eframe is running the wgpu backend.
     gpu: Option<GpuViewport>,
+    /// UV editor panel state.
+    uv: UvEditor,
     /// Whether the viewport was interacted with this frame (drives repaint).
     dirty: bool,
     show_outliner: bool,
@@ -85,6 +89,7 @@ impl OpenForgeApp {
             current_file: None,
             tris: Vec::new(),
             gpu,
+            uv: UvEditor::default(),
             dirty: true,
             show_outliner: true,
             show_properties: true,
@@ -861,9 +866,14 @@ impl eframe::App for OpenForgeApp {
         self.handle_menu(ctx);
         self.handle_shortcuts(ctx);
         self.handle_top_toolbar(ctx);
+        // Pack the edges first (status bar lowest, then the UV editor), then
+        // the side panels, and only then the central viewport, which takes what
+        // is left. That order is what keeps the viewport's rect — and its mouse
+        // input — clear of the bottom panels.
+        self.handle_status_bar(ctx);
+        self.handle_uv_editor(ctx);
         self.handle_side_panels(ctx);
         self.handle_central_viewport(ctx, frame.wgpu_render_state());
-        self.handle_status_bar(ctx);
         if self.dirty {
             ctx.request_repaint();
             self.dirty = false;
@@ -929,6 +939,10 @@ impl OpenForgeApp {
                 ui.menu_button("View", |ui| {
                     if ui.button("Frame All (F)").clicked() {
                         self.frame_all();
+                        ui.close_menu();
+                    }
+                    if ui.button("UV Editor").clicked() {
+                        self.uv.open = !self.uv.open;
                         ui.close_menu();
                     }
                     if ui.button("Reset Camera").clicked() {
@@ -1023,6 +1037,13 @@ impl OpenForgeApp {
                 ui.separator();
                 if ui.button("Frame All").clicked() {
                     self.frame_all();
+                }
+                if ui
+                    .selectable_label(self.uv.open, "UV Editor")
+                    .on_hover_text("Show the UV editor panel")
+                    .clicked()
+                {
+                    self.uv.open = !self.uv.open;
                 }
             });
             // Second row: sub-object modeling operations.
@@ -1438,6 +1459,431 @@ impl OpenForgeApp {
                 });
             });
         });
+    }
+
+    // --- UV editor --------------------------------------------------------------
+
+    /// Number of UV entries in a node's mesh (0 when it has no mesh).
+    fn uv_count(&self, id: NodeId) -> usize {
+        self.scene
+            .get(id)
+            .ok()
+            .and_then(|n| n.mesh().map(|m| m.uvs.len()))
+            .unwrap_or(0)
+    }
+
+    /// Whether a node has genuinely projected UVs.
+    ///
+    /// A mesh that has never been projected still carries a single placeholder
+    /// UV slot (core's `Mesh::ensure_attributes` installs one so corner indices
+    /// stay valid), so "more than one entry" is what separates real UVs from
+    /// that placeholder.
+    fn uv_has_real_uvs(&self, id: NodeId) -> bool {
+        self.uv_count(id) > 1
+    }
+
+    fn handle_uv_editor(&mut self, ctx: &egui::Context) {
+        if !self.uv.open {
+            return;
+        }
+        egui::TopBottomPanel::bottom("uv_editor")
+            .resizable(true)
+            .default_height(420.0)
+            .min_height(200.0)
+            .show(ctx, |ui| self.uv_panel(ui));
+    }
+
+    fn uv_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading("UV Editor");
+            if ui.button("Close").clicked() {
+                self.uv.open = false;
+            }
+        });
+        ui.separator();
+
+        let Some(id) = self.active_mesh_node() else {
+            self.uv.retarget(None, 0);
+            ui.label("Select a mesh to edit its UVs.");
+            return;
+        };
+        self.uv.retarget(Some(id), self.uv_count(id));
+
+        self.uv_controls(ui, id);
+        ui.separator();
+        self.uv_canvas(ui, id);
+
+        let selected = self.uv.selected.len();
+        let status = if self.uv_has_real_uvs(id) {
+            let bounds = match self
+                .scene
+                .get(id)
+                .ok()
+                .and_then(|n| n.mesh())
+                .and_then(|m| m.uv_bounds())
+            {
+                Some(b) => format!(
+                    "u {:.2}..{:.2}   v {:.2}..{:.2}",
+                    b.min.x, b.max.x, b.min.y, b.max.y
+                ),
+                None => "no finite UVs".to_string(),
+            };
+            format!("{} UV(s)   {selected} selected   {bounds}", self.uv_count(id))
+        } else {
+            format!("not projected yet   {selected} selected   (use a Project button)")
+        };
+        ui.label(status);
+    }
+
+    /// The UV editor's button rows: selection, projection and editing.
+    fn uv_controls(&mut self, ui: &mut egui::Ui, id: NodeId) {
+        let uv_count = self.uv_count(id);
+        // Projections need geometry, not UVs; every other edit needs real UVs.
+        let has_uvs = self.uv_has_real_uvs(id);
+        let has_faces = self
+            .scene
+            .get(id)
+            .ok()
+            .and_then(|n| n.mesh())
+            .map(|m| !m.faces.is_empty())
+            .unwrap_or(false);
+        let selected = self.uv.selected.len();
+        let faces_selected = self.selection.level == SelectLevel::Face
+            && self
+                .selection
+                .selected_elements(id)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+
+        ui.horizontal(|ui| {
+            ui.label("Selection:");
+            if ui
+                .add_enabled(has_uvs, egui::Button::new("All"))
+                .on_hover_text("Select every UV")
+                .clicked()
+            {
+                self.uv.select_only(0..uv_count as u32);
+            }
+            if ui
+                .add_enabled(selected > 0, egui::Button::new("None"))
+                .clicked()
+            {
+                self.uv.deselect_all();
+            }
+            if ui
+                .add_enabled(faces_selected, egui::Button::new("From Faces"))
+                .on_hover_text("Select the UVs of the faces selected in the viewport")
+                .clicked()
+            {
+                self.uv_select_from_faces(id);
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Project:");
+            for (label, axis) in [
+                ("Planar X", Vec3::X),
+                ("Planar Y", Vec3::Y),
+                ("Planar Z", Vec3::Z),
+            ] {
+                if ui
+                    .add_enabled(has_faces, egui::Button::new(label))
+                    .on_hover_text("Project the mesh along this axis (replaces every UV)")
+                    .clicked()
+                {
+                    self.uv_apply(id, label, move |m| m.uv_project_planar(axis));
+                }
+            }
+            if ui
+                .add_enabled(has_faces, egui::Button::new("Cylindrical"))
+                .clicked()
+            {
+                self.uv_apply(id, "UV Cylindrical", |m| m.uv_project_cylindrical(Vec3::Y));
+            }
+            if ui.add_enabled(has_faces, egui::Button::new("Spherical")).clicked() {
+                self.uv_apply(id, "UV Spherical", |m| m.uv_project_spherical(Vec3::Y));
+            }
+            if ui.add_enabled(has_faces, egui::Button::new("Box")).clicked() {
+                self.uv_apply(id, "UV Box", |m| m.uv_project_box());
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Edit:");
+            if ui.add_enabled(has_uvs, egui::Button::new("Normalize")).clicked() {
+                self.uv_apply(id, "UV Normalize", |m| m.uv_normalize());
+            }
+            if ui.add_enabled(has_uvs, egui::Button::new("Flip V")).clicked() {
+                self.uv_apply(id, "UV Flip V", |m| m.uv_flip_v());
+            }
+            ui.add(
+                egui::DragValue::new(&mut self.uv.grid)
+                    .range(1..=8)
+                    .prefix("grid "),
+            );
+            if ui
+                .add_enabled(has_uvs, egui::Button::new("Pack"))
+                .on_hover_text("Repack UV islands into a grid atlas")
+                .clicked()
+            {
+                let grid = self.uv.grid;
+                self.uv_apply(id, "UV Pack", move |m| m.uv_repack(grid));
+            }
+            ui.separator();
+            let can_transform = selected > 0;
+            ui.add_enabled(
+                can_transform,
+                egui::Slider::new(&mut self.uv.scale, 0.1..=4.0).text("Scale"),
+            );
+            ui.add_enabled(
+                can_transform,
+                egui::Slider::new(&mut self.uv.rotate_deg, -180.0..=180.0).text("Rotate"),
+            );
+            if ui
+                .add_enabled(can_transform, egui::Button::new("Apply"))
+                .on_hover_text("Scale then rotate the selection about its centre")
+                .clicked()
+            {
+                let scale = Vec2::splat(self.uv.scale);
+                let rotate = self.uv.rotate_deg.to_radians();
+                self.uv_transform(id, scale, rotate);
+            }
+            if ui
+                .add_enabled(can_transform, egui::Button::new("Reset"))
+                .clicked()
+            {
+                self.uv.scale = 1.0;
+                self.uv.rotate_deg = 0.0;
+            }
+        });
+    }
+
+    /// The UV canvas: draw the mesh's UVs, then handle pick/drag/band input.
+    fn uv_canvas(&mut self, ui: &mut egui::Ui, id: NodeId) {
+        let avail = ui.available_size();
+        let side = uv_editor::CANVAS_SIZE.min(avail.x).min(avail.y).max(80.0);
+        let (rect, response) =
+            ui.allocate_exact_size(egui::vec2(side, side), egui::Sense::click_and_drag());
+        let painter = ui.painter_at(rect);
+
+        let hovered = match (response.hover_pos(), self.uv_mesh_uvs(id)) {
+            (Some(pos), Some(mesh)) => uv_editor::pick_uv(mesh, pos, rect),
+            _ => None,
+        };
+        if let Ok(node) = self.scene.get(id) {
+            if let Some(mesh) = node.mesh() {
+                uv_editor::draw_canvas(&painter, rect, mesh, &self.uv, hovered);
+            }
+        }
+
+        let shift = ui.input(|i| i.modifiers.shift);
+        let pointer = response.interact_pointer_pos();
+        if response.drag_started() {
+            if let Some(pos) = pointer {
+                match self.uv_pick(id, pos, rect) {
+                    Some(uv) => {
+                        if shift {
+                            self.uv.selected.insert(uv);
+                        } else if !self.uv.selected.contains(&uv) {
+                            self.uv.select_only([uv]);
+                        }
+                        self.uv.drag = Some(uv_editor::UvDrag {
+                            before: self.scene.clone(),
+                            last: pos,
+                        });
+                    }
+                    None => {
+                        if !shift {
+                            self.uv.deselect_all();
+                        }
+                        self.uv.band = Some((pos, pos));
+                    }
+                }
+            }
+        } else if response.dragged() {
+            if let Some(pos) = pointer {
+                if self.uv.drag.is_some() {
+                    // Scope the mutable borrow so the mesh can be edited below.
+                    let step = {
+                        let drag = self.uv.drag.as_mut().expect("checked above");
+                        let last = drag.last;
+                        drag.last = pos;
+                        uv_editor::canvas_to_uv(pos, rect) - uv_editor::canvas_to_uv(last, rect)
+                    };
+                    self.uv_apply_delta(id, step);
+                } else if let Some(band) = self.uv.band.as_mut() {
+                    band.1 = pos;
+                }
+            }
+        } else if response.drag_stopped() {
+            // A finished move becomes exactly one undo entry.
+            if let Some(drag) = self.uv.drag.take() {
+                if !self.scene.content_eq(&drag.before) {
+                    self.undo.push("UV Move", drag.before, self.scene.clone());
+                    self.dirty = true;
+                    self.status = "Moved UVs.".to_string();
+                }
+            }
+            if let Some((a, b)) = self.uv.band.take() {
+                let picked = self
+                    .uv_mesh_uvs(id)
+                    .map(|m| uv_editor::band_select(m, rect, a, b))
+                    .unwrap_or_default();
+                let count = picked.len();
+                if shift {
+                    self.uv.select_more(picked);
+                } else {
+                    self.uv.select_only(picked);
+                }
+                self.status = format!("{} UV(s) in the band.", count);
+            }
+        } else if response.clicked() {
+            if let Some(pos) = pointer {
+                match self.uv_pick(id, pos, rect) {
+                    Some(uv) => {
+                        if shift {
+                            self.uv.selected.insert(uv);
+                        } else {
+                            self.uv.select_only([uv]);
+                        }
+                    }
+                    None => {
+                        if !shift {
+                            self.uv.deselect_all();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drawn after the update so the band tracks the pointer in-frame.
+        if let Some((a, b)) = self.uv.band {
+            let band = egui::Rect::from_two_pos(a, b);
+            painter.rect_filled(
+                band,
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(90, 140, 220, 40),
+            );
+            painter.rect_stroke(
+                band,
+                0.0,
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(120, 170, 240)),
+            );
+        }
+        if !self.uv_has_real_uvs(id) {
+            painter.text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "No UVs yet — pick a projection above",
+                egui::FontId::proportional(13.0),
+                egui::Color32::from_gray(170),
+            );
+        }
+    }
+
+    /// The active mesh's UVs, if it has a mesh.
+    fn uv_mesh_uvs(&self, id: NodeId) -> Option<&Mesh> {
+        self.scene.get(id).ok().and_then(|n| n.mesh())
+    }
+
+    /// The UV entry under `pos`, if any.
+    fn uv_pick(&self, id: NodeId, pos: egui::Pos2, canvas: egui::Rect) -> Option<u32> {
+        self.uv_mesh_uvs(id)
+            .and_then(|m| uv_editor::pick_uv(m, pos, canvas))
+    }
+
+    /// The pivot for selection transforms: the selection's UV centre, or the
+    /// middle of the tile when nothing is selected.
+    fn uv_pivot(&self, id: NodeId) -> Vec2 {
+        self.uv_mesh_uvs(id)
+            .map(|m| self.uv.pivot(m))
+            .unwrap_or_else(|| Vec2::splat(0.5))
+    }
+
+    /// Run a committed UV operation on the active mesh as one undo entry.
+    fn uv_apply(&mut self, id: NodeId, label: &str, f: impl FnOnce(&mut Mesh)) {
+        let mut ran = false;
+        self.with_edit(label, |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    f(mesh);
+                    ran = true;
+                }
+            }
+        });
+        self.status = if ran {
+            format!("{}: {} UV(s).", label, self.uv_count(id))
+        } else {
+            "That node has no mesh.".to_string()
+        };
+    }
+
+    /// Scale then rotate the selected UVs about their centre, as one undo entry.
+    fn uv_transform(&mut self, id: NodeId, scale: Vec2, rotate: f32) {
+        let indices = self.uv.indices();
+        if indices.is_empty() {
+            self.status = "Select UVs first (click the canvas or use a band).".to_string();
+            return;
+        }
+        let count = indices.len();
+        let pivot = self.uv_pivot(id);
+        self.with_edit("UV Transform", move |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    mesh.uv_transform_selected(&indices, Vec2::ZERO, scale, rotate, pivot);
+                }
+            }
+        });
+        self.status = format!(
+            "Transformed {} UV(s): scale {:.2}, {:+.0} deg.",
+            count,
+            scale.x,
+            rotate.to_degrees()
+        );
+    }
+
+    /// Apply a live drag delta to the selected UVs.
+    ///
+    /// Deliberately bypasses `with_edit`: the drag pushes a single undo entry
+    /// when the pointer is released, so the stack is not flooded per frame.
+    fn uv_apply_delta(&mut self, id: NodeId, delta: Vec2) {
+        let indices = self.uv.indices();
+        if indices.is_empty() || delta == Vec2::ZERO {
+            return;
+        }
+        if let Ok(node) = self.scene.get_mut(id) {
+            if let Some(mesh) = node.mesh_mut() {
+                mesh.uv_transform_selected(&indices, delta, Vec2::ONE, 0.0, Vec2::ZERO);
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Select the UVs of the faces selected in the viewport.
+    fn uv_select_from_faces(&mut self, id: NodeId) {
+        let faces = self.selected_faces(id);
+        let mut uvs: Vec<u32> = Vec::new();
+        if let Ok(node) = self.scene.get(id) {
+            if let Some(mesh) = node.mesh() {
+                for f in &faces {
+                    for (uv, _) in mesh.uv_face_uvs(*f) {
+                        if !uvs.contains(&uv) {
+                            uvs.push(uv);
+                        }
+                    }
+                }
+            }
+        }
+        if uvs.is_empty() {
+            self.status = "The selected faces have no UVs.".to_string();
+            return;
+        }
+        self.status = format!(
+            "Selected {} UV(s) from {} face(s).",
+            uvs.len(),
+            faces.len()
+        );
+        self.uv.select_only(uvs);
     }
 
     fn frame_all(&mut self) {

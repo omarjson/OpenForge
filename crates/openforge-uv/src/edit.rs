@@ -70,6 +70,89 @@ pub(crate) fn uv_bounds(mesh: &Mesh) -> Option<UvBounds> {
     uv_bounds_of(&mesh.uvs)
 }
 
+/// `(uv index, value)` for every corner of `face`, in corner order.
+///
+/// Empty for an out-of-range face. Values are read defensively (an
+/// out-of-range or non-finite entry reads as `Vec2::ZERO`) so the result is
+/// always safe to display.
+pub(crate) fn uv_face_uvs(mesh: &Mesh, face: usize) -> Vec<(u32, Vec2)> {
+    let Some(f) = mesh.faces.get(face) else {
+        return Vec::new();
+    };
+    f.corners
+        .iter()
+        .map(|c| (c.uv, crate::uv_at(&mesh.uvs, c.uv)))
+        .collect()
+}
+
+/// Bounding box over a subset of UV entries (by index).
+///
+/// Out-of-range and non-finite entries are skipped; `None` when nothing usable
+/// remains.
+pub(crate) fn uv_bounds_selected(mesh: &Mesh, indices: &[u32]) -> Option<UvBounds> {
+    let mut min = Vec2::ZERO;
+    let mut max = Vec2::ZERO;
+    let mut first = true;
+    for &i in indices {
+        let Some(v) = mesh.uvs.get(i as usize) else {
+            continue;
+        };
+        if !v.is_finite() {
+            continue;
+        }
+        if first {
+            min = *v;
+            max = *v;
+            first = false;
+        } else {
+            min = min.min(*v);
+            max = max.max(*v);
+        }
+    }
+    if first {
+        None
+    } else {
+        Some(UvBounds { min, max })
+    }
+}
+
+/// Apply `uv' = R(angle) * ((uv - pivot) * scale) + pivot + translate` to a
+/// subset of UV entries, leaving every other entry untouched.
+///
+/// Scale is applied before the rotation, both about `pivot`, then the
+/// translation is added. Out-of-range indices are skipped and non-finite input
+/// (or a non-finite angle) makes the whole call a no-op; non-finite *entries*
+/// in the mesh are reset to `Vec2::ZERO` first, so the result is always finite
+/// and every corner `uv` index stays valid.
+pub(crate) fn uv_transform_selected(
+    mesh: &mut Mesh,
+    indices: &[u32],
+    translate: Vec2,
+    scale: Vec2,
+    rotate: f32,
+    pivot: Vec2,
+) {
+    if indices.is_empty()
+        || !translate.is_finite()
+        || !scale.is_finite()
+        || !pivot.is_finite()
+        || !rotate.is_finite()
+    {
+        return;
+    }
+    let (sin, cos) = rotate.sin_cos();
+    for &i in indices {
+        let Some(v) = mesh.uvs.get_mut(i as usize) else {
+            continue;
+        };
+        if !v.is_finite() {
+            *v = Vec2::ZERO;
+        }
+        let p = (*v - pivot) * scale;
+        *v = Vec2::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos) + pivot + translate;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,6 +277,112 @@ mod tests {
         // An unresolvable uv index contributes no area instead of panicking.
         m.faces[0].corners[2].uv = 999;
         assert_eq!(m.uv_face_area_uv(0), 0.0);
+    }
+
+    #[test]
+    fn transform_selected_only_touches_the_given_indices() {
+        let mut m = Mesh::new();
+        m.uvs = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.5, 0.5),
+            Vec2::new(1.0, 1.0),
+        ];
+        m.uv_transform_selected(&[1], Vec2::new(0.25, -0.25), Vec2::ONE, 0.0, Vec2::ZERO);
+        assert_eq!(m.uvs[0], Vec2::new(0.0, 0.0));
+        assert_eq!(m.uvs[1], Vec2::new(0.75, 0.25));
+        assert_eq!(m.uvs[2], Vec2::new(1.0, 1.0));
+    }
+
+    #[test]
+    fn transform_selected_scales_about_the_pivot() {
+        let mut m = Mesh::new();
+        // Pivot at (0.5, 0.5): scaling by 2 pushes the corners out to +-0.5.
+        m.uvs = vec![
+            Vec2::new(0.25, 0.5),
+            Vec2::new(0.5, 0.5),
+            Vec2::new(0.75, 0.5),
+        ];
+        m.uv_transform_selected(&[0, 1, 2], Vec2::ZERO, Vec2::splat(2.0), 0.0, Vec2::splat(0.5));
+        assert!((m.uvs[0] - Vec2::new(0.0, 0.5)).length() < 1e-6);
+        assert!((m.uvs[1] - Vec2::new(0.5, 0.5)).length() < 1e-6);
+        assert!((m.uvs[2] - Vec2::new(1.0, 0.5)).length() < 1e-6);
+    }
+
+    #[test]
+    fn transform_selected_rotates_about_the_pivot() {
+        let mut m = Mesh::new();
+        m.uvs = vec![Vec2::new(1.0, 0.0), Vec2::new(0.0, 1.0)];
+        // Quarter turn about the origin: (1,0) -> (0,1) and (0,1) -> (-1,0).
+        let quarter = std::f32::consts::FRAC_PI_2;
+        m.uv_transform_selected(&[0, 1], Vec2::ZERO, Vec2::ONE, quarter, Vec2::ZERO);
+        assert!((m.uvs[0] - Vec2::new(0.0, 1.0)).length() < 1e-6, "{:?}", m.uvs[0]);
+        assert!((m.uvs[1] - Vec2::new(-1.0, 0.0)).length() < 1e-6, "{:?}", m.uvs[1]);
+        // A full turn is the identity.
+        m.uv_transform_selected(&[0, 1], Vec2::ZERO, Vec2::ONE, std::f32::consts::TAU, Vec2::ZERO);
+        assert!((m.uvs[0] - Vec2::new(0.0, 1.0)).length() < 1e-5);
+        assert!((m.uvs[1] - Vec2::new(-1.0, 0.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn transform_selected_is_defensive() {
+        let mut m = Mesh::new();
+        m.uvs = vec![Vec2::new(0.25, 0.25), Vec2::new(f32::NAN, 1.0)];
+        // Empty index list: no-op (and no panic).
+        m.uv_transform_selected(&[], Vec2::splat(1.0), Vec2::ONE, 0.0, Vec2::ZERO);
+        assert_eq!(m.uvs[0], Vec2::new(0.25, 0.25));
+        // Out-of-range indices are skipped.
+        m.uv_transform_selected(&[7, 1], Vec2::splat(0.5), Vec2::ONE, 0.0, Vec2::ZERO);
+        assert_eq!(m.uvs[0], Vec2::new(0.25, 0.25));
+        // A non-finite entry is reset instead of poisoning the result.
+        assert!(m.uvs[1].is_finite());
+        // Non-finite parameters make the whole call a no-op.
+        let before = m.uvs.clone();
+        m.uv_transform_selected(&[0], Vec2::new(f32::NAN, 0.0), Vec2::ONE, 0.0, Vec2::ZERO);
+        m.uv_transform_selected(&[0], Vec2::ZERO, Vec2::ONE, f32::INFINITY, Vec2::ZERO);
+        m.uv_transform_selected(&[0], Vec2::ZERO, Vec2::ONE, 0.0, Vec2::splat(f32::NAN));
+        assert_eq!(m.uvs, before);
+    }
+
+    #[test]
+    fn face_uvs_lists_indices_and_values_in_corner_order() {
+        let mut m = unit_quad();
+        m.uvs = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
+        for (i, c) in m.faces[0].corners.iter_mut().enumerate() {
+            c.uv = i as u32;
+        }
+        let f = m.uv_face_uvs(0);
+        assert_eq!(f.len(), 4);
+        assert_eq!(f[0], (0, Vec2::new(0.0, 0.0)));
+        assert_eq!(f[3], (3, Vec2::new(0.0, 1.0)));
+        // Out-of-range face and a dangling uv index are handled.
+        assert!(m.uv_face_uvs(9).is_empty());
+        m.faces[0].corners[1].uv = 42;
+        assert_eq!(m.uv_face_uvs(0)[1], (42, Vec2::ZERO));
+    }
+
+    #[test]
+    fn bounds_selected_covers_only_the_subset() {
+        let mut m = Mesh::new();
+        m.uvs = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.5, 0.25),
+            Vec2::new(4.0, 4.0),
+            Vec2::new(f32::NAN, 1.0),
+        ];
+        assert_eq!(m.uv_bounds_selected(&[]), None);
+        let b = m.uv_bounds_selected(&[0, 1]).expect("two finite entries");
+        assert_eq!(b.min, Vec2::new(0.0, 0.0));
+        assert_eq!(b.max, Vec2::new(0.5, 0.25));
+        // The far corner is only included when it is part of the subset.
+        assert_eq!(m.uv_bounds_selected(&[2]).unwrap().max, Vec2::new(4.0, 4.0));
+        // Non-finite and out-of-range indices are skipped, never panic.
+        assert_eq!(m.uv_bounds_selected(&[3, 99]), None);
+        assert!(m.uv_bounds_selected(&[3, 99, 0]).is_some());
     }
 
     #[test]

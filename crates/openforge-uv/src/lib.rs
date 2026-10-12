@@ -4,7 +4,8 @@
 //!
 //! * [`project`] — planar, cylindrical, spherical, and box (triplanar)
 //!   projection of vertex positions into UV space.
-//! * [`edit`] — bounds queries and affine UV edits (normalize, flip, scale).
+//! * [`edit`] — bounds queries and affine UV edits (normalize, flip, scale,
+//!   and per-selection transforms for an interactive editor).
 //! * [`unwrap`] — seam detection by dihedral angle and a simple grid atlas
 //!   repack for UV islands.
 //!
@@ -130,6 +131,35 @@ pub trait UvOps {
     /// Bounding box of all UV entries, or `None` when there are no finite
     /// entries (e.g. an empty mesh).
     fn uv_bounds(&self) -> Option<UvBounds>;
+
+    /// `(uv index, value)` for every corner of `face`, in corner order.
+    ///
+    /// Empty for an out-of-range face. Values read defensively (a dangling or
+    /// non-finite entry reads as `Vec2::ZERO`), so the result is always safe to
+    /// display or feed back into a selection.
+    fn uv_face_uvs(&self, face: usize) -> Vec<(u32, Vec2)>;
+
+    /// Bounding box over a subset of UV entries, by index.
+    ///
+    /// Out-of-range and non-finite entries are skipped; `None` when nothing
+    /// usable remains. This is the pivot source for selection transforms.
+    fn uv_bounds_selected(&self, indices: &[u32]) -> Option<UvBounds>;
+
+    /// Apply `uv' = R(rotate) * ((uv - pivot) * scale) + pivot + translate` to
+    /// a subset of UV entries, leaving every other entry untouched.
+    ///
+    /// Scale is applied before the rotation, both about `pivot`. This is what
+    /// an interactive editor drags: the caller re-applies a per-frame delta for
+    /// a live preview. Out-of-range indices are skipped, and a non-finite
+    /// parameter (or an empty index list) makes the whole call a no-op.
+    fn uv_transform_selected(
+        &mut self,
+        indices: &[u32],
+        translate: Vec2,
+        scale: Vec2,
+        rotate: f32,
+        pivot: Vec2,
+    );
 }
 
 // A single impl block (Rust allows only one per trait/type pair); the bodies
@@ -177,6 +207,25 @@ impl UvOps for Mesh {
 
     fn uv_bounds(&self) -> Option<UvBounds> {
         edit::uv_bounds(self)
+    }
+
+    fn uv_face_uvs(&self, face: usize) -> Vec<(u32, Vec2)> {
+        edit::uv_face_uvs(self, face)
+    }
+
+    fn uv_bounds_selected(&self, indices: &[u32]) -> Option<UvBounds> {
+        edit::uv_bounds_selected(self, indices)
+    }
+
+    fn uv_transform_selected(
+        &mut self,
+        indices: &[u32],
+        translate: Vec2,
+        scale: Vec2,
+        rotate: f32,
+        pivot: Vec2,
+    ) {
+        edit::uv_transform_selected(self, indices, translate, scale, rotate, pivot);
     }
 }
 

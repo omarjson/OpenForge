@@ -16,6 +16,7 @@ openforge-materials = { path = "../openforge-materials" }
 openforge-ops = { path = "../openforge-ops" }
 openforge-boolean = { path = "../openforge-boolean" }
 openforge-rig = { path = "../openforge-rig" }
+openforge-uv = { path = "../openforge-uv" }
 # The GPU viewport backend: camera/uniform/vertex plumbing plus the actual
 # wgpu renderer behind the `gpu` feature.
 openforge-render = { path = "../openforge-render", features = ["gpu"] }
