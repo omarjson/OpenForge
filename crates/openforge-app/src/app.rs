@@ -11,6 +11,7 @@ use openforge_core::selection::{SelectLevel, Selection};
 use openforge_core::tool::{Pointer, SelectTool, Tool, ToolContext, TransformMode, TransformTool};
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
+use openforge_ops::MeshOps;
 use std::path::PathBuf;
 
 /// Which tool is active.
@@ -224,6 +225,86 @@ impl OpenForgeApp {
             }
         });
         self.status = format!("Welded {} vertex/vertices (eps={:.3}).", merged, eps);
+    }
+
+    /// Chamfer the vertices of the selected faces (via `MeshOps`).
+    fn bevel_selected(&mut self, amount: f32) {
+        self.with_mesh_faces("Bevel", true, |mesh, faces| {
+            let mut verts: Vec<u32> = Vec::new();
+            for &fi in faces {
+                if let Some(f) = mesh.faces.get(fi) {
+                    for c in &f.corners {
+                        if !verts.contains(&c.position) {
+                            verts.push(c.position);
+                        }
+                    }
+                }
+            }
+            if verts.is_empty() {
+                return "Bevel: no vertices selected.".into();
+            }
+            let (bv, bf) = (mesh.vertex_count(), mesh.face_count());
+            mesh.bevel_vertices(&verts, amount);
+            format!(
+                "Beveled {} vertex/vertices (+{} verts, +{} faces).",
+                verts.len(),
+                mesh.vertex_count() - bv,
+                mesh.face_count() - bf,
+            )
+        });
+    }
+
+    /// Triangulate every face of the active mesh (via `MeshOps`).
+    fn triangulate_selected(&mut self) {
+        let Some(id) = self.active_mesh_node() else {
+            self.status = "Select a mesh first.".into();
+            return;
+        };
+        let (mut before, mut after) = (0usize, 0usize);
+        self.with_edit("Triangulate", |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    before = mesh.face_count();
+                    mesh.triangulate_all();
+                    after = mesh.face_count();
+                }
+            }
+        });
+        self.status = format!("Triangulated: {} -> {} faces.", before, after);
+    }
+
+    /// Reverse the winding/normals of the active mesh (via `MeshOps`).
+    fn flip_normals_selected(&mut self) {
+        let Some(id) = self.active_mesh_node() else {
+            self.status = "Select a mesh first.".into();
+            return;
+        };
+        self.with_edit("Flip Normals", |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    mesh.flip_normals();
+                }
+            }
+        });
+        self.status = "Flipped normals.".into();
+    }
+
+    /// Duplicate the mesh mirrored across an axis plane (via `MeshOps`).
+    fn mirror_selected(&mut self, axis: Vec3) {
+        let Some(id) = self.active_mesh_node() else {
+            self.status = "Select a mesh first.".into();
+            return;
+        };
+        let mut verts = 0usize;
+        self.with_edit("Mirror", |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    mesh.mirror_axis(axis, 0.001);
+                    verts = mesh.vertex_count();
+                }
+            }
+        });
+        self.status = format!("Mirrored; mesh now has {} vertices.", verts);
     }
 
     fn undo_edit(&mut self) {
@@ -677,6 +758,19 @@ impl OpenForgeApp {
         if ctx.input(|i| i.key_pressed(egui::Key::V)) {
             self.weld_selected(0.001);
         }
+        // MeshOps hotkeys: bevel (faces), triangulate, flip, mirror.
+        if ctx.input(|i| i.key_pressed(egui::Key::B)) {
+            self.bevel_selected(0.5);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::T)) {
+            self.triangulate_selected();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::N)) {
+            self.flip_normals_selected();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::M)) {
+            self.mirror_selected(Vec3::X);
+        }
     }
 
     fn handle_top_toolbar(&mut self, ctx: &egui::Context) {
@@ -745,6 +839,48 @@ impl OpenForgeApp {
                     .clicked()
                 {
                     self.delete_faces_selected();
+                }
+                if ui
+                    .add_enabled(has_faces, egui::Button::new("Bevel (B)"))
+                    .on_hover_text("Chamfer the vertices of the selected faces")
+                    .clicked()
+                {
+                    self.bevel_selected(0.5);
+                }
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Triangulate (T)"))
+                    .on_hover_text("Convert every face to triangles")
+                    .clicked()
+                {
+                    self.triangulate_selected();
+                }
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Flip Normals (N)"))
+                    .on_hover_text("Reverse face winding and normals")
+                    .clicked()
+                {
+                    self.flip_normals_selected();
+                }
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Mirror X (M)"))
+                    .on_hover_text("Duplicate the mesh mirrored across the X plane")
+                    .clicked()
+                {
+                    self.mirror_selected(Vec3::X);
+                }
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Mirror Y"))
+                    .on_hover_text("Duplicate the mesh mirrored across the Y plane")
+                    .clicked()
+                {
+                    self.mirror_selected(Vec3::Y);
+                }
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Mirror Z"))
+                    .on_hover_text("Duplicate the mesh mirrored across the Z plane")
+                    .clicked()
+                {
+                    self.mirror_selected(Vec3::Z);
                 }
             });
         });
