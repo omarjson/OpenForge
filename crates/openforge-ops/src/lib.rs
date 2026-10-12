@@ -55,6 +55,23 @@ pub trait MeshOps {
 
     /// Translate the given faces and their unique vertices by `delta`.
     fn transform_faces(&mut self, faces: &[usize], delta: Vec3);
+
+    /// Taper: scale the geometry perpendicular to `axis` by `1 - amount * t`,
+    /// where `t` in 0..1 is a vertex's normalized position along `axis` over
+    /// the mesh's extent. `amount` 0 leaves geometry unchanged; positive
+    /// values narrow the +axis end. Recomputes normals.
+    fn taper(&mut self, axis: Vec3, amount: f32);
+
+    /// Twist: rotate the geometry perpendicular to `axis` by an angle that
+    /// grows linearly with position along `axis` (0 at the low end, `angle` at
+    /// the high end). Recomputes normals.
+    fn twist(&mut self, axis: Vec3, angle: f32);
+
+    /// Bend: curl the length direction `axis` into an arc around `bend_axis`
+    /// (orthogonalized against `axis`) spanning `angle` radians. The neutral
+    /// line through the mesh centre is preserved; `angle` 0 is a no-op.
+    /// Recomputes normals.
+    fn bend(&mut self, axis: Vec3, bend_axis: Vec3, angle: f32);
 }
 
 // --- Shared helpers -----------------------------------------------------------
@@ -71,6 +88,22 @@ fn tangent_basis(n: Vec3) -> (Vec3, Vec3) {
     let t1 = n.cross(a).normalize_or_zero();
     let t2 = n.cross(t1).normalize_or_zero();
     (t1, t2)
+}
+
+/// The (min, range) of `mesh`'s vertex positions projected onto `axis`.
+/// `range` is `max - min` (0 for a degenerate or empty projection).
+fn axis_extent(mesh: &Mesh, axis: Vec3) -> (f32, f32) {
+    if mesh.positions.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for p in &mesh.positions {
+        let h = p.dot(axis);
+        min = min.min(h);
+        max = max.max(h);
+    }
+    (min, max - min)
 }
 
 /// Merge faces `i` and `j` across their shared undirected edge `{a, b}` into a
@@ -379,6 +412,67 @@ impl MeshOps for Mesh {
         }
         self.compute_flat_normals();
     }
+
+    fn taper(&mut self, axis: Vec3, amount: f32) {
+        let axis = axis.normalize_or_zero();
+        if axis == Vec3::ZERO {
+            return;
+        }
+        let (min, range) = axis_extent(self, axis);
+        for p in self.positions.iter_mut() {
+            let h = p.dot(axis);
+            let t = if range > 1e-9 { (h - min) / range } else { 0.5 };
+            let perp = *p - axis * h;
+            let factor = 1.0 - amount * t;
+            *p = axis * h + perp * factor;
+        }
+        self.compute_flat_normals();
+    }
+
+    fn twist(&mut self, axis: Vec3, angle: f32) {
+        let axis = axis.normalize_or_zero();
+        if axis == Vec3::ZERO {
+            return;
+        }
+        let (min, range) = axis_extent(self, axis);
+        for p in self.positions.iter_mut() {
+            let h = p.dot(axis);
+            let t = if range > 1e-9 { (h - min) / range } else { 0.5 };
+            let perp = *p - axis * h;
+            let q = glam::Quat::from_axis_angle(axis, angle * t);
+            *p = axis * h + q * perp;
+        }
+        self.compute_flat_normals();
+    }
+
+    fn bend(&mut self, axis: Vec3, bend_axis: Vec3, angle: f32) {
+        let e1 = axis.normalize_or_zero();
+        if e1 == Vec3::ZERO || angle.abs() < 1e-6 {
+            return;
+        }
+        // Orthogonalize the bend axis against the length axis.
+        let e2 = (bend_axis - e1 * bend_axis.dot(e1)).normalize_or_zero();
+        if e2 == Vec3::ZERO {
+            return;
+        }
+        let e3 = e1.cross(e2);
+        let (min, range) = axis_extent(self, e1);
+        if range < 1e-9 {
+            return;
+        }
+        let radius = range / angle;
+        for p in self.positions.iter_mut() {
+            let a1 = p.dot(e1);
+            let a2 = p.dot(e2);
+            let a3 = p.dot(e3);
+            let theta = (a1 - min) / radius;
+            let radial = radius + a3;
+            let new_e1 = radial * theta.sin();
+            let new_e3 = radial * theta.cos() - radius;
+            *p = e1 * new_e1 + e2 * a2 + e3 * new_e3;
+        }
+        self.compute_flat_normals();
+    }
 }
 
 /// Bevel a single vertex into a chamfer polygon, adding bridging triangles so
@@ -636,5 +730,82 @@ mod tests {
         assert!(m.select_ring(99).is_empty());
         assert!(!m.bridge_faces(0, 0));
         assert_eq!(m.delete_edges(&[(99, 100)]), 0);
+    }
+
+    #[test]
+    fn taper_narrows_top_and_keeps_bottom() {
+        let mut m = cube(); // verts at ±0.5 on every axis
+        m.taper(Vec3::Y, 0.5);
+        // Bottom (y=-0.5, t=0) unchanged; top (y=+0.5, t=1) scaled by 0.5.
+        assert!((m.positions[0].x - -0.5).abs() < 1e-5); // vertex 0 at bottom
+        assert!((m.positions[2].x - 0.25).abs() < 1e-5); // vertex 2 at top
+        assert!((m.positions[6].z - 0.25).abs() < 1e-5); // vertex 6 at top
+        // Y coordinates are untouched by a Y taper.
+        assert!((m.positions[6].y - 0.5).abs() < 1e-5);
+        assert_eq!(m.vertex_count(), 8);
+    }
+
+    #[test]
+    fn taper_zero_amount_is_identity() {
+        let mut m = cube();
+        let before = m.positions.clone();
+        m.taper(Vec3::Y, 0.0);
+        for (a, b) in m.positions.iter().zip(before.iter()) {
+            assert!(a.abs_diff_eq(*b, 1e-6));
+        }
+    }
+
+    #[test]
+    fn twist_zero_angle_is_identity_and_preserves_axis() {
+        let mut m = cube();
+        let before = m.positions.clone();
+        m.twist(Vec3::Y, 0.0);
+        for (a, b) in m.positions.iter().zip(before.iter()) {
+            assert!(a.abs_diff_eq(*b, 1e-6));
+        }
+        // A nonzero twist keeps each vertex's distance from the Y axis and its Y.
+        let mut m = cube();
+        let d0 = (m.positions[6].x.powi(2) + m.positions[6].z.powi(2)).sqrt();
+        let y0 = m.positions[6].y;
+        m.twist(Vec3::Y, 1.2);
+        let d1 = (m.positions[6].x.powi(2) + m.positions[6].z.powi(2)).sqrt();
+        assert!((d0 - d1).abs() < 1e-5);
+        assert!((m.positions[6].y - y0).abs() < 1e-5);
+        // Bottom vertices (t=0) receive no rotation at all.
+        assert!(m.positions[0].abs_diff_eq(before[0], 1e-6));
+    }
+
+    #[test]
+    fn bend_preserves_bend_axis_and_is_finite() {
+        let mut m = cube();
+        let xs: Vec<f32> = m.positions.iter().map(|p| p.x).collect();
+        m.bend(Vec3::Y, Vec3::X, 1.0);
+        // The bend axis coordinate (X) is unchanged for every vertex.
+        for (p, &x0) in m.positions.iter().zip(xs.iter()) {
+            assert!((p.x - x0).abs() < 1e-5);
+            assert!(p.x.is_finite() && p.y.is_finite() && p.z.is_finite());
+        }
+        assert_eq!(m.vertex_count(), 8);
+    }
+
+    #[test]
+    fn bend_zero_angle_is_identity() {
+        let mut m = cube();
+        let before = m.positions.clone();
+        m.bend(Vec3::Y, Vec3::X, 0.0);
+        for (a, b) in m.positions.iter().zip(before.iter()) {
+            assert!(a.abs_diff_eq(*b, 1e-6));
+        }
+    }
+
+    #[test]
+    fn deformers_reject_degenerate_axis() {
+        let mut m = cube();
+        let before = m.positions.clone();
+        m.taper(Vec3::ZERO, 0.5);
+        m.twist(Vec3::ZERO, 1.0);
+        for (a, b) in m.positions.iter().zip(before.iter()) {
+            assert!(a.abs_diff_eq(*b, 1e-6));
+        }
     }
 }
