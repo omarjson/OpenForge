@@ -1,0 +1,12 @@
+[package]
+name = "openforge-boolean"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mesh boolean operations (union, subtract, intersect) via BSP for OpenForge."
+
+[dependencies]
+openforge-core = { path = "../openforge-core" }
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true

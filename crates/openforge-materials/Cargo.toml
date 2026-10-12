@@ -1,0 +1,13 @@
+[package]
+name = "openforge-materials"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Materials, textures, and shading for OpenForge."
+
+[dependencies]
+openforge-core = { path = "../openforge-core" }
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

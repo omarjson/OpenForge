@@ -1,0 +1,12 @@
+[package]
+name = "openforge-uv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UV projection, unwrapping, and UV editing operations for OpenForge."
+
+[dependencies]
+openforge-core = { path = "../openforge-core" }
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true

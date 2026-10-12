@@ -9,6 +9,7 @@
 
 use glam::{Mat4, Vec3, Vec4};
 use openforge_core::math::Ray;
+use openforge_core::mesh::Mesh;
 use openforge_core::scene::Scene;
 use openforge_core::selection::Selection;
 use openforge_core::NodeId;
@@ -110,33 +111,137 @@ pub struct Vx {
 pub struct Tri {
     pub v: [Vx; 3],
     pub selected: bool,
+    /// True when this triangle's face is in the current face selection.
+    pub face_selected: bool,
 }
 
 /// Collect all visible mesh triangles from the scene in world space.
-pub fn collect_triangles(scene: &mut Scene, selection: &Selection) -> Vec<Tri> {
+pub fn collect_triangles(
+    scene: &mut Scene,
+    selection: &Selection,
+) -> Vec<Tri> {
     let mut out = Vec::new();
     let ids: Vec<NodeId> = scene.iter().filter(|n| n.is_mesh() && n.visible).map(|n| n.id).collect();
     for id in ids {
         let Ok(world) = scene.world_matrix(id) else { continue };
         let selected = selection.is_node_selected(id);
+        let sel_faces = selection.selected_elements(id).cloned();
         let Ok(node) = scene.get(id) else { continue };
         let Some(mesh) = node.mesh() else { continue };
-        for tri in mesh.triangulate() {
-            let p = |pi: u32| world.transform_point3(mesh.positions[pi as usize]);
-            // Face normal in world space.
-            let a = p(tri[0]);
-            let b = p(tri[1]);
-            let c = p(tri[2]);
-            let n = (b - a).cross(c - a).normalize_or_zero();
-            out.push(Tri {
-                v: [
-                    Vx { pos: a, normal: n },
-                    Vx { pos: b, normal: n },
-                    Vx { pos: c, normal: n },
-                ],
-                selected,
-            });
+        // Map each source face to its triangulated output.
+        for (face_idx, face) in mesh.faces.iter().enumerate() {
+            let face_is_sel = sel_faces
+                .as_ref()
+                .map(|s| s.contains(&(face_idx as u32)))
+                .unwrap_or(false);
+            let cs = &face.corners;
+            for i in 1..cs.len().saturating_sub(1) {
+                let tri = [cs[0].position, cs[i].position, cs[i + 1].position];
+                let p = |pi: u32| world.transform_point3(mesh.positions[pi as usize]);
+                let a = p(tri[0]);
+                let b = p(tri[1]);
+                let c = p(tri[2]);
+                let n = (b - a).cross(c - a).normalize_or_zero();
+                out.push(Tri {
+                    v: [
+                        Vx { pos: a, normal: n },
+                        Vx { pos: b, normal: n },
+                        Vx { pos: c, normal: n },
+                    ],
+                    selected,
+                    face_selected: face_is_sel,
+                });
+            }
         }
     }
     out
+}
+
+/// Result of a face pick: the node and the source face index.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FaceHit {
+    pub node: NodeId,
+    pub face: u32,
+    pub dist: f32,
+}
+
+/// Cast a ray and return the nearest visible face across all mesh nodes.
+pub fn pick_face(scene: &mut Scene, ray: Ray) -> Option<FaceHit> {
+    let candidates: Vec<(NodeId, Mesh)> = scene
+        .iter()
+        .filter(|n| n.is_mesh() && n.visible && !n.frozen)
+        .filter_map(|n| n.mesh().map(|m| (n.id, m.clone())))
+        .collect();
+
+    let mut best: Option<FaceHit> = None;
+    for (id, mesh) in candidates {
+        let Ok(world) = scene.world_matrix(id) else { continue };
+        let inv = world.inverse();
+        let local_origin = inv.transform_point3(ray.origin);
+        let local_dir = (inv * ray.direction.extend(0.0)).truncate().normalize_or_zero();
+        let local_ray = Ray { origin: local_origin, direction: local_dir };
+        for (fi, face) in mesh.faces.iter().enumerate() {
+            let cs = &face.corners;
+            for i in 1..cs.len().saturating_sub(1) {
+                let a = mesh.positions[cs[0].position as usize];
+                let b = mesh.positions[cs[i].position as usize];
+                let c = mesh.positions[cs[i + 1].position as usize];
+                if let Some(t) = local_ray.intersect_triangle(a, b, c) {
+                    let world_hit = world.transform_point3(local_ray.at(t));
+                    let dist = world_hit.distance(ray.origin);
+                    let better = best.map(|b| dist < b.dist).unwrap_or(true);
+                    if better {
+                        best = Some(FaceHit { node: id, face: fi as u32, dist });
+                    }
+                }
+            }
+        }
+    }
+    best
+}
+
+/// Result of a vertex pick.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct VertexHit {
+    pub node: NodeId,
+    pub vertex: u32,
+    pub dist: f32,
+}
+
+/// Cast a ray and return the nearest vertex within screen-space tolerance.
+pub fn pick_vertex(
+    scene: &mut Scene,
+    ray: Ray,
+    cam_pos: Vec3,
+    tol_world: f32,
+) -> Option<VertexHit> {
+    let candidates: Vec<(NodeId, Mesh)> = scene
+        .iter()
+        .filter(|n| n.is_mesh() && n.visible && !n.frozen)
+        .filter_map(|n| n.mesh().map(|m| (n.id, m.clone())))
+        .collect();
+
+    let mut best: Option<VertexHit> = None;
+    for (id, mesh) in candidates {
+        let Ok(world) = scene.world_matrix(id) else { continue };
+        for (vi, _) in mesh.positions.iter().enumerate() {
+            let wp = world.transform_point3(mesh.positions[vi]);
+            // Distance from the vertex to the ray.
+            let to_v = wp - ray.origin;
+            let along = to_v.dot(ray.direction);
+            if along < 0.0 {
+                continue;
+            }
+            let closest = ray.at(along);
+            let perp = wp.distance(closest);
+            if perp <= tol_world {
+                let better = best.map(|b| along < b.dist).unwrap_or(true);
+                if better {
+                    best = Some(VertexHit { node: id, vertex: vi as u32, dist: along });
+                }
+            }
+        }
+    }
+    let _ = cam_pos;
+    best
 }

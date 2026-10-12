@@ -1,0 +1,12 @@
+[package]
+name = "openforge-ops"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Advanced modeling operators (bevel, loop cut, mirror, bridge, transform tools) for OpenForge."
+
+[dependencies]
+openforge-core = { path = "../openforge-core" }
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true

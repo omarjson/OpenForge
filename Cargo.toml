@@ -3,6 +3,13 @@ resolver = "2"
 members = [
     "crates/openforge-core",
     "crates/openforge-io",
+    "crates/openforge-ops",
+    "crates/openforge-materials",
+    "crates/openforge-render",
+    "crates/openforge-animation",
+    "crates/openforge-algorithms",
+    "crates/openforge-uv",
+    "crates/openforge-boolean",
     "crates/openforge-app",
 ]
 

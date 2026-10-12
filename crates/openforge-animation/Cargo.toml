@@ -1,0 +1,12 @@
+[package]
+name = "openforge-animation"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Keyframe animation tracks, interpolation, and sampling for OpenForge."
+
+[dependencies]
+openforge-core = { path = "../openforge-core" }
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true

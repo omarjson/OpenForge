@@ -1,0 +1,12 @@
+[package]
+name = "openforge-algorithms"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Procedural mesh generation and algorithms (L-systems, noise, grids) for OpenForge."
+
+[dependencies]
+openforge-core = { path = "../openforge-core" }
+glam.workspace = true
+thiserror.workspace = true
+log.workspace = true

@@ -55,7 +55,7 @@ impl OpenForgeApp {
             camera: Camera::default(),
             tool: ActiveTool::Select,
             edit_before: None,
-            status: "Ready. Left-drag selects; middle-drag orbits; scroll zooms.".into(),
+            status: "Ready. Left-drag selects; middle-drag orbits; scroll zooms. Face level: X extrude, I inset, O poke, S subdivide, Del delete.".into(),
             current_file: None,
             tris: Vec::new(),
             dirty: true,
@@ -125,6 +125,105 @@ impl OpenForgeApp {
             app.selection.clear();
         });
         self.status = "Deleted selection.".into();
+    }
+
+    // --- Sub-object modeling operations -----------------------------------------
+
+    /// The first selected mesh node, if any.
+    fn active_mesh_node(&self) -> Option<NodeId> {
+        self.selection
+            .selected_nodes()
+            .find(|id| self.scene.get(*id).map(|n| n.is_mesh()).unwrap_or(false))
+    }
+
+    /// The selected face indices (as `usize`) for a node.
+    fn selected_faces(&self, id: NodeId) -> Vec<usize> {
+        self.selection
+            .selected_elements(id)
+            .map(|s| s.iter().map(|&x| x as usize).collect())
+            .unwrap_or_default()
+    }
+
+    /// Run a modeling op on the active mesh's selected faces with undo. The
+    /// closure receives the mesh and the selected faces and returns a status
+    /// string describing what it did.
+    fn with_mesh_faces(&mut self, label: &str, need_faces: bool, f: impl FnOnce(&mut Mesh, &[usize]) -> String) {
+        let Some(id) = self.active_mesh_node() else {
+            self.status = "Select a mesh first.".into();
+            return;
+        };
+        let faces = self.selected_faces(id);
+        if need_faces && faces.is_empty() {
+            self.status = "Switch to Face level and select faces.".into();
+            return;
+        }
+        let mut msg = String::new();
+        self.with_edit(label, |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    msg = f(mesh, &faces);
+                }
+            }
+        });
+        if !msg.is_empty() {
+            self.status = msg;
+        }
+    }
+
+    fn extrude_selected(&mut self, distance: f32) {
+        self.with_mesh_faces("Extrude", true, |mesh, faces| {
+            match mesh.extrude_faces(faces, distance) {
+                Some(r) => format!("Extruded {} face(s), {} wall(s).", r.cap_faces.len(), r.side_faces),
+                None => "Extrude failed.".into(),
+            }
+        });
+    }
+
+    fn inset_selected(&mut self, amount: f32) {
+        self.with_mesh_faces("Inset", true, |mesh, faces| {
+            match mesh.inset_faces(faces, amount) {
+                Some(caps) => format!("Inset {} face(s) -> {} cap(s).", faces.len(), caps.len()),
+                None => "Inset failed.".into(),
+            }
+        });
+    }
+
+    fn poke_selected(&mut self) {
+        self.with_mesh_faces("Poke", true, |mesh, faces| {
+            let added = mesh.poke_faces(faces);
+            format!("Poked {} face(s) -> +{} face(s).", faces.len(), added)
+        });
+    }
+
+    fn subdivide_selected(&mut self) {
+        self.with_mesh_faces("Subdivide", true, |mesh, faces| {
+            let added = mesh.subdivide_faces(faces);
+            format!("Subdivided {} face(s) -> +{} face(s).", faces.len(), added)
+        });
+    }
+
+    fn delete_faces_selected(&mut self) {
+        self.with_mesh_faces("Delete Faces", true, |mesh, faces| {
+            let removed = mesh.delete_faces(faces);
+            format!("Deleted {} face(s).", removed)
+        });
+    }
+
+    /// Weld coincident vertices of the active mesh (whole-mesh, vertex level).
+    fn weld_selected(&mut self, eps: f32) {
+        let Some(id) = self.active_mesh_node() else {
+            self.status = "Select a mesh first.".into();
+            return;
+        };
+        let mut merged = 0usize;
+        self.with_edit("Weld", |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    merged = mesh.weld_close(eps);
+                }
+            }
+        });
+        self.status = format!("Welded {} vertex/vertices (eps={:.3}).", merged, eps);
     }
 
     fn undo_edit(&mut self) {
@@ -210,6 +309,7 @@ impl OpenForgeApp {
 
         // Build the active tool and a context borrowing the scene + selection.
         let mut tool = self.active_tool();
+        let level = self.selection.level;
         let mut tctx = ToolContext {
             scene: &mut self.scene,
             selection: &mut self.selection,
@@ -220,6 +320,9 @@ impl OpenForgeApp {
         let primary = response.dragged_by(egui::PointerButton::Primary)
             || response.drag_started_by(egui::PointerButton::Primary);
         let mut pending_undo: Option<(String, Scene)> = None;
+        // For sub-object picking we stash the click ray and resolve it after the
+        // tool context's borrows on the scene/selection are released.
+        let mut click_pick: Option<openforge_core::math::Ray> = None;
         if let Some(pos) = response.interact_pointer_pos() {
             let ndc_x = ((pos.x - rect.left()) / rect.width()) * 2.0 - 1.0;
             let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height()) * 2.0;
@@ -241,14 +344,47 @@ impl OpenForgeApp {
                     pending_undo = before.map(|b| (outcome.label, b));
                     self.dirty = true;
                 }
-            } else if response.clicked() && matches!(self.tool, ActiveTool::Select) {
-                // Plain click with select tool.
-                tool.on_pointer_down(&mut tctx, &pointer);
-                tool.on_pointer_up(&mut tctx, &pointer);
-                self.dirty = true;
+            } else if response.clicked() {
+                if level == SelectLevel::Object {
+                    // Object level: delegate to the select tool.
+                    if matches!(self.tool, ActiveTool::Select) {
+                        tool.on_pointer_down(&mut tctx, &pointer);
+                        tool.on_pointer_up(&mut tctx, &pointer);
+                        self.dirty = true;
+                    }
+                } else {
+                    // Face/Vertex level: stash the ray and pick below.
+                    click_pick = Some(ray);
+                }
             }
         }
         drop(tctx);
+
+        // Resolve a sub-object pick now that the borrows are released.
+        if let Some(ray) = click_pick {
+            match level {
+                SelectLevel::Face => {
+                    if let Some(hit) = viewport::pick_face(&mut self.scene, ray) {
+                        self.selection.clear();
+                        self.selection.select_node(hit.node);
+                        self.selection.select_elements(hit.node, [hit.face]);
+                        self.dirty = true;
+                    }
+                }
+                SelectLevel::Vertex => {
+                    let tol = (self.camera.distance * 0.02).max(0.01);
+                    if let Some(hit) =
+                        viewport::pick_vertex(&mut self.scene, ray, self.camera.eye(), tol)
+                    {
+                        self.selection.clear();
+                        self.selection.select_node(hit.node);
+                        self.selection.select_elements(hit.node, [hit.vertex]);
+                        self.dirty = true;
+                    }
+                }
+                _ => {}
+            }
+        }
 
         // Record the undo entry now that the scene borrow is released.
         if let Some((label, before)) = pending_undo {
@@ -305,20 +441,48 @@ impl OpenForgeApp {
             if behind || pts.len() < 3 {
                 continue;
             }
-            let shade = (t.v[0].normal.dot(light).clamp(-1.0, 1.0) * 0.5 + 0.5).clamp(0.15, 1.0);
-            let base = if t.selected {
-                egui::Color32::from_rgb(80, 170, 255)
+            let base = if t.face_selected {
+                // Selected sub-object face: warm highlight.
+                [255u8, 170, 60, 255]
+            } else if t.selected {
+                [80u8, 170, 255, 255]
             } else {
-                egui::Color32::from_rgb(170, 170, 178)
+                [170u8, 170, 178, 255]
             };
-            let (r, g, b) = (base.r() as f32, base.g() as f32, base.b() as f32);
-            let color = egui::Color32::from_rgb(
-                (r * shade) as u8,
-                (g * shade) as u8,
-                (b * shade) as u8,
-            );
+            // Phong shade using the shared materials crate (diffuse + specular).
+            let centroid = (t.v[0].pos + t.v[1].pos + t.v[2].pos) / 3.0;
+            let view_dir = (cam - centroid).normalize_or_zero();
+            let [r, g, b, _] =
+                openforge_materials::shade_phong(t.v[0].normal, light, view_dir, 24.0, base);
+            let color = egui::Color32::from_rgb(r, g, b);
             let shape = egui::Shape::convex_polygon(pts, color, egui::Stroke::new(0.5_f32, color.gamma_multiply(0.6)));
             painter.add(shape);
+        }
+
+        // Overlay selected vertices as small dots (vertex level editing aid).
+        if self.selection.level == SelectLevel::Vertex {
+            let dot = 3.0f32;
+            for id in self.selection.selected_nodes() {
+                let Ok(world) = self.scene.world_matrix(id) else { continue };
+                let selected = self.selection.selected_elements(id).cloned();
+                let Ok(node) = self.scene.get(id) else { continue };
+                let Some(mesh) = node.mesh() else { continue };
+                for (vi, p) in mesh.positions.iter().enumerate() {
+                    let wp = world.transform_point3(*p);
+                    let Some((x, y, _)) = viewport::project(vp, wp, size) else { continue };
+                    let is_sel = selected
+                        .as_ref()
+                        .map(|s| s.contains(&(vi as u32)))
+                        .unwrap_or(false);
+                    let center = egui::pos2(rect.left() + x, rect.top() + y);
+                    let (rad, color) = if is_sel {
+                        (dot + 1.0, egui::Color32::from_rgb(255, 170, 60))
+                    } else {
+                        (dot, egui::Color32::from_rgb(120, 200, 255))
+                    };
+                    painter.circle_filled(center, rad, color);
+                }
+            }
         }
 
         // Overlay label.
@@ -474,7 +638,12 @@ impl OpenForgeApp {
             self.redo_edit();
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Delete)) {
-            self.delete_selected();
+            // Level-aware delete: element-level deletes sub-objects, object
+            // level deletes whole nodes.
+            match self.selection.level {
+                SelectLevel::Face if self.active_mesh_node().is_some() => self.delete_faces_selected(),
+                _ => self.delete_selected(),
+            }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
             self.frame_all();
@@ -491,6 +660,22 @@ impl OpenForgeApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::R)) {
             self.tool = ActiveTool::Rotate;
+        }
+        // Modeling hotkeys (sub-object ops).
+        if ctx.input(|i| i.key_pressed(egui::Key::X)) {
+            self.extrude_selected(0.5);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::I)) {
+            self.inset_selected(0.3);
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::O)) {
+            self.poke_selected();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::S)) {
+            self.subdivide_selected();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::V)) {
+            self.weld_selected(0.001);
         }
     }
 
@@ -510,6 +695,56 @@ impl OpenForgeApp {
                 ui.separator();
                 if ui.button("Frame All").clicked() {
                     self.frame_all();
+                }
+            });
+            // Second row: sub-object modeling operations.
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Model:");
+                let has_mesh = self.active_mesh_node().is_some();
+                let has_faces = has_mesh && self.selection.total_element_count() > 0
+                    && self.selection.level == SelectLevel::Face;
+                if ui
+                    .add_enabled(has_faces, egui::Button::new("Extrude (X)"))
+                    .on_hover_text("Extrude selected faces outward")
+                    .clicked()
+                {
+                    self.extrude_selected(0.5);
+                }
+                if ui
+                    .add_enabled(has_faces, egui::Button::new("Inset (I)"))
+                    .on_hover_text("Inset selected faces")
+                    .clicked()
+                {
+                    self.inset_selected(0.3);
+                }
+                if ui
+                    .add_enabled(has_faces, egui::Button::new("Poke (O)"))
+                    .on_hover_text("Poke selected faces to their centroid")
+                    .clicked()
+                {
+                    self.poke_selected();
+                }
+                if ui
+                    .add_enabled(has_faces, egui::Button::new("Subdivide (S)"))
+                    .on_hover_text("Subdivide selected faces into quads")
+                    .clicked()
+                {
+                    self.subdivide_selected();
+                }
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Weld (V)"))
+                    .on_hover_text("Weld coincident vertices")
+                    .clicked()
+                {
+                    self.weld_selected(0.001);
+                }
+                if ui
+                    .add_enabled(has_faces, egui::Button::new("Delete Faces"))
+                    .on_hover_text("Delete selected faces")
+                    .clicked()
+                {
+                    self.delete_faces_selected();
                 }
             });
         });

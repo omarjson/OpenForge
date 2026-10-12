@@ -5,6 +5,7 @@
 //! selection set, an undo stack, interactive tools) without copying any
 //! proprietary implementation.
 
+pub mod edit;
 pub mod math;
 pub mod mesh;
 pub mod node;

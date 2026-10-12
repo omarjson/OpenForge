@@ -1,0 +1,15 @@
+[package]
+name = "openforge-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPU (wgpu) viewport renderer backend for OpenForge."
+
+[dependencies]
+openforge-core = { path = "../openforge-core" }
+glam.workspace = true
+bytemuck.workspace = true
+log.workspace = true
+# Note: wgpu/winit/egui are intentionally NOT added here yet. The renderer is
+# developed against openforge-core math first; the GPU integration layer is
+# wired in by the app once the interface is stable.
