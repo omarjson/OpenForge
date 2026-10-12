@@ -14,14 +14,14 @@ A clean-room, open-source 3D modeling application written in Rust, targeting
 
 ## Architecture
 
-The project is a Cargo workspace of three crates, mirroring the layered design of
-modern editors:
+The project is a Cargo workspace of eleven crates; these are the main layers:
 
 | Crate | Role | Notes |
 |-------|------|-------|
 | `openforge-core` | Scene graph, geometry, editing model | GUI- and renderer-agnostic. Nodes, meshes, selection, undo/redo, interactive tools, ray picking. |
 | `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL. Clean-room readers and writers. |
-| `openforge-app` | Desktop application | `eframe`/`egui` UI (which bundles `winit` for windowing and `wgpu` for GPU). Viewport, outliner, properties, toolbar, hotkeys. |
+| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target, and the scene, grid and axis-gizmo passes. |
+| `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, outliner, properties, toolbar, hotkeys. |
 
 ### Core concepts
 
@@ -111,12 +111,13 @@ real files to disk and re-imports them for all four formats.
 ## Roadmap
 
 This is a deliberately solid *foundation*, not a feature-complete clone of a
-mature commercial modeler. Natural next steps:
+mature commercial modeler. Sub-element editing, deformers, boolean CSG,
+skeletal skinning, materials, and a **depth-tested `wgpu` viewport** are in;
+what remains is mostly application surface. Natural next steps:
 
-- Sub-element (vertex/edge/face) editing and selection highlighting in the viewport.
-- Materials, textures, and a shading model beyond flat headlight shading.
-- A GPU (`wgpu`) viewport backend for large scenes.
-- Skeletal animation and skinning.
+- An interactive UV editor (the projection/unwrap/pack math already exists).
+- A deeper GPU viewport: selection outlines and wireframe, MSAA, a
+  materials-driven shader instead of one Lambert pass, and depth-buffer picking.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) mirroring the study architecture.
 
