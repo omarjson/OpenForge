@@ -10,6 +10,7 @@ members = [
     "crates/openforge-algorithms",
     "crates/openforge-uv",
     "crates/openforge-boolean",
+    "crates/openforge-rig",
     "crates/openforge-app",
 ]
 
