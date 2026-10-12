@@ -117,11 +117,13 @@ mod tests {
 
     #[test]
     fn orbit_camera_mirrors_the_cpu_camera() {
-        let mut camera = Camera::default();
-        camera.target = Vec3::new(1.0, -2.0, 3.0);
-        camera.distance = 12.5;
-        camera.yaw = 1.1;
-        camera.pitch = -0.4;
+        let camera = Camera {
+            target: Vec3::new(1.0, -2.0, 3.0),
+            distance: 12.5,
+            yaw: 1.1,
+            pitch: -0.4,
+            ..Camera::default()
+        };
         let gpu = orbit_camera(&camera);
         assert_eq!(gpu.target, camera.target);
         assert_eq!(gpu.distance, camera.distance);

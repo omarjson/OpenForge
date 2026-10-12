@@ -208,8 +208,9 @@ mod tests {
         mesh.normals = vec![n]; // corners all reference normal slot 0
         let world = Mat4::from_scale(Vec3::new(2.0, 1.0, 1.0));
         let buf = MeshBuffers::build(&mesh, world, DEFAULT_BASE_COLOR);
-        // inv-transpose of diag(2,1,1) is diag(0.5,1,1): n' ∝ (0.3536, 0.7071, 0).
-        let expected = Vec3::new(0.35355339, 0.70710678, 0.0).normalize();
+        // inv-transpose of diag(2,1,1) is diag(0.5,1,1), which maps n = (1,1,0)
+        // to (0.5, 1, 0), i.e. (1,2,0) once normalized.
+        let expected = Vec3::new(0.5, 1.0, 0.0).normalize();
         for v in &buf.vertices {
             assert!((Vec3::from(v.normal) - expected).length() < 1e-5);
         }

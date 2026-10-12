@@ -1048,7 +1048,7 @@ mod tests {
         //    dark background (plus the grid, which never reaches this
         //    brightness).
         let stats = renderer.render(&device, &queue, &mut scene, &selection, &camera, 0.0);
-        assert!(stats.indices > 0 && stats.indices % 3 == 0, "{stats:?}");
+        assert!(stats.indices > 0 && stats.indices.is_multiple_of(3), "{stats:?}");
         assert_eq!(stats.draws, 3);
         let pixels = read_pixels(&device, &queue, &renderer);
         let lit = bright_neutral_pixels(&pixels, renderer.size());
