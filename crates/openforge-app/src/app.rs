@@ -39,6 +39,10 @@ pub struct OpenForgeApp {
     dirty: bool,
     show_outliner: bool,
     show_properties: bool,
+    /// Deformer axis index (0 = X, 1 = Y, 2 = Z).
+    deform_axis: usize,
+    /// Deformer amount: taper factor, or twist/bend angle in radians.
+    deform_amount: f32,
 }
 
 impl OpenForgeApp {
@@ -62,6 +66,8 @@ impl OpenForgeApp {
             dirty: true,
             show_outliner: true,
             show_properties: true,
+            deform_axis: 1,
+            deform_amount: 0.5,
         }
     }
 
@@ -305,6 +311,85 @@ impl OpenForgeApp {
             }
         });
         self.status = format!("Mirrored; mesh now has {} vertices.", verts);
+    }
+
+    /// Map the stored deformer axis index to a vector.
+    fn deform_axis_vec(&self) -> Vec3 {
+        match self.deform_axis {
+            0 => Vec3::X,
+            1 => Vec3::Y,
+            _ => Vec3::Z,
+        }
+    }
+
+    /// Apply a deformer (Taper / Twist / Bend) to the whole active mesh.
+    fn deform_selected(&mut self, kind: &str) {
+        let axis = self.deform_axis_vec();
+        // Bend curls the length axis around a perpendicular one.
+        let bend_axis = if axis == Vec3::X { Vec3::Y } else { Vec3::X };
+        let amount = self.deform_amount;
+        let Some(id) = self.active_mesh_node() else {
+            self.status = "Select a mesh first.".into();
+            return;
+        };
+        self.with_edit(kind, |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    match kind {
+                        "Taper" => mesh.taper(axis, amount),
+                        "Twist" => mesh.twist(axis, amount),
+                        "Bend" => mesh.bend(axis, bend_axis, amount),
+                        _ => {}
+                    }
+                }
+            }
+        });
+        self.status = format!("{} applied along {:?} (amount {:.2}).", kind, axis, amount);
+    }
+
+    /// Combine the two first selected meshes with a boolean op (the second is
+    /// consumed; the first takes the result).
+    fn boolean_selected(&mut self, kind: &str) {
+        let ids: Vec<NodeId> = self
+            .selection
+            .selected_nodes()
+            .filter(|id| self.scene.get(*id).map(|n| n.is_mesh()).unwrap_or(false))
+            .collect();
+        if ids.len() < 2 {
+            self.status = "Select two meshes for a boolean.".into();
+            return;
+        }
+        let (a, b) = (ids[0], ids[1]);
+        let (Some(ma), Some(mb)) = (
+            self.scene.get(a).ok().and_then(|n| n.mesh()).cloned(),
+            self.scene.get(b).ok().and_then(|n| n.mesh()).cloned(),
+        ) else {
+            self.status = "Could not read the two meshes.".into();
+            return;
+        };
+        let result = match kind {
+            "Union" => openforge_boolean::union(&ma, &mb),
+            "Subtract" => openforge_boolean::subtract(&ma, &mb),
+            "Intersect" => openforge_boolean::intersect(&ma, &mb),
+            _ => return,
+        };
+        match result {
+            Ok(mesh) => {
+                let verts = mesh.vertex_count();
+                self.with_edit(kind, |app| {
+                    if let Ok(node) = app.scene.get_mut(a) {
+                        if let Some(slot) = node.mesh_mut() {
+                            *slot = mesh;
+                        }
+                    }
+                    app.scene.remove_subtree(b);
+                    app.selection.clear();
+                    app.selection.select_node(a);
+                });
+                self.status = format!("{}: result has {} vertices.", kind, verts);
+            }
+            Err(e) => self.status = format!("Boolean failed: {}", e),
+        }
     }
 
     fn undo_edit(&mut self) {
@@ -881,6 +966,59 @@ impl OpenForgeApp {
                     .clicked()
                 {
                     self.mirror_selected(Vec3::Z);
+                }
+            });
+            // Third row: deformers and boolean operations.
+            ui.separator();
+            ui.horizontal(|ui| {
+                let has_mesh = self.active_mesh_node().is_some();
+                ui.label("Deform:");
+                ui.label("Axis:");
+                ui.selectable_value(&mut self.deform_axis, 0, "X");
+                ui.selectable_value(&mut self.deform_axis, 1, "Y");
+                ui.selectable_value(&mut self.deform_axis, 2, "Z");
+                ui.add(
+                    egui::Slider::new(&mut self.deform_amount, -3.0..=3.0)
+                        .fixed_decimals(2)
+                        .text("Amount"),
+                );
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Taper"))
+                    .on_hover_text("Narrow one end along the axis (factor)")
+                    .clicked()
+                {
+                    self.deform_selected("Taper");
+                }
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Twist"))
+                    .on_hover_text("Twist around the axis (radians)")
+                    .clicked()
+                {
+                    self.deform_selected("Twist");
+                }
+                if ui
+                    .add_enabled(has_mesh, egui::Button::new("Bend"))
+                    .on_hover_text("Bend into an arc (radians)")
+                    .clicked()
+                {
+                    self.deform_selected("Bend");
+                }
+                ui.separator();
+                ui.label("Boolean:");
+                let two_meshes = self
+                    .selection
+                    .selected_nodes()
+                    .filter(|id| self.scene.get(*id).map(|n| n.is_mesh()).unwrap_or(false))
+                    .count()
+                    >= 2;
+                for (label, kind) in [("Union", "Union"), ("Subtract", "Subtract"), ("Intersect", "Intersect")] {
+                    if ui
+                        .add_enabled(two_meshes, egui::Button::new(label))
+                        .on_hover_text("Combine the two selected meshes (the second is consumed)")
+                        .clicked()
+                    {
+                        self.boolean_selected(kind);
+                    }
                 }
             });
         });
