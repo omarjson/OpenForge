@@ -9,6 +9,7 @@
 
 use glam::{Mat4, Vec3, Vec4};
 use openforge_core::math::Ray;
+use std::collections::HashMap;
 use openforge_core::mesh::Mesh;
 use openforge_core::scene::Scene;
 use openforge_core::selection::Selection;
@@ -200,6 +201,179 @@ pub fn pick_face(scene: &mut Scene, ray: Ray) -> Option<FaceHit> {
     best
 }
 
+/// How much edge overlay the viewport draws over the shaded meshes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Wireframe {
+    /// Shaded meshes only.
+    #[default]
+    Off,
+    /// The edges of the selected meshes, as a selection outline.
+    Selection,
+    /// Every visible mesh's edges, so topology reads through the shading.
+    All,
+}
+
+impl Wireframe {
+    /// The next mode in the `Off → Selection → All` cycle.
+    pub fn next(self) -> Self {
+        match self {
+            Wireframe::Off => Wireframe::Selection,
+            Wireframe::Selection => Wireframe::All,
+            Wireframe::All => Wireframe::Off,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Wireframe::Off => "Off",
+            Wireframe::Selection => "Selection",
+            Wireframe::All => "All",
+        }
+    }
+}
+
+/// One world-space edge of the overlay, flagged for how it should be coloured.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct OverlayEdge {
+    pub a: Vec3,
+    pub b: Vec3,
+    /// The owning mesh node is selected.
+    pub node_selected: bool,
+    /// At least one face using this edge is in the face selection.
+    pub face_selected: bool,
+}
+
+/// The world-space normal of a polygon, via Newell's method.
+///
+/// Unlike a cross product of the first three corners this stays sane on
+/// non-planar n-gons, which is exactly what an edge overlay walks.
+pub fn polygon_normal(points: &[Vec3]) -> Vec3 {
+    let mut n = Vec3::ZERO;
+    let len = points.len();
+    if len < 3 {
+        return n;
+    }
+    for i in 0..len {
+        let a = points[i];
+        let b = points[(i + 1) % len];
+        n.x += (a.y - b.y) * (a.z + b.z);
+        n.y += (a.z - b.z) * (a.x + b.x);
+        n.z += (a.x - b.x) * (a.y + b.y);
+    }
+    n.normalize_or_zero()
+}
+
+/// Collect the overlay edges for the visible scene.
+///
+/// The edges come from `wireframe`'s mode and are deduplicated per mesh, so a
+/// shared edge is drawn once. An edge is dropped when *every* face using it
+/// faces away from `eye`: without that, a closed mesh's wireframe would draw
+/// its own far side straight through the shaded surface.
+pub fn collect_edges(
+    scene: &mut Scene,
+    selection: &Selection,
+    wireframe: Wireframe,
+    eye: Vec3,
+) -> Vec<OverlayEdge> {
+    let mut out = Vec::new();
+    if wireframe == Wireframe::Off {
+        return out;
+    }
+
+    let ids: Vec<(NodeId, bool)> = scene
+        .iter()
+        .filter(|n| n.is_mesh() && n.visible && !n.frozen)
+        .map(|n| (n.id, selection.is_node_selected(n.id)))
+        .filter(|(_, selected)| wireframe == Wireframe::All || *selected)
+        .collect();
+
+    // An edge as it is discovered, before the facing test is final: later faces
+    // sharing it can still reveal it as front-facing.
+    struct Pending {
+        a: Vec3,
+        b: Vec3,
+        front: bool,
+        face_selected: bool,
+    }
+
+    for (id, node_selected) in ids {
+        let Ok(world) = scene.world_matrix(id) else { continue };
+        let sel_faces = selection.selected_elements(id).cloned();
+        let Ok(node) = scene.get(id) else { continue };
+        let Some(mesh) = node.mesh() else { continue };
+
+        let mut pending: Vec<Pending> = Vec::new();
+        let mut index: HashMap<(u32, u32), usize> = HashMap::new();
+
+        for (fi, face) in mesh.faces.iter().enumerate() {
+            let corners = &face.corners;
+            if corners.len() < 2 {
+                continue;
+            }
+            // Resolve the face in world space once, keeping each corner's
+            // vertex index beside it; a corner whose vertex no longer exists is
+            // skipped rather than trusted.
+            let verts: Vec<(u32, Vec3)> = corners
+                .iter()
+                .filter_map(|c| {
+                    mesh.positions
+                        .get(c.position as usize)
+                        .map(|p| (c.position, world.transform_point3(*p)))
+                })
+                .collect();
+            if verts.len() < 2 {
+                continue;
+            }
+            let pts: Vec<Vec3> = verts.iter().map(|(_, p)| *p).collect();
+            let normal = polygon_normal(&pts);
+            let front = normal.length_squared() > 0.0 && normal.dot(eye - pts[0]) > 0.0;
+            let face_selected = sel_faces
+                .as_ref()
+                .map(|s| s.contains(&(fi as u32)))
+                .unwrap_or(false);
+
+            let len = verts.len();
+            for i in 0..len {
+                let (pi, pa) = verts[i];
+                let (pj, pb) = verts[(i + 1) % len];
+                // Two corners of one face can name the same vertex (a seam);
+                // there is no edge to draw between a point and itself.
+                if pi == pj {
+                    continue;
+                }
+                let key = (pi.min(pj), pi.max(pj));
+                match index.get(&key) {
+                    Some(&at) => {
+                        if front {
+                            pending[at].front = true;
+                        }
+                        if face_selected {
+                            pending[at].face_selected = true;
+                        }
+                    }
+                    None => {
+                        index.insert(key, pending.len());
+                        pending.push(Pending { a: pa, b: pb, front, face_selected });
+                    }
+                }
+            }
+        }
+
+        for edge in pending {
+            if !edge.front {
+                continue;
+            }
+            out.push(OverlayEdge {
+                a: edge.a,
+                b: edge.b,
+                node_selected,
+                face_selected: edge.face_selected,
+            });
+        }
+    }
+    out
+}
+
 /// Result of a vertex pick.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct VertexHit {
@@ -245,3 +419,194 @@ pub fn pick_vertex(
     let _ = cam_pos;
     best
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use openforge_core::mesh::Mesh;
+    use openforge_core::selection::SelectLevel;
+
+    /// A quad in the XY plane, wound counter-clockwise seen from `+Z`.
+    fn quad(z: f32) -> Mesh {
+        let mut m = Mesh::new();
+        m.add_vertex(Vec3::new(-1.0, -1.0, z));
+        m.add_vertex(Vec3::new(1.0, -1.0, z));
+        m.add_vertex(Vec3::new(1.0, 1.0, z));
+        m.add_vertex(Vec3::new(-1.0, 1.0, z));
+        m.add_face(&[0, 1, 2, 3]);
+        m.compute_flat_normals();
+        m
+    }
+
+    /// A unit cube with outward-facing quads.
+    fn cube() -> Mesh {
+        let mut m = Mesh::new();
+        for &(x, y, z) in &[
+            (-1.0, -1.0, -1.0),
+            (1.0, -1.0, -1.0),
+            (1.0, 1.0, -1.0),
+            (-1.0, 1.0, -1.0),
+            (-1.0, -1.0, 1.0),
+            (1.0, -1.0, 1.0),
+            (1.0, 1.0, 1.0),
+            (-1.0, 1.0, 1.0),
+        ] {
+            m.add_vertex(Vec3::new(x, y, z));
+        }
+        m.add_face(&[4, 5, 6, 7]); // +Z
+        m.add_face(&[1, 0, 3, 2]); // -Z
+        m.add_face(&[5, 1, 2, 6]); // +X
+        m.add_face(&[0, 4, 7, 3]); // -X
+        m.add_face(&[7, 6, 2, 3]); // +Y
+        m.add_face(&[0, 1, 5, 4]); // -Y
+        m.compute_flat_normals();
+        m
+    }
+
+    #[test]
+    fn wireframe_cycles_off_selection_all() {
+        assert_eq!(Wireframe::default(), Wireframe::Off);
+        let mut mode = Wireframe::Off;
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            mode = mode.next();
+            seen.push(mode);
+        }
+        assert_eq!(seen, [Wireframe::Selection, Wireframe::All, Wireframe::Off]);
+        assert_eq!(Wireframe::All.label(), "All");
+    }
+
+    #[test]
+    fn polygon_normal_follows_the_winding() {
+        let ccw = [Vec3::ZERO, Vec3::X, Vec3::new(1.0, 1.0, 0.0), Vec3::Y];
+        assert!((polygon_normal(&ccw) - Vec3::Z).length() < 1e-5);
+        let mut reversed = ccw;
+        reversed.reverse();
+        assert!((polygon_normal(&reversed) + Vec3::Z).length() < 1e-5);
+        // Degenerate input has no direction rather than a garbage one.
+        assert_eq!(polygon_normal(&[Vec3::ZERO, Vec3::X]), Vec3::ZERO);
+    }
+
+    #[test]
+    fn wireframe_off_collects_nothing() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", quad(0.0));
+        let sel = Selection::new();
+        assert!(collect_edges(&mut scene, &sel, Wireframe::Off, Vec3::new(0.0, 0.0, 5.0)).is_empty());
+    }
+
+    #[test]
+    fn a_quad_yields_its_four_edges() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", quad(0.0));
+        let sel = Selection::new();
+        let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, 5.0));
+        assert_eq!(edges.len(), 4);
+        for e in &edges {
+            // Every edge keeps its two endpoints and no inherited flags.
+            assert!((e.b - e.a).length() > 1.0);
+            assert!(!e.node_selected && !e.face_selected);
+        }
+    }
+
+    #[test]
+    fn a_shared_edge_is_drawn_once() {
+        let mut m = Mesh::new();
+        for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        m.add_face(&[0, 1, 2]);
+        m.add_face(&[0, 2, 3]);
+        m.compute_flat_normals();
+        let mut scene = Scene::new();
+        scene.create_mesh("two tris", m);
+        let sel = Selection::new();
+        let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, 5.0));
+        // Six edge slots, five distinct edges: the diagonal is shared.
+        assert_eq!(edges.len(), 5);
+    }
+
+    #[test]
+    fn edges_seen_only_from_behind_are_dropped() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", quad(0.0));
+        let sel = Selection::new();
+        let front = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, 5.0));
+        let back = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, -5.0));
+        assert_eq!(front.len(), 4);
+        assert!(back.is_empty(), "from behind, the quad's own edges are hidden");
+    }
+
+    #[test]
+    fn a_closed_mesh_hides_the_edges_of_its_far_corner() {
+        let mut scene = Scene::new();
+        scene.create_mesh("cube", cube());
+        let sel = Selection::new();
+        let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(5.0, 5.0, 5.0));
+        // A cube has 12 edges; the three meeting at the far corner join two
+        // faces that both point away from the eye, so they are the ones hidden.
+        assert_eq!(edges.len(), 9);
+    }
+
+    #[test]
+    fn selection_mode_only_walks_selected_meshes() {
+        let mut scene = Scene::new();
+        let a = scene.create_mesh("a", quad(0.0));
+        scene.create_mesh("b", quad(2.0));
+        let mut sel = Selection::new();
+        sel.select_node(a);
+
+        let all = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, 8.0));
+        let only = collect_edges(&mut scene, &sel, Wireframe::Selection, Vec3::new(0.0, 0.0, 8.0));
+        assert_eq!(all.len(), 8, "both quads in All mode");
+        assert_eq!(only.len(), 4, "only the selected quad in Selection mode");
+        assert!(only.iter().all(|e| e.node_selected));
+        assert_eq!(all.iter().filter(|e| e.node_selected).count(), 4);
+    }
+
+    #[test]
+    fn face_selection_is_flagged_on_the_edges_around_it() {
+        // Two quads side by side; selecting the right one flags its four edges.
+        // The two meshes meet along x = 1 by *coincident* corners, not shared
+        // ones, so that seam is two edges (drawn on top of each other) rather
+        // than one: dedup is by vertex index, which is what the shading data
+        // says the topology is.
+        let mut m = Mesh::new();
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        for (x, y) in [(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        m.add_face(&[0, 1, 2, 3]);
+        m.add_face(&[4, 5, 6, 7]);
+        m.compute_flat_normals();
+
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("strip", m);
+        let mut sel = Selection::new();
+        sel.level = SelectLevel::Face;
+        sel.select_node(id);
+        sel.select_elements(id, [1u32]);
+
+        let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(1.0, 0.5, 5.0));
+        assert_eq!(edges.len(), 8);
+        assert_eq!(edges.iter().filter(|e| e.face_selected).count(), 4);
+    }
+
+    #[test]
+    fn hidden_and_frozen_meshes_are_left_out() {
+        let mut scene = Scene::new();
+        let hidden = scene.create_mesh("hidden", quad(0.0));
+        let frozen = scene.create_mesh("frozen", quad(1.0));
+        let shown = scene.create_mesh("shown", quad(2.0));
+        scene.get_mut(hidden).unwrap().visible = false;
+        scene.get_mut(frozen).unwrap().frozen = true;
+
+        let sel = Selection::new();
+        let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, 8.0));
+        assert_eq!(edges.len(), 4, "only the visible, unfrozen mesh contributes");
+        let _ = shown;
+    }
+}
+

@@ -41,7 +41,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 11 crates (311 `#[test]` fns; 312 tests run, all green)
+## 4. Repo layout — 11 crates (324 `#[test]` fns; 325 tests run, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -55,7 +55,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
-| `openforge-app` | 39 (bin) | eframe/egui GUI. `app.rs` (~2600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-app` | 52 (bin) | eframe/egui GUI. `app.rs` (~2600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -124,9 +124,9 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** baseline commit `2a201c8`. Full workspace builds with **0 warnings**,
-**312 tests pass**, CI green on all 3 platforms. Three work-streams are done —
-the **wgpu viewport** (#1), the **interactive UV editor** (#2) and the
-**transform gizmo** (#3) — plus a progress report:
+**325 tests pass**, CI green on all 3 platforms. Four work-streams are done —
+the **wgpu viewport** (#1), the **interactive UV editor** (#2), the
+**transform gizmo** (#3) and the **edge overlay** (#4) — plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -184,7 +184,7 @@ the **wgpu viewport** (#1), the **interactive UV editor** (#2) and the
   the drag state (`self.tool_drag`) and gates the release on `drag_stopped()`
   alone. A press that misses the handles therefore falls through to the
   free-form view-plane drag, which now works too.
-- **27 new tests**: 18 in `gizmo.rs` (pure math — pixel size, ring geometry,
+- **27 tests**: 18 in `gizmo.rs` (pure math — pixel size, ring geometry,
   hit-testing, the three drag measures, transform application) and 9 in
   `app.rs`, which drive `handle_central_viewport` headlessly on a plain
   `egui::Context` with synthetic pointer events: hit the arm and only that arm,
@@ -194,8 +194,24 @@ the **wgpu viewport** (#1), the **interactive UV editor** (#2) and the
   check that the Move gizmo paints exactly three extra strokes while Rotate
   paints paths instead.
 
+- **A wireframe / selection-outline overlay** over both viewport backends.
+  `viewport::collect_edges` walks the visible meshes and returns deduplicated
+  world-space edges, dropping any edge whose faces all point away from the eye
+  (Newell normals, so non-planar n-gons behave) — without that cull a closed
+  mesh would draw its own far side through the shading, since the CPU painter
+  has no depth buffer to consult. `Wireframe::Off/Selection/All` cycles from
+  `Z` and the View menu, and one paint routine serves both backends. Edges of
+  selected faces are drawn in the warm highlight, of selected nodes in blue,
+  and everything else dim.
+- **13 tests**: 10 in `viewport.rs` (edge dedup, the facing cull — including a
+  cube hiding exactly the three edges meeting at its far corner — mode and
+  shortcut cycling, the visibility/frozen filters, face-selection flags) and 3
+  in `app.rs` driving the overlay headlessly: the `Z` cycle, the `Selection`
+  vs `All` stroke counts (exactly nine more for an unselected box), and the
+  highlight appearing on the facing face's edges only.
+
 **Verified this session:** `cargo build --release -p openforge-app` (the CI
-build job) → 0 warnings; `cargo test --workspace` → **312 pass, 0 failures**
+build job) → 0 warnings; `cargo test --workspace` → **325 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0); the app was launched
 locally and logged `eframe: ... Using wgpu.` with a Metal adapter and **no**
 `egui_wgpu` warnings, and it survived a 12 s run on the wgpu path without a
@@ -283,6 +299,9 @@ deltas and are many work-streams, not one push.
   silently do nothing (or nothing is undoable). Likewise reach `on_pointer_up`
   on `drag_stopped()` alone — gating it on `dragged_by(Primary)` never fires on
   the release frame.
+- **`Stroke::color` is a `ColorMode`, not a `Color32`, in egui 0.29.** A test
+  that inspects painted shapes must compare against
+  `egui::epaint::ColorMode::Solid(colour)`.
 - **Panel order in `update()` matters.** The status bar is added first so it
   owns the bottom edge, then the UV editor, then the side panels, and the
   central viewport last. That is what keeps the viewport's rect — and its mouse

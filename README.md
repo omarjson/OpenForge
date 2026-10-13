@@ -98,6 +98,11 @@ A sample GitHub Actions matrix is shown below.
   highlights and is labelled while the drag is live, and the whole gesture is a
   single undo step. Handles keep a constant size on screen whatever the camera
   distance.
+- **Z** cycles the edge overlay: off, then the selected meshes' edges as a
+  selection outline, then every visible mesh's wireframe (**View → Wireframe**
+  shows the current mode). Edges of the selected faces are highlighted, and
+  edges seen only from behind are dropped so a closed mesh doesn't draw its own
+  far side through the shading.
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
 - **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Delete** removes, **F** frames all.
 - **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY and STL.

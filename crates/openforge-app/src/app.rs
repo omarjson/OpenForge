@@ -67,6 +67,8 @@ pub struct OpenForgeApp {
     rig_bones: usize,
     /// Live transform-gizmo state (hover, drag, this frame's handle layout).
     gizmo: gizmo::Gizmo,
+    /// How much edge overlay the viewport draws over the shading.
+    wireframe: viewport::Wireframe,
     /// In-progress free-form tool drag, held here because a drag spans frames.
     tool_drag: Option<DragState>,
 }
@@ -118,6 +120,7 @@ impl OpenForgeApp {
             rig_angle: 0.0,
             rig_bones: 4,
             gizmo: gizmo::Gizmo::default(),
+            wireframe: viewport::Wireframe::default(),
             tool_drag: None,
         }
     }
@@ -948,6 +951,7 @@ impl OpenForgeApp {
 
         // Overlay selected vertices as small dots (vertex level editing aid).
         self.paint_vertex_dots(&painter, rect);
+        self.paint_wireframe(&painter, rect);
         // The transform gizmo sits above the geometry so its handles stay
         // grabbable even when they overlap the mesh.
         self.paint_gizmo(&painter);
@@ -1092,6 +1096,15 @@ impl OpenForgeApp {
                         self.uv.open = !self.uv.open;
                         ui.close_menu();
                     }
+                    if ui
+                        .button(format!("Wireframe: {}", self.wireframe.label()))
+                        .on_hover_text("Cycle Off / Selection / All (Z)")
+                        .clicked()
+                    {
+                        self.wireframe = self.wireframe.next();
+                        self.dirty = true;
+                        ui.close_menu();
+                    }
                     if ui.button("Reset Camera").clicked() {
                         self.camera = Camera::default();
                         self.dirty = true;
@@ -1123,6 +1136,10 @@ impl OpenForgeApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
             self.frame_all();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
+            self.wireframe = self.wireframe.next();
+            self.dirty = true;
         }
         // Tool hotkeys.
         if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
@@ -1540,6 +1557,7 @@ impl OpenForgeApp {
         painter.image(texture_id, rect, uv, egui::Color32::WHITE);
 
         self.paint_vertex_dots(&painter, rect);
+        self.paint_wireframe(&painter, rect);
         self.paint_gizmo(&painter);
 
         let label = format!(
@@ -1590,6 +1608,46 @@ impl OpenForgeApp {
                 };
                 painter.circle_filled(center, rad, color);
             }
+        }
+    }
+
+    /// Draw the edge overlay (wireframe and/or selection outline).
+    ///
+    /// Shared by both viewport backends, like the gizmo: the edges are built
+    /// from the scene in world space and projected through the same camera, so
+    /// the two paths agree. Edges are drawn on top of the shading — the CPU
+    /// path has no depth buffer to consult — which is why `collect_edges` drops
+    /// the ones only ever seen from behind.
+    fn paint_wireframe(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.wireframe == viewport::Wireframe::Off {
+            return;
+        }
+        let size = [rect.width(), rect.height()];
+        let aspect = size[0] / size[1].max(1.0);
+        let vp = self.camera.view_proj(aspect);
+        let eye = self.camera.eye();
+        let edges = viewport::collect_edges(&mut self.scene, &self.selection, self.wireframe, eye);
+        for edge in edges {
+            let (Some(a), Some(b)) = (
+                viewport::project(vp, edge.a, size),
+                viewport::project(vp, edge.b, size),
+            ) else {
+                continue;
+            };
+            let (width, color) = if edge.face_selected {
+                (2.0_f32, egui::Color32::from_rgb(255, 170, 60))
+            } else if edge.node_selected {
+                (1.6_f32, egui::Color32::from_rgb(90, 190, 255))
+            } else {
+                (1.0_f32, egui::Color32::from_rgba_unmultiplied(150, 158, 172, 130))
+            };
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + a.0, rect.top() + a.1),
+                    egui::pos2(rect.left() + b.0, rect.top() + b.1),
+                ],
+                egui::Stroke::new(width, color),
+            );
         }
     }
 
@@ -2256,6 +2314,27 @@ mod tests {
         input
     }
 
+    /// A frame carrying one key press.
+    fn key_frame(time: f64, key: egui::Key) -> egui::RawInput {
+        let mut input = frame(time, egui::pos2(500.0, 350.0), None);
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        });
+        input
+    }
+
+    /// Drive one frame including the global shortcuts, the way `update` does.
+    fn step_with_keys(ctx: &egui::Context, app: &mut OpenForgeApp, input: egui::RawInput) {
+        let _ = ctx.run(input, |ctx| {
+            app.handle_shortcuts(ctx);
+            app.handle_central_viewport(ctx, None);
+        });
+    }
+
     /// Drive one frame of the app's viewport path (input + paint), headlessly,
     /// returning the shapes the frame painted.
     fn paint_once(
@@ -2547,6 +2626,120 @@ mod tests {
             move_lines,
             "the arms are replaced by rings, not drawn as well"
         );
+    }
+
+    #[test]
+    fn the_wireframe_cycles_from_the_keyboard() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        assert_eq!(app.wireframe, viewport::Wireframe::Off, "shaded only by default");
+
+        step_with_keys(&ctx, &mut app, key_frame(0.0, egui::Key::Z));
+        assert_eq!(app.wireframe, viewport::Wireframe::Selection);
+        step_with_keys(&ctx, &mut app, key_frame(1.0, egui::Key::Z));
+        assert_eq!(app.wireframe, viewport::Wireframe::All);
+        step_with_keys(&ctx, &mut app, key_frame(2.0, egui::Key::Z));
+        assert_eq!(app.wireframe, viewport::Wireframe::Off, "the cycle closes");
+    }
+
+    #[test]
+    fn the_wireframe_overlay_adds_edges_for_the_selection_and_then_the_rest() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        // A second, *unselected* mesh, so Selection and All have to differ.
+        app.scene.create_mesh("Box", primitive_box(1.0));
+
+        let stroke_count = |app: &mut OpenForgeApp, ctx: &egui::Context, mode: viewport::Wireframe| {
+            app.wireframe = mode;
+            let shapes = paint_once(ctx, app, frame(0.0, egui::pos2(500.0, 350.0), None));
+            stroked(&shapes).0
+        };
+
+        let off = stroke_count(&mut app, &ctx, viewport::Wireframe::Off);
+        let selection = stroke_count(&mut app, &ctx, viewport::Wireframe::Selection);
+        let all = stroke_count(&mut app, &ctx, viewport::Wireframe::All);
+
+        assert!(selection > off, "the outline strokes the sphere's edges: {off} -> {selection}");
+        // From this camera three of the box's six faces look at it, so nine of
+        // its twelve edges survive the facing test — and only All reaches them.
+        assert_eq!(
+            all - selection,
+            9,
+            "All adds the unselected box's visible edges: {selection} -> {all}"
+        );
+    }
+
+    #[test]
+    fn the_face_selection_colours_the_edges_around_the_selected_face() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        app.selection.level = SelectLevel::Face;
+        app.wireframe = viewport::Wireframe::Selection;
+
+        // Rank the sphere's faces by how squarely they look at the camera: the
+        // facing one's edges all survive, the one turned furthest away keeps
+        // none of them.
+        let eye = app.camera.eye();
+        let mesh = app.scene.get(id).unwrap().mesh().unwrap().clone();
+        let facing = |i: usize| {
+            let face = &mesh.faces[i];
+            let n = mesh.normals[face.corners[0].normal as usize];
+            let mut centre = Vec3::ZERO;
+            for c in &face.corners {
+                centre += mesh.positions[c.position as usize];
+            }
+            n.dot(eye - centre / face.corners.len() as f32)
+        };
+        let toward = (0..mesh.faces.len()).max_by(|a, b| facing(*a).partial_cmp(&facing(*b)).unwrap()).unwrap();
+        let away = (0..mesh.faces.len()).min_by(|a, b| facing(*a).partial_cmp(&facing(*b)).unwrap()).unwrap();
+        let corners = mesh.faces[toward].corners.len();
+        assert!(facing(away) < 0.0, "the sphere has faces turned away");
+
+        let select_only = |app: &mut OpenForgeApp, face: usize| {
+            app.selection.clear();
+            app.selection.select_node(id);
+            app.selection.select_elements(id, [face as u32]);
+        };
+
+        select_only(&mut app, toward);
+        assert_eq!(
+            painted_face_edge_count(&ctx, &mut app),
+            corners,
+            "every edge of the facing face is stroked in the highlight colour"
+        );
+
+        select_only(&mut app, away);
+        assert_eq!(
+            painted_face_edge_count(&ctx, &mut app),
+            0,
+            "a face turned away keeps its edges hidden"
+        );
+    }
+
+    /// How many stroked segments the frame drew in the face-highlight colour.
+    fn painted_face_edge_count(ctx: &egui::Context, app: &mut OpenForgeApp) -> usize {
+        let highlight = egui::Color32::from_rgb(255, 170, 60);
+        let shapes = paint_once(ctx, app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        let mut count = 0;
+        fn walk(shape: &egui::Shape, highlight: egui::Color32, count: &mut usize) {
+            match shape {
+                egui::Shape::LineSegment { stroke, .. } => {
+                    if stroke.color == egui::epaint::ColorMode::Solid(highlight) {
+                        *count += 1;
+                    }
+                }
+                egui::Shape::Vec(inner) => {
+                    for s in inner {
+                        walk(s, highlight, count);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in &shapes {
+            walk(&clipped.shape, highlight, &mut count);
+        }
+        count
     }
 
     #[test]
