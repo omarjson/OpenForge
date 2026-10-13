@@ -13,7 +13,7 @@ use eframe::egui_wgpu::RenderState;
 use openforge_core::scene::Scene;
 use openforge_core::selection::Selection;
 use openforge_render::gpu::{FrameStats, GpuRenderer};
-use openforge_render::OrbitCamera;
+use openforge_render::{NodeColors, OrbitCamera};
 use wgpu::FilterMode;
 
 /// The wgpu viewport and the egui handle its image is drawn through.
@@ -48,6 +48,7 @@ impl GpuViewport {
         size: [f32; 2],
         scene: &mut Scene,
         selection: &Selection,
+        colors: &NodeColors,
         camera: &OrbitCamera,
         time: f32,
     ) -> (egui::TextureId, FrameStats) {
@@ -62,9 +63,15 @@ impl GpuViewport {
                 FilterMode::Linear,
             );
         }
-        let stats = self
-            .renderer
-            .render(&state.device, &state.queue, scene, selection, camera, time);
+        let stats = self.renderer.render(
+            &state.device,
+            &state.queue,
+            scene,
+            selection,
+            colors,
+            camera,
+            time,
+        );
         (self.texture_id, stats)
     }
 }

@@ -108,7 +108,13 @@ A sample GitHub Actions matrix is shown below.
   is left alone. Changing level clears the element selection, because a face
   index and a vertex index are not the same thing.
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
-- **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Delete** removes, **F** frames all.
+- **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Ctrl+D** duplicates the selection,
+  **Delete** removes, **F** frames all.
+- The **Properties** panel renames a node (one undo step per rename) and the
+  **Materials** panel lists the library: pick an entry to edit its colour,
+  shininess and opacity, **Assign** it to the selection, or **New** to duplicate
+  it. Assigned meshes are shaded with that material in both viewports. The
+  outliner's checkbox hides a node from the viewport.
 - **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY and STL.
 - **Create** menu adds primitives (box, sphere, cylinder, cone, plane).
 

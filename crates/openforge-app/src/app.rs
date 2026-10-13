@@ -7,7 +7,7 @@ use crate::uv_editor::{self, UvEditor};
 use crate::viewport::{self, Camera};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
-use glam::{Vec2, Vec3};
+use glam::{Vec2, Vec3, Vec4};
 use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
 use openforge_core::scene::Scene;
@@ -18,10 +18,32 @@ use openforge_core::tool::{
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
-use openforge_render::FrameStats;
+use openforge_materials::{Material, MaterialLibrary};
+use openforge_render::{FrameStats, NodeColors};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
 use std::path::PathBuf;
+
+/// The material library a new scene starts with: the crate's default grey at
+/// slot 0 plus a few presets, so the materials panel is not empty on first run.
+///
+/// Slot `0` must stay the default: it is what every unassigned face resolves to.
+fn default_materials() -> MaterialLibrary {
+    let mut library = MaterialLibrary::new();
+    for (name, rgb, shininess, specular) in [
+        ("Clay", [0.72, 0.70, 0.68], 16.0, 0.05),
+        ("Painted Red", [0.78, 0.16, 0.14], 48.0, 0.20),
+        ("Steel", [0.62, 0.65, 0.70], 160.0, 0.50),
+        ("Gold", [0.86, 0.70, 0.28], 96.0, 0.60),
+    ] {
+        let mut material = Material::new(name);
+        material.diffuse = Vec4::new(rgb[0], rgb[1], rgb[2], 1.0);
+        material.shininess = shininess;
+        material.specular = Vec3::splat(specular);
+        library.add_material(material);
+    }
+    library
+}
 
 /// Which tool is active.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,6 +91,13 @@ pub struct OpenForgeApp {
     gizmo: gizmo::Gizmo,
     /// How much edge overlay the viewport draws over the shading.
     wireframe: viewport::Wireframe,
+    /// The project's materials and textures.
+    materials: MaterialLibrary,
+    /// The library entry the materials panel is editing.
+    current_material: usize,
+    /// Scene captured when a text field took focus, so committing the edit
+    /// leaves one undo entry for the whole rename rather than one per keystroke.
+    rename_before: Option<Scene>,
     /// In-progress free-form tool drag, held here because a drag spans frames.
     tool_drag: Option<DragState>,
 }
@@ -121,6 +150,9 @@ impl OpenForgeApp {
             rig_bones: 4,
             gizmo: gizmo::Gizmo::default(),
             wireframe: viewport::Wireframe::default(),
+            materials: default_materials(),
+            current_material: 0,
+            rename_before: None,
             tool_drag: None,
         }
     }
@@ -172,6 +204,39 @@ impl OpenForgeApp {
             app.selection.select_node(id);
         });
         self.status = format!("Created {}.", kind);
+    }
+
+    /// Duplicate every selected node, leaving the copies selected.
+    ///
+    /// The copy is independent (its mesh is cloned) but shallow: children are
+    /// not duplicated, and a duplicated child becomes a root node.
+    fn duplicate_selected(&mut self) {
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if ids.is_empty() {
+            self.status = "Select something to duplicate.".into();
+            return;
+        }
+        let mut copies = Vec::new();
+        self.with_edit("Duplicate", |app| {
+            copies = ids
+                .iter()
+                .filter_map(|id| {
+                    let mut copy = app.scene.get(*id).ok()?.clone();
+                    // An invalid id makes the scene hand out a fresh one; keeping
+                    // the original id would overwrite the node it came from.
+                    copy.id = NodeId::INVALID;
+                    copy.name = format!("{} copy", copy.name);
+                    copy.children.clear();
+                    copy.parent = None;
+                    Some(app.scene.insert(copy))
+                })
+                .collect();
+            app.selection.clear();
+            for id in &copies {
+                app.selection.select_node(*id);
+            }
+        });
+        self.status = format!("Duplicated {} node(s).", copies.len());
     }
 
     fn delete_selected(&mut self) {
@@ -656,6 +721,84 @@ impl OpenForgeApp {
         )
     }
 
+    /// Base colours for the GPU path, resolved from the material library.
+    ///
+    /// `openforge-render` knows nothing about materials, so the app hands it a
+    /// colour per node in linear space (the offscreen target is sRGB and the
+    /// shader works in linear). The GPU path colours per node, so a mesh using
+    /// several slots is drawn with its first face's material; the CPU path
+    /// resolves the slot per face.
+    fn node_colors(&self) -> NodeColors {
+        let mut colors = NodeColors::new();
+        for node in self.scene.iter().filter(|n| n.is_mesh()) {
+            let selected = self.selection.is_node_selected(node.id);
+            let base = viewport::material_base(
+                self.materials.resolve(node.face_material_slot(0)),
+                selected,
+                false,
+            );
+            colors = colors.with(
+                node.id,
+                openforge_render::gpu::linear_from_srgb_u8([base[0], base[1], base[2]]),
+            );
+        }
+        colors
+    }
+
+    // --- Materials -----------------------------------------------------------------
+
+    /// Assign a library material to every selected mesh node.
+    fn assign_material_to_selection(&mut self, slot: u32) {
+        let ids: Vec<NodeId> = self
+            .selection
+            .selected_nodes()
+            .filter(|id| self.scene.get(*id).map(|n| n.is_mesh()).unwrap_or(false))
+            .collect();
+        if ids.is_empty() {
+            self.status = "Select a mesh node to assign a material to.".into();
+            return;
+        }
+        self.with_edit("Assign Material", |app| {
+            for id in ids {
+                if let Ok(node) = app.scene.get_mut(id) {
+                    node.assign_material(slot);
+                }
+            }
+        });
+        let name = self.materials.resolve(slot).name.clone();
+        self.status = format!("Assigned \"{name}\" to {} node(s).", self.selection.node_count());
+    }
+
+    /// Whether any mesh node in the scene uses `slot`.
+    fn material_in_use(&self, slot: u32) -> bool {
+        self.scene.iter().filter(|n| n.is_mesh()).any(|n| {
+            (0..n.mesh().map(|m| m.faces.len()).unwrap_or(0)).any(|f| n.face_material_slot(f) == slot)
+        })
+    }
+
+    /// Remove the library's last material, if nothing uses it.
+    ///
+    /// Only the last entry can be removed: deleting one in the middle would
+    /// renumber every slot above it and silently reassign geometry. Material
+    /// edits live outside the undo stack (which snapshots the scene), so a
+    /// delete that could dangle a slot is refused rather than half-undone.
+    fn delete_current_material(&mut self) {
+        let index = self.current_material;
+        let last = self.materials.material_count().saturating_sub(1);
+        if index == 0 || index != last {
+            self.status = "Only the last material can be removed.".into();
+            return;
+        }
+        if self.material_in_use(index as u32) {
+            self.status = "That material is assigned to a mesh.".into();
+            return;
+        }
+        let name = self.materials.materials.remove(index).name;
+        self.current_material = 0;
+        self.status = format!("Removed material \"{name}\".");
+        self.dirty = true;
+    }
+
     /// What a new gizmo drag should move: the vertices behind a sub-object
     /// selection when there is one, otherwise the selected nodes' transforms.
     fn gizmo_targets(&mut self, nodes: &[NodeId]) -> gizmo::Targets {
@@ -956,14 +1099,13 @@ impl OpenForgeApp {
             if behind || pts.len() < 3 {
                 continue;
             }
-            let base = if t.face_selected {
-                // Selected sub-object face: warm highlight.
-                [255u8, 170, 60, 255]
-            } else if t.selected {
-                [80u8, 170, 255, 255]
-            } else {
-                [170u8, 170, 178, 255]
-            };
+            // The face's resolved material is the surface colour; selection
+            // tints it towards the highlight colours.
+            let base = viewport::material_base(
+                self.materials.resolve(t.material),
+                t.selected,
+                t.face_selected,
+            );
             // Phong shade using the shared materials crate (diffuse + specular).
             let centroid = (t.v[0].pos + t.v[1].pos + t.v[2].pos) / 3.0;
             let view_dir = (cam - centroid).normalize_or_zero();
@@ -1095,6 +1237,13 @@ impl OpenForgeApp {
                         self.redo_edit();
                         ui.close_menu();
                     }
+                    if ui
+                        .add_enabled(self.selection.node_count() > 0, egui::Button::new("Duplicate"))
+                        .clicked()
+                    {
+                        self.duplicate_selected();
+                        ui.close_menu();
+                    }
                     ui.separator();
                     if ui
                         .add_enabled(self.selection.node_count() > 0, egui::Button::new("Delete"))
@@ -1165,6 +1314,9 @@ impl OpenForgeApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
             self.wireframe = self.wireframe.next();
             self.dirty = true;
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
+            self.duplicate_selected();
         }
         // Tool hotkeys.
         if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
@@ -1454,9 +1606,13 @@ impl OpenForgeApp {
             egui::SidePanel::right("properties")
                 .default_width(260.0)
                 .show(ctx, |ui| {
-                    ui.heading("Properties");
-                    ui.separator();
-                    self.properties_panel(ui);
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.heading("Properties");
+                        ui.separator();
+                        self.properties_panel(ui);
+                        ui.separator();
+                        self.materials_panel(ui);
+                    });
                 });
         }
     }
@@ -1464,22 +1620,37 @@ impl OpenForgeApp {
     fn outliner_node(&mut self, ui: &mut egui::Ui, id: NodeId) {
         // Snapshot the node's display data so we don't hold a borrow on the
         // scene while recursively painting children.
-        let (name, icon, has_children, children) = match self.scene.get(id) {
+        let (name, icon, has_children, children, visible) = match self.scene.get(id) {
             Ok(node) => {
                 let icon = match &node.kind {
                     NodeKind::Group => "[] ",
                     NodeKind::Dummy => "() ",
                     NodeKind::Mesh { .. } => "/\\ ",
                 };
-                (node.name.clone(), icon, !node.children.is_empty(), node.children.clone())
+                (node.name.clone(), icon, !node.children.is_empty(), node.children.clone(), node.visible)
             }
             Err(_) => return,
         };
         let selected = self.selection.is_node_selected(id);
 
         ui.push_id(id.0, |ui| {
-            let resp = ui.selectable_label(selected, format!("{}{}", icon, name));
-            if resp.clicked() {
+            let mut shown = visible;
+            let mut resp = None;
+            ui.horizontal(|ui| {
+                if ui
+                    .checkbox(&mut shown, "")
+                    .on_hover_text("Visible in the viewport")
+                    .changed()
+                {
+                    if let Ok(node) = self.scene.get_mut(id) {
+                        node.visible = shown;
+                    }
+                    self.dirty = true;
+                }
+                let line = ui.selectable_label(selected, format!("{}{}", icon, name));
+                resp = Some(line);
+            });
+            if resp.map(|r| r.clicked()).unwrap_or(false) {
                 self.selection.clear();
                 self.selection.select_node(id);
             }
@@ -1493,14 +1664,121 @@ impl OpenForgeApp {
         });
     }
 
+    /// The material library: pick an entry, assign it to the selection and edit
+    /// it. Always visible — the library belongs to the project, not to the
+    /// current selection.
+    fn materials_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Materials");
+        let assigned = self
+            .selection
+            .selected_nodes()
+            .next()
+            .and_then(|id| self.scene.get(id).ok().map(|n| n.face_material_slot(0)));
+
+        egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+            for index in 0..self.materials.material_count() {
+                let material = self.materials.resolve(index as u32).clone();
+                let swatch = viewport::material_base(&material, false, false);
+                ui.horizontal(|ui| {
+                    let (rect, _) =
+                        ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+                    ui.painter().rect_filled(
+                        rect,
+                        2.0,
+                        egui::Color32::from_rgb(swatch[0], swatch[1], swatch[2]),
+                    );
+                    let label = if Some(index as u32) == assigned {
+                        format!("{} ✓", material.name)
+                    } else {
+                        material.name.clone()
+                    };
+                    if ui
+                        .selectable_label(self.current_material == index, label)
+                        .on_hover_text(format!("slot {index}"))
+                        .clicked()
+                    {
+                        self.current_material = index;
+                    }
+                });
+            }
+        });
+
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(assigned.is_some(), egui::Button::new("Assign"))
+                .on_hover_text("Assign the selected material to the selection")
+                .clicked()
+            {
+                self.assign_material_to_selection(self.current_material as u32);
+            }
+            if ui
+                .button("New")
+                .on_hover_text("Duplicate the selected material")
+                .clicked()
+            {
+                let mut material = self.materials.resolve(self.current_material as u32).clone();
+                material.name = format!("{} copy", material.name);
+                self.current_material = self.materials.add_material(material);
+                self.dirty = true;
+            }
+            let last = self.materials.material_count().saturating_sub(1);
+            let removable = self.current_material == last
+                && last > 0
+                && !self.material_in_use(last as u32);
+            if ui
+                .add_enabled(removable, egui::Button::new("Delete"))
+                .on_hover_text("Only the last, unassigned material can be removed")
+                .clicked()
+            {
+                self.delete_current_material();
+            }
+        });
+
+        let index = self.current_material;
+        let Some(material) = self.materials.materials.get_mut(index) else { return };
+        ui.separator();
+        ui.label(format!("slot {index}"));
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            if ui.text_edit_singleline(&mut material.name).changed() {
+                self.dirty = true;
+            }
+        });
+        let mut rgba = egui::Color32::from_rgba_unmultiplied(
+            (material.diffuse.x.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (material.diffuse.y.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (material.diffuse.z.clamp(0.0, 1.0) * 255.0).round() as u8,
+            (material.diffuse.w.clamp(0.0, 1.0) * 255.0).round() as u8,
+        );
+        if ui.color_edit_button_srgba(&mut rgba).changed() {
+            material.diffuse = Vec4::new(
+                rgba.r() as f32 / 255.0,
+                rgba.g() as f32 / 255.0,
+                rgba.b() as f32 / 255.0,
+                rgba.a() as f32 / 255.0,
+            );
+            self.dirty = true;
+        }
+        if ui
+            .add(egui::Slider::new(&mut material.shininess, 1.0..=256.0).text("Shininess"))
+            .changed()
+        {
+            self.dirty = true;
+        }
+        if ui
+            .add(egui::Slider::new(&mut material.opacity, 0.0..=1.0).text("Opacity"))
+            .changed()
+        {
+            self.dirty = true;
+        }
+    }
+
     fn properties_panel(&mut self, ui: &mut egui::Ui) {
         let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
         if ids.is_empty() {
             ui.label("Nothing selected.");
-            ui.separator();
             ui.label(format!("Nodes: {}", self.scene.node_count()));
-            let meshes = self.scene.mesh_names().len();
-            ui.label(format!("Mesh nodes: {}", meshes));
+            ui.label(format!("Mesh nodes: {}", self.scene.mesh_names().len()));
             return;
         }
         for &id in &ids {
@@ -1511,6 +1789,8 @@ impl OpenForgeApp {
                 ui.label(format!("Vertices: {}", mesh.vertex_count()));
                 ui.label(format!("Faces: {}", mesh.face_count()));
                 ui.label(format!("Triangles: {}", mesh.triangulated_count()));
+                let slot = node.face_material_slot(0);
+                ui.label(format!("Material: {} (slot {slot})", self.materials.resolve(slot).name));
             }
             ui.separator();
         }
@@ -1518,6 +1798,29 @@ impl OpenForgeApp {
         // Edit the transform of a single selected node.
         if ids.len() == 1 {
             let id = ids[0];
+            let mut name = self.scene.get(id).map(|n| n.name.clone()).unwrap_or_default();
+            ui.horizontal(|ui| {
+                ui.label("Name");
+                let response = ui.text_edit_singleline(&mut name);
+                // One undo entry for the whole rename, snapshotted when the
+                // field took focus — not one entry per keystroke.
+                if response.gained_focus() && self.rename_before.is_none() {
+                    self.rename_before = Some(self.scene.clone());
+                }
+                if response.changed() {
+                    if let Ok(node) = self.scene.get_mut(id) {
+                        node.name = name.clone();
+                    }
+                    self.dirty = true;
+                }
+                if response.lost_focus() {
+                    if let Some(before) = self.rename_before.take() {
+                        if !self.scene.content_eq(&before) {
+                            self.undo.push("Rename", before, self.scene.clone());
+                        }
+                    }
+                }
+            });
             let before = self.scene.clone();
             let mut changed = false;
             if let Ok(node) = self.scene.get_mut(id) {
@@ -1553,13 +1856,27 @@ impl OpenForgeApp {
                 // fall back to the CPU painter when it is not. Both paths show
                 // the same scene through the same camera state, so the only
                 // difference is shading quality and depth correctness.
+                // The per-node colours have to be resolved before `gpu` is
+                // borrowed mutably, and only the GPU path needs them.
+                let colors = match (render_state, self.gpu.is_some()) {
+                    (Some(_), true) => self.node_colors(),
+                    _ => NodeColors::new(),
+                };
                 let rendered = match (render_state, self.gpu.as_mut()) {
                     (Some(state), Some(gpu)) => {
                         let scale = ui.ctx().pixels_per_point();
                         let size = [rect.width() * scale, rect.height() * scale];
                         let camera = gpu_viewport::orbit_camera(&self.camera);
                         let time = ui.input(|i| i.time) as f32;
-                        Some(gpu.render(state, size, &mut self.scene, &self.selection, &camera, time))
+                        Some(gpu.render(
+                            state,
+                            size,
+                            &mut self.scene,
+                            &self.selection,
+                            &colors,
+                            &camera,
+                            time,
+                        ))
                     }
                     _ => None,
                 };
@@ -2804,6 +3121,40 @@ mod tests {
         );
     }
 
+    /// Drive one frame of the *whole* UI the way `update` does (minus the eframe
+    /// frame): menu bar, shortcuts, toolbars, side panels, status bar, viewport.
+    fn step_full(ctx: &egui::Context, app: &mut OpenForgeApp, input: egui::RawInput) {
+        let _ = ctx.run(input, |ctx| {
+            app.handle_menu(ctx);
+            app.handle_shortcuts(ctx);
+            app.handle_top_toolbar(ctx);
+            app.handle_status_bar(ctx);
+            app.handle_uv_editor(ctx);
+            app.handle_side_panels(ctx);
+            app.handle_central_viewport(ctx, None);
+        });
+    }
+
+    /// Every fill colour the frame painted.
+    fn painted_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
+            match shape {
+                egui::Shape::Path(p) => out.push(p.fill),
+                egui::Shape::Vec(inner) => {
+                    for s in inner {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
     /// How many stroked segments the frame drew in the face-highlight colour.
     fn painted_face_edge_count(ctx: &egui::Context, app: &mut OpenForgeApp) -> usize {
         let highlight = egui::Color32::from_rgb(255, 170, 60);
@@ -2828,6 +3179,126 @@ mod tests {
             walk(&clipped.shape, highlight, &mut count);
         }
         count
+    }
+
+    #[test]
+    fn the_whole_ui_paints_a_frame() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        // With a selection...
+        step_full(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        // ...and with none, which takes a different branch in the panels.
+        app.selection.clear();
+        step_full(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None));
+        assert_eq!(app.scene.node_count(), 1, "nothing was changed by painting");
+    }
+
+    #[test]
+    fn the_material_library_starts_with_the_default_and_the_presets() {
+        let library = default_materials();
+        assert_eq!(library.material_count(), 5);
+        // Slot 0 stays the default: it is what an unassigned face resolves to.
+        assert_eq!(library.resolve(0).name, "Default");
+        assert_eq!(library.resolve(2).name, "Painted Red");
+        assert_eq!(library.resolve(4).name, "Gold");
+        assert!(library.resolve(99).name == "Default", "out of range falls back");
+    }
+
+    #[test]
+    fn assigning_a_material_shades_the_mesh_with_it() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        let pos = egui::pos2(500.0, 350.0);
+        // Unselected, so the painted colour is the material's own.
+        app.selection.clear();
+        let grey = painted_fills(&paint_once(&ctx, &mut app, frame(0.0, pos, None)));
+        assert!(
+            !grey.iter().any(|c| c.r() as i32 > c.b() as i32 + 30),
+            "the default material is neutral"
+        );
+
+        app.selection.select_node(id);
+        app.assign_material_to_selection(2);
+        assert_eq!(app.scene.get(id).unwrap().face_material_slot(0), 2);
+        app.selection.clear();
+        let red = painted_fills(&paint_once(&ctx, &mut app, frame(1.0, pos, None)));
+        assert!(
+            red.iter().any(|c| c.r() as i32 > c.b() as i32 + 30),
+            "\"Painted Red\" should read red"
+        );
+
+        // The assignment is one undo step.
+        assert!(app.undo.can_undo());
+        app.undo_edit();
+        assert_eq!(app.scene.get(id).unwrap().face_material_slot(0), 0);
+    }
+
+    #[test]
+    fn node_colors_go_to_the_renderer_in_linear_space() {
+        let (mut app, id) = app_ready_to_move();
+        app.selection.select_node(id);
+        app.assign_material_to_selection(2);
+        let srgba = viewport::material_base(app.materials.resolve(2), true, false);
+        let expected = openforge_render::gpu::linear_from_srgb_u8([srgba[0], srgba[1], srgba[2]]);
+        let colors = app.node_colors();
+        assert_eq!(colors.len(), 1, "one entry per mesh node");
+        let got = colors.get(id).expect("the node's colour");
+        for (a, b) in got.iter().zip(&expected) {
+            assert!((a - b).abs() < 1e-6, "{got:?} vs {expected:?}");
+        }
+    }
+
+    #[test]
+    fn a_material_that_is_in_use_cannot_be_removed() {
+        let (mut app, id) = app_ready_to_move();
+        app.selection.select_node(id);
+        app.assign_material_to_selection(4);
+        assert!(app.material_in_use(4));
+        assert!(!app.material_in_use(3));
+
+        app.current_material = 4;
+        app.delete_current_material();
+        assert_eq!(app.materials.material_count(), 5, "refused while assigned");
+
+        // Unassign it and the last entry can go.
+        app.assign_material_to_selection(0);
+        app.current_material = 4;
+        app.delete_current_material();
+        assert_eq!(app.materials.material_count(), 4);
+        assert_eq!(app.current_material, 0, "the selection falls back to the default");
+    }
+
+    #[test]
+    fn a_material_in_the_middle_of_the_library_cannot_be_removed() {
+        let (mut app, _id) = app_ready_to_move();
+        app.current_material = 2;
+        app.delete_current_material();
+        assert_eq!(app.materials.material_count(), 5, "removing it would renumber slots");
+        assert!(app.status.contains("last material"), "status: {}", app.status);
+    }
+
+    #[test]
+    fn duplicating_a_node_leaves_an_independent_copy() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        let original = app.scene.get(id).unwrap().mesh().unwrap().vertex_count();
+
+        step_full(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        app.duplicate_selected();
+
+        assert_eq!(app.scene.node_count(), 2);
+        let copy = app.selection.selected_nodes().next().expect("the copy is selected");
+        assert_ne!(copy, id, "the copy has its own id");
+        assert!(app.scene.get(copy).unwrap().name.ends_with(" copy"));
+        assert_eq!(app.scene.get(copy).unwrap().mesh().unwrap().vertex_count(), original);
+
+        // Editing the copy must not touch the node it came from.
+        app.scene.get_mut(copy).unwrap().mesh_mut().unwrap().positions[0] = Vec3::new(9.0, 9.0, 9.0);
+        assert_ne!(app.scene.get(id).unwrap().mesh().unwrap().positions[0], Vec3::new(9.0, 9.0, 9.0));
+
+        assert!(app.undo.can_undo(), "one entry for the duplicate");
+        app.undo_edit();
+        assert_eq!(app.scene.node_count(), 1);
     }
 
     #[test]

@@ -9,6 +9,7 @@
 
 use glam::{Mat4, Vec3, Vec4};
 use openforge_core::math::Ray;
+use openforge_materials::Material;
 use std::collections::HashMap;
 use openforge_core::mesh::Mesh;
 use openforge_core::scene::Scene;
@@ -115,6 +116,45 @@ pub struct Tri {
     pub selected: bool,
     /// True when this triangle's face is in the current face selection.
     pub face_selected: bool,
+    /// The library material slot this triangle's face resolves to.
+    pub material: u32,
+}
+
+/// Blend `a` towards `b` by `t` (0 keeps `a`, 1 gives `b`).
+fn mix(a: u8, b: u8, t: f32) -> u8 {
+    (a as f32 + (b as f32 - a as f32) * t.clamp(0.0, 1.0)).round().clamp(0.0, 255.0) as u8
+}
+
+/// sRGB bytes for a material's base colour, for the CPU viewport's shading.
+///
+/// The material's `effective_color` carries the diffuse colour with opacity
+/// folded into alpha; a selected mesh (or a selected face) is nudged towards
+/// the same highlight colours the unassigned materials use, so selection still
+/// reads on a mesh that has a material of its own.
+pub fn material_base(material: &Material, selected: bool, face_selected: bool) -> [u8; 4] {
+    let c = material.effective_color();
+    let rgb = [
+        (c.x.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.y.clamp(0.0, 1.0) * 255.0).round() as u8,
+        (c.z.clamp(0.0, 1.0) * 255.0).round() as u8,
+    ];
+    let alpha = (c.w.clamp(0.0, 1.0) * 255.0).round() as u8;
+    let tint = if face_selected {
+        Some([255u8, 170, 60])
+    } else if selected {
+        Some([80u8, 170, 255])
+    } else {
+        None
+    };
+    match tint {
+        Some(t) => [
+            mix(rgb[0], t[0], 0.55),
+            mix(rgb[1], t[1], 0.55),
+            mix(rgb[2], t[2], 0.55),
+            alpha,
+        ],
+        None => [rgb[0], rgb[1], rgb[2], alpha],
+    }
 }
 
 /// Collect all visible mesh triangles from the scene in world space.
@@ -130,12 +170,14 @@ pub fn collect_triangles(
         let sel_faces = selection.selected_elements(id).cloned();
         let Ok(node) = scene.get(id) else { continue };
         let Some(mesh) = node.mesh() else { continue };
+        // Resolve the node's slot list into a library slot per face.
         // Map each source face to its triangulated output.
         for (face_idx, face) in mesh.faces.iter().enumerate() {
             let face_is_sel = sel_faces
                 .as_ref()
                 .map(|s| s.contains(&(face_idx as u32)))
                 .unwrap_or(false);
+            let material = node.face_material_slot(face_idx);
             let cs = &face.corners;
             for i in 1..cs.len().saturating_sub(1) {
                 let tri = [cs[0].position, cs[i].position, cs[i + 1].position];
@@ -152,6 +194,7 @@ pub fn collect_triangles(
                     ],
                     selected,
                     face_selected: face_is_sel,
+                    material,
                 });
             }
         }
@@ -772,6 +815,84 @@ mod tests {
         assert_eq!(only_five[0].1, vec![(5, Vec3::new(2.0, 1.0, 0.0))]);
         sel.level = SelectLevel::Object;
         assert!(selected_vertices(&mut scene, &sel).is_empty());
+    }
+
+    #[test]
+    fn a_material_base_colour_is_its_diffuse() {
+        let mut m = Material::default();
+        m.diffuse = glam::Vec4::new(1.0, 0.0, 0.0, 1.0);
+        assert_eq!(material_base(&m, false, false), [255, 0, 0, 255]);
+    }
+
+    #[test]
+    fn a_material_base_colour_folds_opacity_into_alpha() {
+        let mut m = Material::default();
+        m.diffuse = glam::Vec4::new(0.0, 0.0, 1.0, 0.8);
+        m.opacity = 0.5;
+        let [r, g, b, a] = material_base(&m, false, false);
+        assert_eq!((r, g, b), (0, 0, 255));
+        assert_eq!(a, 102, "0.8 * 0.5 * 255, rounded");
+    }
+
+    #[test]
+    fn a_material_base_colour_clamps_out_of_range_input() {
+        let mut m = Material::default();
+        m.diffuse = glam::Vec4::new(2.0, -1.0, 0.5, 4.0);
+        m.opacity = 1.0;
+        let [r, g, b, a] = material_base(&m, false, false);
+        assert_eq!((r, g, b), (255, 0, 128));
+        assert_eq!(a, 255);
+    }
+
+    #[test]
+    fn selection_tints_a_material_base_colour_towards_the_highlight() {
+        let mut m = Material::default();
+        m.diffuse = glam::Vec4::new(1.0, 1.0, 1.0, 1.0);
+        let plain = material_base(&m, false, false);
+        let selected = material_base(&m, true, false);
+        let face = material_base(&m, true, true);
+
+        assert_eq!(plain, [255, 255, 255, 255]);
+        // Blue-ish selection tint: blue stays highest, red is pulled down most.
+        assert!(selected[2] > selected[1] && selected[1] > selected[0], "got {selected:?}");
+        // Face selection is the warm highlight: red now leads.
+        assert!(face[0] > face[1] && face[1] > face[2], "got {face:?}");
+    }
+
+    #[test]
+    fn triangles_carry_the_slot_their_face_resolves_to() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        // Unassigned: everything resolves to the default slot.
+        let tris = collect_triangles(&mut scene, &Selection::new());
+        assert!(tris.iter().all(|t| t.material == 0));
+
+        // Assigned: every face of the node follows the assignment.
+        scene.get_mut(id).unwrap().assign_material(5);
+        let tris = collect_triangles(&mut scene, &Selection::new());
+        assert!(!tris.is_empty());
+        assert!(tris.iter().all(|t| t.material == 5));
+
+        // A per-face slot list is respected face by face.
+        let mut m = Mesh::new();
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        m.add_face(&[0, 1, 2]);
+        m.add_face(&[0, 2, 3]);
+        m.faces[1].material = 1;
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("mixed", m);
+        if let openforge_core::node::NodeKind::Mesh { material_slots, .. } =
+            &mut scene.get_mut(id).unwrap().kind
+        {
+            *material_slots = vec![7, 9];
+        }
+        let slots: Vec<u32> = collect_triangles(&mut scene, &Selection::new())
+            .iter()
+            .map(|t| t.material)
+            .collect();
+        assert!(slots.contains(&7) && slots.contains(&9), "got {slots:?}");
     }
 
     #[test]

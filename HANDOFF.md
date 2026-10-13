@@ -41,21 +41,21 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 11 crates (335 `#[test]` fns; 336 tests run, all green)
+## 4. Repo layout — 11 crates (355 `#[test]` fns; 356 tests run, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 23 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. |
+| `openforge-core` | 28 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 27 | Phong/Lambert materials, colors. |
-| `openforge-render` | 51 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target, scene/grid/gizmo pipelines, frame stats. |
+| `openforge-render` | 54 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target, scene/grid/gizmo pipelines, frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
-| `openforge-app` | 62 (bin) | eframe/egui GUI. `app.rs` (~2600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-app` | 74 (bin) | eframe/egui GUI. `app.rs` (~2600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -124,10 +124,10 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** baseline commit `2a201c8`. Full workspace builds with **0 warnings**,
-**336 tests pass**, CI green on all 3 platforms. Five work-streams are done —
+**356 tests pass**, CI green on all 3 platforms. Six work-streams are done —
 the **wgpu viewport** (#1), the **interactive UV editor** (#2), the
-**transform gizmo** (#3), the **edge overlay** (#4) and the **sub-object
-transforms** (#5) — plus a progress report:
+**transform gizmo** (#3), the **edge overlay** (#4), the **sub-object
+transforms** (#5) and **materials** (#6) — plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -232,8 +232,37 @@ transforms** (#5) — plus a progress report:
   faces, the empty cases, corner dedup) and 1 end-to-end in `app.rs` — a
   vertex-level drag that asserts every other vertex is untouched.
 
+- **Materials are wired through to the pixels.** `openforge-materials` already
+  had `Material`, `MaterialLibrary` and textures; nothing used them, and
+  `Face::material` / `NodeKind::Mesh::material_slots` were dead weight. Core now
+  has `Node::assign_material(slot)` (whole node, returns whether anything
+  changed) and `Node::face_material_slot(face)` (a face's index through the
+  node's slot list, falling back to slot 0). The app owns a library seeded with
+  the default grey plus Clay / Painted Red / Steel / Gold, and the Properties
+  panel gained a **Materials** section: pick an entry, edit name, colour,
+  shininess and opacity, Assign it to the selection (undoable), or duplicate it.
+  `collect_triangles` resolves each face's slot, so the **CPU path shades per
+  face**; `viewport::material_base` turns a material into viewport bytes and
+  tints it towards the selection colours, so selection still reads on a meshed
+  material. The **GPU path** gets a colour per node: `openforge-render` gained
+  `NodeColors` and `build_scene_with`, because the renderer knows nothing about
+  materials — the app resolves them and passes linear colours in.
+- **The panels do more than report.** Rename (one undo step for the whole edit,
+  snapshotted when the field takes focus, not one per keystroke), a visibility
+  checkbox per outliner row, the material read-out in Properties, and **Ctrl+D**
+  to duplicate the selection (an independent copy — the mesh is cloned — but a
+  shallow one: children are not duplicated and the copy goes to the root).
+- **18 tests**: 5 in `openforge-core` (material assignment, stale slots, the
+  non-mesh no-op), 3 in `openforge-render` (`NodeColors` addressing,
+  `build_scene_with` overriding and falling back), 5 in `viewport.rs`
+  (`material_base` colour/alpha/clamping/tinting, and triangles carrying their
+  face's resolved slot) and 7 in `app.rs` — including assigning a material and
+  asserting the painted fills actually turn red, the linear colour handed to the
+  renderer, refusing to delete an in-use or non-final material, and duplicating
+  without aliasing the original mesh.
+
 **Verified this session:** `cargo build --release -p openforge-app` (the CI
-build job) → 0 warnings; `cargo test --workspace` → **336 pass, 0 failures**
+build job) → 0 warnings; `cargo test --workspace` → **356 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0); the app was launched
 locally and logged `eframe: ... Using wgpu.` with a Metal adapter and **no**
 `egui_wgpu` warnings, and it survived a 12 s run on the wgpu path without a
@@ -324,6 +353,17 @@ deltas and are many work-streams, not one push.
 - **`Stroke::color` is a `ColorMode`, not a `Color32`, in egui 0.29.** A test
   that inspects painted shapes must compare against
   `egui::epaint::ColorMode::Solid(colour)`.
+- **The undo stack stores `Scene`s only.** Material-library edits (creating a
+  material, changing its colour) are therefore *not* undoable, while assigning
+  one to a node (which changes the scene) is. That is also why deleting a
+  material is restricted to the last, unassigned entry: a delete in the middle
+  would renumber slots with no way to undo it. Making the stack generic over the
+  document state is the fix, and a good next work-stream.
+- **`Scene::insert` keeps a valid `NodeId`.** A duplicate that clones a node
+  without clearing `copy.id` overwrites the node it came from; set
+  `copy.id = NodeId::INVALID` to make the scene allocate a fresh one.
+- **`Scene::iter()` is hash-ordered.** Tests that walk a scene's buffers or
+  nodes must not assume creation order — count or look up instead.
 - **Element indices are only meaningful at the level they were picked at.**
   `Selection` stores vertex/face indices in one set, so anything that changes
   `level` must call `Selection::clear_elements()` (the toolbar does). Skip it

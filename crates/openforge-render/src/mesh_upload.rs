@@ -116,11 +116,57 @@ impl MeshBuffers {
     }
 }
 
+/// Per-node base colours for [`build_scene_with`].
+///
+/// The renderer knows nothing about materials — a caller that has a material
+/// library resolves each node's colour and hands the result in. Nodes with no
+/// entry keep the selection/default colours.
+#[derive(Clone, Debug, Default)]
+pub struct NodeColors {
+    colors: HashMap<NodeId, [f32; 4]>,
+}
+
+impl NodeColors {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set (or replace) a node's base colour, returning `self` for chaining.
+    #[must_use]
+    pub fn with(mut self, id: NodeId, color: [f32; 4]) -> Self {
+        self.colors.insert(id, color);
+        self
+    }
+
+    pub fn get(&self, id: NodeId) -> Option<[f32; 4]> {
+        self.colors.get(&id).copied()
+    }
+
+    pub fn len(&self) -> usize {
+        self.colors.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.colors.is_empty()
+    }
+}
+
 /// Build buffers for every visible mesh node in `scene`, tinting selected
 /// nodes with [`SELECTION_COLOR`] and everything else with
 /// [`DEFAULT_BASE_COLOR`]. Returns the buffers plus the combined world-space
 /// bounds of all built geometry (empty bounds when nothing is visible).
 pub fn build_scene(scene: &mut Scene, selection: &Selection) -> (Vec<MeshBuffers>, Aabb) {
+    build_scene_with(scene, selection, &NodeColors::default())
+}
+
+/// [`build_scene`] with a caller-supplied colour per node (e.g. resolved from a
+/// material library). A node missing from `colors` falls back to the selection
+/// tint when it is selected and [`DEFAULT_BASE_COLOR`] otherwise.
+pub fn build_scene_with(
+    scene: &mut Scene,
+    selection: &Selection,
+    colors: &NodeColors,
+) -> (Vec<MeshBuffers>, Aabb) {
     let ids: Vec<NodeId> = scene
         .iter()
         .filter(|n| n.is_mesh() && n.visible)
@@ -132,11 +178,11 @@ pub fn build_scene(scene: &mut Scene, selection: &Selection) -> (Vec<MeshBuffers
         let Ok(world) = scene.world_matrix(id) else { continue };
         let Ok(node) = scene.get(id) else { continue };
         let Some(mesh) = node.mesh() else { continue };
-        let color = if selection.is_node_selected(id) {
+        let color = colors.get(id).unwrap_or(if selection.is_node_selected(id) {
             SELECTION_COLOR
         } else {
             DEFAULT_BASE_COLOR
-        };
+        });
         let buf = MeshBuffers::build(mesh, world, color);
         bounds.merge(&buf.bounds());
         buffers.push(buf);
@@ -343,6 +389,62 @@ mod tests {
         let (buffers, bounds) = build_scene(&mut scene, &Selection::new());
         assert!(buffers.is_empty());
         assert!(bounds.is_empty());
+    }
+
+    #[test]
+    fn node_colors_are_addressable_and_chain() {
+        let mut colors = NodeColors::new();
+        assert!(colors.is_empty());
+        colors = colors.with(NodeId(1), [1.0, 0.0, 0.0, 1.0]).with(NodeId(2), [0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(colors.len(), 2);
+        assert!(!colors.is_empty());
+        assert_eq!(colors.get(NodeId(2)), Some([0.0, 1.0, 0.0, 1.0]));
+        assert_eq!(colors.get(NodeId(3)), None);
+        // Overwriting keeps one entry per node.
+        let colors = colors.with(NodeId(1), [0.0, 0.0, 1.0, 1.0]);
+        assert_eq!(colors.len(), 2);
+        assert_eq!(colors.get(NodeId(1)), Some([0.0, 0.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn build_scene_with_uses_the_supplied_colour() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", unit_quad());
+        let black = [0.0, 0.0, 0.0, 1.0];
+        let (buffers, _) = build_scene_with(
+            &mut scene,
+            &Selection::new(),
+            &NodeColors::new().with(id, black),
+        );
+        assert!(buffers.iter().flat_map(|b| &b.vertices).all(|v| v.color == black));
+    }
+
+    #[test]
+    fn build_scene_with_falls_back_for_nodes_it_was_not_given() {
+        let mut scene = Scene::new();
+        let plain = scene.create_mesh("plain", unit_quad());
+        let picked = scene.create_mesh("picked", unit_quad());
+        let mut selection = Selection::new();
+        selection.select_node(picked);
+
+        // An empty table: the old behaviour, selection tint and default grey.
+        // The scene iterates in hash order, so count the two cases rather than
+        // assuming which buffer is which.
+        let (buffers, _) = build_scene_with(&mut scene, &selection, &NodeColors::new());
+        let all = |color: [f32; 4]| {
+            buffers
+                .iter()
+                .filter(|b| !b.vertices.is_empty() && b.vertices.iter().all(|v| v.color == color))
+                .count()
+        };
+        assert_eq!(all(DEFAULT_BASE_COLOR), 1, "the unselected node");
+        assert_eq!(all(SELECTION_COLOR), 1, "the selected node");
+
+        // A table entry wins over both, including for the selected node.
+        let gold = [0.9, 0.7, 0.3, 1.0];
+        let colors = NodeColors::new().with(picked, gold).with(plain, gold);
+        let (buffers, _) = build_scene_with(&mut scene, &selection, &colors);
+        assert!(buffers.iter().flat_map(|b| &b.vertices).all(|v| v.color == gold));
     }
 
     #[test]
