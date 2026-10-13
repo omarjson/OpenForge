@@ -32,6 +32,15 @@ impl Selection {
         self.elements.clear();
     }
 
+    /// Drop the element selection but keep the nodes.
+    ///
+    /// Element indices only mean anything at the level they were picked at —
+    /// face 3 and vertex 3 are different things — so anything that changes the
+    /// level has to call this rather than reinterpret the index.
+    pub fn clear_elements(&mut self) {
+        self.elements.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty() && self.elements.is_empty()
     }
@@ -105,5 +114,16 @@ mod tests {
         s.select_elements(id, [0u32, 2, 4]);
         assert_eq!(s.element_count(id), 3);
         assert_eq!(s.total_element_count(), 3);
+    }
+
+    #[test]
+    fn clearing_elements_keeps_the_nodes() {
+        let mut s = Selection::new();
+        let id = NodeId(7);
+        s.select_elements(id, [0u32, 1]);
+        s.clear_elements();
+        assert_eq!(s.total_element_count(), 0);
+        assert!(s.is_node_selected(id), "the node is still the one being edited");
+        assert_eq!(s.node_count(), 1);
     }
 }

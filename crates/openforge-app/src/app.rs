@@ -656,6 +656,26 @@ impl OpenForgeApp {
         )
     }
 
+    /// What a new gizmo drag should move: the vertices behind a sub-object
+    /// selection when there is one, otherwise the selected nodes' transforms.
+    fn gizmo_targets(&mut self, nodes: &[NodeId]) -> gizmo::Targets {
+        let vertices = viewport::selected_vertices(&mut self.scene, &self.selection);
+        if !vertices.is_empty() {
+            return gizmo::Targets::Vertices(
+                vertices
+                    .into_iter()
+                    .map(|(node, positions)| gizmo::VertexTarget { node, positions })
+                    .collect(),
+            );
+        }
+        gizmo::Targets::Nodes(
+            nodes
+                .iter()
+                .filter_map(|id| self.scene.get(*id).ok().map(|n| (*id, n.transform)))
+                .collect(),
+        )
+    }
+
     /// A world-space picking ray for a screen position inside the viewport.
     ///
     /// Takes the camera by reference rather than `&self` so it can be called
@@ -707,12 +727,20 @@ impl OpenForgeApp {
         };
         let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
         let bounds = self.scene.world_bounds(&ids);
-        let frame = match (gizmo_mode, bounds.is_empty()) {
-            (Some(_), false) => Some(gizmo::Frame::for_camera(
+        // A sub-object selection is transformed about its own centroid, a node
+        // selection about its bounds. While a drag is live the frame stays where
+        // that drag began — otherwise the handles would chase the geometry they
+        // are moving, and each frame's hit-test would be against a new origin.
+        let origin = self.gizmo.drag.as_ref().map(|drag| drag.anchor.origin).or_else(|| {
+            viewport::element_centroid(&mut self.scene, &self.selection)
+                .or_else(|| (!bounds.is_empty()).then(|| bounds.center()))
+        });
+        let frame = match (gizmo_mode, origin) {
+            (Some(_), Some(origin)) => Some(gizmo::Frame::for_camera(
                 &self.camera,
                 rect.height(),
                 gizmo::HANDLE_PIXELS,
-                bounds.center(),
+                origin,
             )),
             _ => None,
         };
@@ -778,11 +806,8 @@ impl OpenForgeApp {
                 if let Some(axis) = axis {
                     let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
                     if let Some(anchor) = gizmo::Anchor::new(mode, axis, frame.origin, ray) {
-                        let start_transforms = ids
-                            .iter()
-                            .filter_map(|id| self.scene.get(*id).ok().map(|n| (*id, n.transform)))
-                            .collect();
-                        self.gizmo.begin(gizmo::Drag { mode, axis, anchor, start_transforms });
+                        let targets = self.gizmo_targets(&ids);
+                        self.gizmo.begin(gizmo::Drag { mode, axis, anchor, targets });
                         if self.edit_before.is_none() {
                             self.edit_before = Some(self.scene.clone());
                         }
@@ -1195,9 +1220,17 @@ impl OpenForgeApp {
                 tool_button(ui, &mut self.tool, ActiveTool::Rotate, "Rotate (R)");
                 ui.separator();
                 ui.label("Level:");
+                let level_before = self.selection.level;
                 ui.selectable_value(&mut self.selection.level, SelectLevel::Object, "Object");
                 ui.selectable_value(&mut self.selection.level, SelectLevel::Vertex, "Vertex");
                 ui.selectable_value(&mut self.selection.level, SelectLevel::Face, "Face");
+                if self.selection.level != level_before {
+                    // Element indices are level-specific: keeping them would read
+                    // a face index as a vertex index, and the next drag would
+                    // transform the wrong thing.
+                    self.selection.clear_elements();
+                    self.dirty = true;
+                }
                 ui.separator();
                 if ui.button("Frame All").clicked() {
                     self.frame_all();
@@ -2485,6 +2518,61 @@ mod tests {
             "undo restored the start: {:?}",
             restored.translation
         );
+    }
+
+    #[test]
+    fn a_vertex_level_drag_moves_only_the_selected_vertex() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+
+        // Pick a vertex that faces the camera, so its axis arm is grabbable.
+        let eye = app.camera.eye();
+        let mesh = app.scene.get(id).unwrap().mesh().unwrap().clone();
+        let front = (0..mesh.positions.len())
+            .max_by(|a, b| {
+                mesh.positions[*a].dot(eye).partial_cmp(&mesh.positions[*b].dot(eye)).unwrap()
+            })
+            .unwrap();
+        app.selection.level = SelectLevel::Vertex;
+        app.selection.select_node(id);
+        app.selection.select_elements(id, [front as u32]);
+
+        let before: Vec<Vec3> = mesh.positions.clone();
+        let start = app.scene.get(id).unwrap().transform;
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        // The gizmo sits on the vertex itself, not on the whole node.
+        let pivot = app.gizmo.layout.as_ref().expect("handles are laid out").origin;
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        assert!(
+            (tip - pivot).length() > 20.0,
+            "the X arm runs away from the pivot"
+        );
+
+        step(&ctx, &mut app, frame(1.0, tip, Some(true)));
+        assert_eq!(app.gizmo.active, Some(gizmo::Axis::X), "the arm was grabbed");
+        step(&ctx, &mut app, frame(2.0, tip + egui::vec2(120.0, 0.0), None));
+        step(&ctx, &mut app, frame(3.0, tip + egui::vec2(120.0, 0.0), Some(false)));
+        assert!(!app.gizmo.is_dragging());
+
+        let after: Vec<Vec3> = app.scene.get(id).unwrap().mesh().unwrap().positions.clone();
+        assert_eq!(after.len(), before.len());
+        let moved = after[front] - before[front];
+        assert!(moved.length() > 0.05, "the picked vertex moved: {moved:?}");
+        for (i, (a, b)) in after.iter().zip(&before).enumerate() {
+            if i == front {
+                continue;
+            }
+            assert!(
+                (*a - *b).length() < 1e-5,
+                "vertex {i} should not have moved: {:?} -> {:?}",
+                b,
+                a
+            );
+        }
+        // Sub-object editing never touches the node's own transform.
+        assert_eq!(app.scene.get(id).unwrap().transform, start);
+        assert!(app.undo.can_undo(), "the vertex drag is undoable");
     }
 
     #[test]

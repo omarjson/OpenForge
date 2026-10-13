@@ -103,6 +103,10 @@ A sample GitHub Actions matrix is shown below.
   shows the current mode). Edges of the selected faces are highlighted, and
   edges seen only from behind are dropped so a closed mesh doesn't draw its own
   far side through the shading.
+- **Vertex / Face level** editing: select sub-objects and the gizmo moves to their
+  centroid, where a drag moves *only* those vertices — the node's own transform
+  is left alone. Changing level clears the element selection, because a face
+  index and a vertex index are not the same thing.
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
 - **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Delete** removes, **F** frames all.
 - **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY and STL.

@@ -8,7 +8,7 @@ OpenForge — progress toward ZModeler parity
 ENGINE
   Data model (nodes, mesh, selection, undo, tools)     █████████████████░░░  85%
   Standard format IO (OBJ, glTF/GLB, PLY, STL)         █████████████░░░░░░░  65%
-  Modeling ops (extrude, inset, bevel, mirror, weld, deformers) ███████████████░░░░░  75%
+  Modeling ops (extrude, inset, bevel, mirror, weld, deformers) ████████████████░░░░  80%
   Boolean CSG                                          █████████████░░░░░░░  65%
   Generators & algorithms (primitives, Catmull-Clark, noise, L-systems) ████████████████░░░░  80%
   Materials & textures                                 ███████░░░░░░░░░░░░░  35%
@@ -18,16 +18,16 @@ ENGINE
 
 APPLICATION SURFACE
   GPU viewport (depth, shading, grid, gizmo)           ██████████░░░░░░░░░░  50%
-  Viewport editing UX (gizmos, wireframe, outlines, picking) ████████████░░░░░░░░  60%
+  Viewport editing UX (gizmos, wireframe, outlines, picking) ██████████████░░░░░░  70%
   UV editor UI                                         ████████░░░░░░░░░░░░  40%
   Panels & dialogs (outliner, properties, toolbars)    ██████░░░░░░░░░░░░░░  30%
   Import/export UX                                     ███████░░░░░░░░░░░░░  35%
   Plugin / service host                                ░░░░░░░░░░░░░░░░░░░░   0%
   Game tooling (LOD, dummies/TXD, vehicles)            █░░░░░░░░░░░░░░░░░░░   5%
 
-  OVERALL (unweighted mean of 16 areas)                ██████████░░░░░░░░░░  51%
+  OVERALL (unweighted mean of 16 areas)                ██████████░░░░░░░░░░  52%
 
-Measured from the repo: 11 crates · 324 test fns · 18050 lines of Rust
+Measured from the repo: 11 crates · 335 test fns · 18526 lines of Rust
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

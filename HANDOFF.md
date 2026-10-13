@@ -41,11 +41,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 11 crates (324 `#[test]` fns; 325 tests run, all green)
+## 4. Repo layout — 11 crates (335 `#[test]` fns; 336 tests run, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 22 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. |
+| `openforge-core` | 23 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 27 | Phong/Lambert materials, colors. |
@@ -55,7 +55,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
-| `openforge-app` | 52 (bin) | eframe/egui GUI. `app.rs` (~2600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-app` | 62 (bin) | eframe/egui GUI. `app.rs` (~2600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -124,9 +124,10 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** baseline commit `2a201c8`. Full workspace builds with **0 warnings**,
-**325 tests pass**, CI green on all 3 platforms. Four work-streams are done —
+**336 tests pass**, CI green on all 3 platforms. Five work-streams are done —
 the **wgpu viewport** (#1), the **interactive UV editor** (#2), the
-**transform gizmo** (#3) and the **edge overlay** (#4) — plus a progress report:
+**transform gizmo** (#3), the **edge overlay** (#4) and the **sub-object
+transforms** (#5) — plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -210,8 +211,29 @@ the **wgpu viewport** (#1), the **interactive UV editor** (#2), the
   vs `All` stroke counts (exactly nine more for an unselected box), and the
   highlight appearing on the facing face's edges only.
 
+- **The gizmo edits sub-objects, not just nodes.** A drag now carries a
+  `gizmo::Targets`: whole node transforms at object level, or the vertices
+  behind a vertex/face selection at element level. `viewport::element_centroid`
+  puts the handles on the selected elements' centroid (rotating a face about
+  the node's bounds centre looks like a bug) and `viewport::selected_vertices`
+  lists the affected corners, deduplicated, with their drag-start local
+  positions. The measure is world-space, so the app carries it through each
+  node's world matrix (`world⁻¹ · M · world`) before touching mesh-local
+  positions — one world unit of drag stays one world unit whatever the node's
+  own transform is. Idempotence and the single undo entry work exactly as for
+  nodes. `Selection::clear_elements` (new in core) fires when the user changes
+  level, because face 3 and vertex 3 are different things and keeping the index
+  would silently transform the wrong geometry.
+- **11 tests**: 1 in `openforge-core` (`clear_elements` keeps the nodes), 5 in
+  `gizmo.rs` (the measure matrix about a pivot; a vertex drag moving only its
+  own vertices and leaving the node transform alone; sweeping the cursor
+  without accumulating; the drag carried through the node's transform; a scale
+  about the pivot), 4 in `viewport.rs` (element centroids for vertices and
+  faces, the empty cases, corner dedup) and 1 end-to-end in `app.rs` — a
+  vertex-level drag that asserts every other vertex is untouched.
+
 **Verified this session:** `cargo build --release -p openforge-app` (the CI
-build job) → 0 warnings; `cargo test --workspace` → **325 pass, 0 failures**
+build job) → 0 warnings; `cargo test --workspace` → **336 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0); the app was launched
 locally and logged `eframe: ... Using wgpu.` with a Metal adapter and **no**
 `egui_wgpu` warnings, and it survived a 12 s run on the wgpu path without a
@@ -302,6 +324,15 @@ deltas and are many work-streams, not one push.
 - **`Stroke::color` is a `ColorMode`, not a `Color32`, in egui 0.29.** A test
   that inspects painted shapes must compare against
   `egui::epaint::ColorMode::Solid(colour)`.
+- **Element indices are only meaningful at the level they were picked at.**
+  `Selection` stores vertex/face indices in one set, so anything that changes
+  `level` must call `Selection::clear_elements()` (the toolbar does). Skip it
+  and a face index is read as a vertex index: the gizmo then pivots and drags
+  the wrong geometry.
+- **A live drag must pin its gizmo frame.** While dragging, the handles are
+  drawn at `drag.anchor.origin` rather than at the recomputed centroid/bounds —
+  otherwise the handles chase the geometry they are moving and every frame's
+  hit-test is against a new pivot.
 - **Panel order in `update()` matters.** The status bar is added first so it
   owns the bottom edge, then the UV editor, then the side panels, and the
   central viewport last. That is what keeps the viewport's rect — and its mouse

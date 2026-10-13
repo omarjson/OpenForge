@@ -12,8 +12,9 @@ use openforge_core::math::Ray;
 use std::collections::HashMap;
 use openforge_core::mesh::Mesh;
 use openforge_core::scene::Scene;
-use openforge_core::selection::Selection;
+use openforge_core::selection::{SelectLevel, Selection};
 use openforge_core::NodeId;
+use std::collections::BTreeSet;
 
 /// A perspective orbit camera.
 #[derive(Clone, Copy, Debug)]
@@ -374,6 +375,86 @@ pub fn collect_edges(
     out
 }
 
+/// The world-space centroid of the selected sub-objects, if anything is
+/// selected at vertex or face level.
+///
+/// This is where a sub-object transform should be applied *from*: rotating a
+/// face about the node's bounds centre looks like a bug, rotating it about
+/// itself is what the user asked for.
+pub fn element_centroid(scene: &mut Scene, selection: &Selection) -> Option<Vec3> {
+    let ids: Vec<NodeId> = selection.selected_nodes().collect();
+    let mut sum = Vec3::ZERO;
+    let mut count = 0usize;
+    for id in ids {
+        let Some(elements) = selection.selected_elements(id) else { continue };
+        let Ok(world) = scene.world_matrix(id) else { continue };
+        let Ok(node) = scene.get(id) else { continue };
+        let Some(mesh) = node.mesh() else { continue };
+        for &index in elements {
+            match selection.level {
+                SelectLevel::Vertex => {
+                    if let Some(p) = mesh.positions.get(index as usize) {
+                        sum += world.transform_point3(*p);
+                        count += 1;
+                    }
+                }
+                SelectLevel::Face | SelectLevel::Edge => {
+                    let Some(face) = mesh.faces.get(index as usize) else { continue };
+                    for corner in &face.corners {
+                        if let Some(p) = mesh.positions.get(corner.position as usize) {
+                            sum += world.transform_point3(*p);
+                            count += 1;
+                        }
+                    }
+                }
+                SelectLevel::Object => {}
+            }
+        }
+    }
+    (count > 0).then(|| sum / count as f32)
+}
+
+/// The vertices a sub-object drag should move, grouped by owning node, with
+/// their mesh-local positions at the moment the drag began.
+///
+/// Corners shared by several selected faces are listed once.
+pub fn selected_vertices(scene: &mut Scene, selection: &Selection) -> Vec<(NodeId, Vec<(u32, Vec3)>)> {
+    let mut out = Vec::new();
+    if selection.level == SelectLevel::Object {
+        return out;
+    }
+    for id in selection.selected_nodes().collect::<Vec<_>>() {
+        let Some(elements) = selection.selected_elements(id) else { continue };
+        let Ok(node) = scene.get(id) else { continue };
+        let Some(mesh) = node.mesh() else { continue };
+
+        let mut indices: BTreeSet<u32> = BTreeSet::new();
+        for &index in elements {
+            match selection.level {
+                SelectLevel::Vertex => {
+                    indices.insert(index);
+                }
+                SelectLevel::Face | SelectLevel::Edge => {
+                    let Some(face) = mesh.faces.get(index as usize) else { continue };
+                    for corner in &face.corners {
+                        indices.insert(corner.position);
+                    }
+                }
+                SelectLevel::Object => {}
+            }
+        }
+
+        let positions: Vec<(u32, Vec3)> = indices
+            .into_iter()
+            .filter_map(|vi| mesh.positions.get(vi as usize).map(|p| (vi, *p)))
+            .collect();
+        if !positions.is_empty() {
+            out.push((id, positions));
+        }
+    }
+    out
+}
+
 /// Result of a vertex pick.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct VertexHit {
@@ -592,6 +673,105 @@ mod tests {
         let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(1.0, 0.5, 5.0));
         assert_eq!(edges.len(), 8);
         assert_eq!(edges.iter().filter(|e| e.face_selected).count(), 4);
+    }
+
+    #[test]
+    fn the_element_centroid_of_selected_vertices_is_their_middle() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let mut sel = Selection::new();
+        sel.level = SelectLevel::Vertex;
+        sel.select_node(id);
+        sel.select_elements(id, [0u32, 2]);
+        // Corners (-1,-1) and (1,1) average to the middle.
+        let c = element_centroid(&mut scene, &sel).unwrap();
+        assert!(c.length() < 1e-5, "got {c:?}");
+
+        // Moving the node carries the centroid with it.
+        scene.get_mut(id).unwrap().transform.translation = Vec3::new(3.0, 0.0, -1.0);
+        let moved = element_centroid(&mut scene, &sel).unwrap();
+        assert!((moved - Vec3::new(3.0, 0.0, -1.0)).length() < 1e-5, "got {moved:?}");
+    }
+
+    #[test]
+    fn the_element_centroid_of_a_face_is_the_face_middle() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let mut sel = Selection::new();
+        sel.level = SelectLevel::Face;
+        sel.select_node(id);
+        sel.select_elements(id, [0u32]);
+        let c = element_centroid(&mut scene, &sel).unwrap();
+        assert!(c.length() < 1e-5, "got {c:?}");
+
+        // Two faces side by side: the centroid averages all eight corners.
+        let mut m = Mesh::new();
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        for (x, y) in [(1.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        m.add_face(&[0, 1, 2, 3]);
+        m.add_face(&[4, 5, 6, 7]);
+        let mut scene = Scene::new();
+        let strip = scene.create_mesh("strip", m);
+        let mut sel = Selection::new();
+        sel.level = SelectLevel::Face;
+        sel.select_node(strip);
+        sel.select_elements(strip, [0u32, 1]);
+        let both = element_centroid(&mut scene, &sel).unwrap();
+        assert!((both - Vec3::new(1.0, 0.5, 0.0)).length() < 1e-5, "got {both:?}");
+    }
+
+    #[test]
+    fn the_element_centroid_is_none_without_a_sub_object_selection() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let mut sel = Selection::new();
+        sel.level = SelectLevel::Vertex;
+        sel.select_node(id);
+        assert_eq!(element_centroid(&mut scene, &sel), None, "no vertices selected");
+
+        sel.level = SelectLevel::Object;
+        sel.select_elements(id, [0u32]);
+        assert_eq!(element_centroid(&mut scene, &sel), None, "object level has none");
+    }
+
+    #[test]
+    fn a_sub_object_selection_lists_each_corner_once() {
+        let mut m = Mesh::new();
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0), (2.0, 0.0), (2.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        m.add_face(&[0, 1, 2, 3]);
+        // The second face reuses corners 2 and 3 along the shared vertical edge.
+        m.add_face(&[3, 2, 4, 5]);
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("hinge", m);
+        let mut sel = Selection::new();
+        sel.level = SelectLevel::Face;
+        sel.select_node(id);
+        sel.select_elements(id, [0u32, 1]);
+
+        let targets = selected_vertices(&mut scene, &sel);
+        assert_eq!(targets.len(), 1, "both faces belong to one node");
+        let (node, positions) = &targets[0];
+        assert_eq!(*node, id);
+        assert_eq!(positions.len(), 6, "eight corners, two of them shared");
+        // The positions are the drag-start state, i.e. the local vertices.
+        assert!(positions.contains(&(2, Vec3::new(1.0, 1.0, 0.0))));
+
+        // Vertex level lists exactly what was selected, and object level none.
+        // (The app clears the element set when the level changes; here that is
+        // done by hand so the two levels are not mixed in one set.)
+        sel.clear_elements();
+        sel.level = SelectLevel::Vertex;
+        sel.select_elements(id, [5u32]);
+        let only_five = selected_vertices(&mut scene, &sel);
+        assert_eq!(only_five[0].1, vec![(5, Vec3::new(2.0, 1.0, 0.0))]);
+        sel.level = SelectLevel::Object;
+        assert!(selected_vertices(&mut scene, &sel).is_empty());
     }
 
     #[test]

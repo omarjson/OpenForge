@@ -354,14 +354,42 @@ impl Anchor {
     }
 }
 
+/// The world-space transform a measure describes, about `pivot`.
+pub fn measure_matrix(axis: Axis, measure: Measure, pivot: Vec3) -> Mat4 {
+    let about_pivot = |m: Mat4| Mat4::from_translation(pivot) * m * Mat4::from_translation(-pivot);
+    match measure {
+        Measure::Translate(d) => Mat4::from_translation(axis.dir() * d),
+        Measure::Scale(f) => about_pivot(Mat4::from_scale(Vec3::splat(f))),
+        Measure::Rotate(a) => about_pivot(Mat4::from_axis_angle(axis.dir(), a)),
+    }
+}
+
+/// One node's vertices, as they were when the drag began.
+#[derive(Clone, Debug)]
+pub struct VertexTarget {
+    pub node: NodeId,
+    /// Mesh-local positions, keyed by vertex index.
+    pub positions: Vec<(u32, Vec3)>,
+}
+
+/// What a drag moves.
+#[derive(Clone, Debug)]
+pub enum Targets {
+    /// Whole nodes, re-derived from the transform each held when the drag
+    /// began.
+    Nodes(Vec<(NodeId, Transform)>),
+    /// The vertices behind a sub-object selection, re-derived from the local
+    /// positions each held when the drag began.
+    Vertices(Vec<VertexTarget>),
+}
+
 /// An in-progress axis-constrained drag.
 #[derive(Clone, Debug)]
 pub struct Drag {
     pub mode: TransformMode,
     pub axis: Axis,
     pub anchor: Anchor,
-    /// Each selected node's transform at the moment the drag began.
-    pub start_transforms: Vec<(NodeId, Transform)>,
+    pub targets: Targets,
 }
 
 impl Drag {
@@ -409,17 +437,40 @@ impl Gizmo {
         self.drag.take().map(|d| d.undo_label())
     }
 
-    /// Move the selection along the dragged axis, using the cursor ray.
+    /// Move the dragged targets along the dragged axis, using the cursor ray.
     ///
-    /// Every node is re-derived from its drag-start transform, so the edit is
+    /// Every target is re-derived from its drag-start state, so the edit is
     /// idempotent and never accumulates rounding error. Returns whether the
     /// measure could be resolved this frame.
     pub fn apply(&self, scene: &mut Scene, ray: Ray) -> bool {
         let Some(drag) = self.drag.as_ref() else { return false };
         let Some(measure) = drag.anchor.measure(ray) else { return false };
-        for (id, start) in &drag.start_transforms {
-            let Ok(node) = scene.get_mut(*id) else { continue };
-            node.transform = apply_measure(drag.axis, start, measure);
+        match &drag.targets {
+            Targets::Nodes(nodes) => {
+                for (id, start) in nodes {
+                    let Ok(node) = scene.get_mut(*id) else { continue };
+                    node.transform = apply_measure(drag.axis, start, measure);
+                }
+            }
+            Targets::Vertices(targets) => {
+                // The measure is world-space; the vertices are mesh-local, so
+                // the transform is carried through each node's world matrix.
+                let world_space = measure_matrix(drag.axis, measure, drag.anchor.origin);
+                for target in targets {
+                    let Ok(world) = scene.world_matrix(target.node) else { continue };
+                    if world.determinant().abs() < 1e-12 {
+                        continue;
+                    }
+                    let local = world.inverse() * world_space * world;
+                    let Ok(node) = scene.get_mut(target.node) else { continue };
+                    let Some(mesh) = node.mesh_mut() else { continue };
+                    for (vi, start) in &target.positions {
+                        if let Some(p) = mesh.positions.get_mut(*vi as usize) {
+                            *p = local.transform_point3(*start);
+                        }
+                    }
+                }
+            }
         }
         true
     }
@@ -670,7 +721,7 @@ mod tests {
             mode: TransformMode::Move,
             axis: Axis::X,
             anchor,
-            start_transforms: vec![(id, start)],
+            targets: Targets::Nodes(vec![(id, start)]),
         });
 
         let ray_at = |x: f32| Ray { origin: Vec3::new(x, 0.0, 5.0), direction: -Vec3::Z };
@@ -682,6 +733,143 @@ mod tests {
         assert!((t - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "got {t:?}");
         assert_eq!(gizmo.finish(), Some("Move"));
         assert!(!gizmo.is_dragging());
+    }
+
+    #[test]
+    fn measure_matrix_moves_scales_and_spins_about_the_pivot() {
+        let pivot = Vec3::new(1.0, 0.0, 0.0);
+        let p = Vec3::new(2.0, 0.0, 0.0);
+
+        let moved = measure_matrix(Axis::X, Measure::Translate(3.0), pivot).transform_point3(p);
+        assert!((moved - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5, "got {moved:?}");
+
+        // Scaling about the pivot: x = 1 + (2 - 1) * 2.
+        let scaled = measure_matrix(Axis::Y, Measure::Scale(2.0), pivot).transform_point3(p);
+        assert!((scaled - Vec3::new(3.0, 0.0, 0.0)).length() < 1e-5, "got {scaled:?}");
+
+        // A quarter turn about Z around the pivot sends +X to +Y.
+        let spun = measure_matrix(Axis::Z, Measure::Rotate(std::f32::consts::FRAC_PI_2), pivot)
+            .transform_point3(p);
+        assert!((spun - Vec3::new(1.0, 1.0, 0.0)).length() < 1e-4, "got {spun:?}");
+    }
+
+    /// A unit square in the XY plane whose corners are vertices 0..3.
+    fn square_scene() -> (Scene, NodeId) {
+        let mut mesh = Mesh::new();
+        mesh.add_vertex(Vec3::new(0.0, 0.0, 0.0));
+        mesh.add_vertex(Vec3::new(1.0, 0.0, 0.0));
+        mesh.add_vertex(Vec3::new(1.0, 1.0, 0.0));
+        mesh.add_vertex(Vec3::new(0.0, 1.0, 0.0));
+        mesh.add_face(&[0, 1, 2, 3]);
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("square", mesh);
+        (scene, id)
+    }
+
+    fn vertex_drag(node: NodeId, positions: Vec<(u32, Vec3)>) -> (Gizmo, Vec3) {
+        let ray = Ray { origin: Vec3::new(0.0, 5.0, 0.0), direction: -Vec3::Y };
+        let anchor = Anchor::new(TransformMode::Move, Axis::X, Vec3::ZERO, ray).unwrap();
+        let mut gizmo = Gizmo::default();
+        gizmo.begin(Drag {
+            mode: TransformMode::Move,
+            axis: Axis::X,
+            anchor,
+            targets: Targets::Vertices(vec![VertexTarget { node, positions }]),
+        });
+        (gizmo, Vec3::ZERO)
+    }
+
+    fn drag_ray(x: f32) -> Ray {
+        Ray { origin: Vec3::new(x, 5.0, 0.0), direction: -Vec3::Y }
+    }
+
+    #[test]
+    fn a_vertex_drag_moves_only_the_vertices_it_was_given() {
+        let (mut scene, id) = square_scene();
+        let (gizmo, _) = vertex_drag(
+            id,
+            vec![(0, Vec3::new(0.0, 0.0, 0.0)), (2, Vec3::new(1.0, 1.0, 0.0))],
+        );
+        assert!(gizmo.apply(&mut scene, drag_ray(2.0)));
+
+        let mesh = scene.get(id).unwrap().mesh().unwrap();
+        assert!((mesh.positions[0] - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-5);
+        assert!((mesh.positions[2] - Vec3::new(3.0, 1.0, 0.0)).length() < 1e-5);
+        // The corners left out of the drag stay exactly where they were.
+        assert!((mesh.positions[1] - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5);
+        assert!((mesh.positions[3] - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-5);
+        // Sub-object editing leaves the node's own transform alone.
+        assert_eq!(scene.get(id).unwrap().transform, Transform::identity());
+    }
+
+    #[test]
+    fn a_vertex_drag_is_re_derived_from_the_start_positions() {
+        let (mut scene, id) = square_scene();
+        let (gizmo, _) = vertex_drag(id, vec![(1, Vec3::new(1.0, 0.0, 0.0))]);
+        // Sweeping the cursor around must not accumulate: the last position is
+        // one drag measured from the start, i.e. x = 1 + 4.
+        for x in [0.5, 3.0, -2.0, 4.0] {
+            gizmo.apply(&mut scene, drag_ray(x));
+        }
+        let mesh = scene.get(id).unwrap().mesh().unwrap();
+        assert!(
+            (mesh.positions[1] - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5,
+            "only the last ray counts: {:?}",
+            mesh.positions[1]
+        );
+    }
+
+    #[test]
+    fn a_vertex_drag_is_carried_through_the_node_transform() {
+        let (mut scene, id) = square_scene();
+        {
+            // The node sits at x = 5 and is scaled twice over, so one world
+            // unit of drag is half a unit of mesh-local movement.
+            let node = scene.get_mut(id).unwrap();
+            node.transform.translation = Vec3::new(5.0, 0.0, 0.0);
+            node.transform.scale = Vec3::splat(2.0);
+        }
+        let (gizmo, _) = vertex_drag(id, vec![(0, Vec3::ZERO)]);
+        assert!(gizmo.apply(&mut scene, drag_ray(1.0)));
+
+        let local = scene.get(id).unwrap().mesh().unwrap().positions[0];
+        let world = scene.world_matrix(id).unwrap().transform_point3(local);
+        assert!(
+            (world - Vec3::new(6.0, 0.0, 0.0)).length() < 1e-4,
+            "one world unit along +X from x = 5: got {world:?}"
+        );
+    }
+
+    #[test]
+    fn a_vertex_scale_drag_pulls_the_vertices_about_the_pivot() {
+        let (mut scene, id) = square_scene();
+        // Grab the +Y arm at y = 1 (the pivot is the origin), then drag out to
+        // y = 2 for a 2x scale.
+        let anchor = Anchor::new(
+            TransformMode::Scale,
+            Axis::Y,
+            Vec3::ZERO,
+            Ray { origin: Vec3::new(5.0, 1.0, 0.0), direction: -Vec3::X },
+        )
+        .unwrap();
+        let mut gizmo = Gizmo::default();
+        gizmo.begin(Drag {
+            mode: TransformMode::Scale,
+            axis: Axis::Y,
+            anchor,
+            targets: Targets::Vertices(vec![VertexTarget {
+                node: id,
+                positions: vec![(2, Vec3::new(1.0, 1.0, 0.0)), (3, Vec3::new(0.0, 1.0, 0.0))],
+            }]),
+        });
+        assert!(gizmo.apply(
+            &mut scene,
+            Ray { origin: Vec3::new(5.0, 2.0, 0.0), direction: -Vec3::X }
+        ));
+
+        let mesh = scene.get(id).unwrap().mesh().unwrap();
+        assert!((mesh.positions[2] - Vec3::new(2.0, 2.0, 0.0)).length() < 1e-4, "got {:?}", mesh.positions[2]);
+        assert!((mesh.positions[3] - Vec3::new(0.0, 2.0, 0.0)).length() < 1e-4, "got {:?}", mesh.positions[3]);
     }
 
     #[test]
