@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod gizmo;
 mod gpu_viewport;
 mod uv_editor;
 mod viewport;

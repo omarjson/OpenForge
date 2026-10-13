@@ -1,6 +1,7 @@
 //! The OpenForge application: UI layout, viewport interaction, and the glue
 //! between egui and the openforge-core scene model.
 
+use crate::gizmo;
 use crate::gpu_viewport::{self, GpuViewport};
 use crate::uv_editor::{self, UvEditor};
 use crate::viewport::{self, Camera};
@@ -11,7 +12,9 @@ use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
 use openforge_core::scene::Scene;
 use openforge_core::selection::{SelectLevel, Selection};
-use openforge_core::tool::{Pointer, SelectTool, Tool, ToolContext, TransformMode, TransformTool};
+use openforge_core::tool::{
+    DragState, Pointer, SelectTool, Tool, ToolContext, TransformMode, TransformTool,
+};
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
@@ -62,19 +65,31 @@ pub struct OpenForgeApp {
     rig_bone: usize,
     rig_angle: f32,
     rig_bones: usize,
+    /// Live transform-gizmo state (hover, drag, this frame's handle layout).
+    gizmo: gizmo::Gizmo,
+    /// In-progress free-form tool drag, held here because a drag spans frames.
+    tool_drag: Option<DragState>,
 }
 
 impl OpenForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         // Dark theme by default; egui respects the native theme otherwise.
         cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        // eframe hands us a live wgpu device when it runs the wgpu backend;
+        // otherwise `gpu` stays `None` and the CPU painter takes over.
+        Self::with_gpu(cc.wgpu_render_state.as_ref().map(GpuViewport::new))
+    }
+
+    /// The initial application state for a given viewport backend.
+    ///
+    /// Split out of [`Self::new`] because an [`eframe::CreationContext`] can
+    /// only be built by eframe itself; the headless interaction tests at the
+    /// bottom of this file come in through here.
+    fn with_gpu(gpu: Option<GpuViewport>) -> Self {
         let mut scene = Scene::new();
         // Seed with a cube so the viewport isn't empty on first run.
         let cube = mesh::uv_sphere(1.0, 24, 16);
         scene.create_mesh("Sphere", cube);
-        // eframe hands us a live wgpu device when it runs the wgpu backend;
-        // otherwise `gpu` stays `None` and the CPU painter takes over.
-        let gpu = cc.wgpu_render_state.as_ref().map(GpuViewport::new);
         let backend = if gpu.is_some() { "wgpu" } else { "CPU" };
         Self {
             scene,
@@ -84,7 +99,7 @@ impl OpenForgeApp {
             tool: ActiveTool::Select,
             edit_before: None,
             status: format!(
-                "{backend} viewport. Left-drag selects; middle-drag orbits; scroll zooms. Face level: X extrude, I inset, O poke, S subdivide, Del delete."
+                "{backend} viewport. Left-drag selects; W/E/R show the transform gizmo; middle-drag orbits; scroll zooms."
             ),
             current_file: None,
             tris: Vec::new(),
@@ -102,6 +117,8 @@ impl OpenForgeApp {
             rig_bone: 0,
             rig_angle: 0.0,
             rig_bones: 4,
+            gizmo: gizmo::Gizmo::default(),
+            tool_drag: None,
         }
     }
 
@@ -627,6 +644,29 @@ impl OpenForgeApp {
 
     // --- Viewport interaction ----------------------------------------------------
 
+    /// Normalized device coordinates (`-1..1`) for a screen position inside the
+    /// viewport rect.
+    fn viewport_ndc(pos: egui::Pos2, rect: egui::Rect) -> glam::Vec2 {
+        glam::Vec2::new(
+            ((pos.x - rect.left()) / rect.width()) * 2.0 - 1.0,
+            1.0 - ((pos.y - rect.top()) / rect.height()) * 2.0,
+        )
+    }
+
+    /// A world-space picking ray for a screen position inside the viewport.
+    ///
+    /// Takes the camera by reference rather than `&self` so it can be called
+    /// while the scene is mutably borrowed by a tool context.
+    fn pick_ray(
+        camera: &Camera,
+        pos: egui::Pos2,
+        rect: egui::Rect,
+        aspect: f32,
+    ) -> openforge_core::math::Ray {
+        let ndc = Self::viewport_ndc(pos, rect);
+        camera.ray_from_ndc(ndc.x, ndc.y, aspect)
+    }
+
     fn handle_viewport_input(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
         let response = ui.interact(rect, ui.id().with("viewport"), egui::Sense::click_and_drag());
         let aspect = rect.width() / rect.height().max(1.0);
@@ -650,44 +690,142 @@ impl OpenForgeApp {
             }
         }
 
+        // --- Gizmo ----------------------------------------------------------------
+        // Lay the handles out once per frame: this same layout drives both the
+        // hit-testing below and the painting later in the frame, so the arm that
+        // lights up is exactly the arm that was grabbed.
+        let size = [rect.width(), rect.height()];
+        let vp = self.camera.view_proj(aspect);
+        let gizmo_mode = match self.tool {
+            ActiveTool::Select => None,
+            ActiveTool::Move => Some(TransformMode::Move),
+            ActiveTool::Scale => Some(TransformMode::Scale),
+            ActiveTool::Rotate => Some(TransformMode::Rotate),
+        };
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        let bounds = self.scene.world_bounds(&ids);
+        let frame = match (gizmo_mode, bounds.is_empty()) {
+            (Some(_), false) => Some(gizmo::Frame::for_camera(
+                &self.camera,
+                rect.height(),
+                gizmo::HANDLE_PIXELS,
+                bounds.center(),
+            )),
+            _ => None,
+        };
+        self.gizmo.layout = frame.and_then(|f| {
+            gizmo::Layout::build(vp, size, rect.min.to_vec2(), &f, gizmo::RING_SEGMENTS)
+        });
+
+        // Which handle is under the cursor, and what the pointer is doing. The
+        // cursor has to come from the raw pointer state rather than
+        // `Response::hover_pos`: a widget stops reporting itself as hovered on
+        // the very frame its press starts, which is exactly the frame a grab
+        // has to be recognised on.
+        let (cursor, pressed, press_pos, released) = ui.input(|i| {
+            (
+                i.pointer.hover_pos().filter(|p| rect.contains(*p)),
+                i.pointer.primary_pressed(),
+                i.pointer.press_origin().filter(|p| rect.contains(*p)),
+                i.pointer.any_released(),
+            )
+        });
+        let hovered = match (gizmo_mode, self.gizmo.layout.as_ref(), cursor) {
+            (Some(TransformMode::Rotate), Some(layout), Some(pos)) => {
+                layout.hit_ring(pos, gizmo::HIT_TOLERANCE)
+            }
+            (Some(_), Some(layout), Some(pos)) => layout.hit_axis(pos, gizmo::HIT_TOLERANCE),
+            _ => None,
+        };
+        if !self.gizmo.is_dragging() && hovered != self.gizmo.hovered {
+            self.gizmo.hovered = hovered;
+            self.dirty = true;
+        }
+
+        // A handle grab owns the pointer for the whole gesture, so the free-form
+        // tool drag below never competes with it. The grab is taken on the press
+        // itself — by the time egui reports a drag the cursor has already left
+        // the handle, so hit-testing then would always miss.
+        let mut consumed = false;
+        let mut gizmo_undo: Option<(String, Scene)> = None;
+        if self.gizmo.is_dragging() {
+            consumed = true;
+            if let Some(pos) = cursor {
+                let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
+                if self.gizmo.apply(&mut self.scene, ray) {
+                    self.dirty = true;
+                }
+            }
+            if released {
+                if let Some(label) = self.gizmo.finish() {
+                    if let Some(before) = self.edit_before.take() {
+                        gizmo_undo = Some((label.to_string(), before));
+                    }
+                }
+            }
+        } else if pressed {
+            if let (Some(mode), Some(frame), Some(pos)) = (gizmo_mode, frame, press_pos) {
+                let axis = match self.gizmo.layout.as_ref() {
+                    Some(layout) if mode == TransformMode::Rotate => {
+                        layout.hit_ring(pos, gizmo::HIT_TOLERANCE)
+                    }
+                    Some(layout) => layout.hit_axis(pos, gizmo::HIT_TOLERANCE),
+                    None => None,
+                };
+                if let Some(axis) = axis {
+                    let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
+                    if let Some(anchor) = gizmo::Anchor::new(mode, axis, frame.origin, ray) {
+                        let start_transforms = ids
+                            .iter()
+                            .filter_map(|id| self.scene.get(*id).ok().map(|n| (*id, n.transform)))
+                            .collect();
+                        self.gizmo.begin(gizmo::Drag { mode, axis, anchor, start_transforms });
+                        if self.edit_before.is_none() {
+                            self.edit_before = Some(self.scene.clone());
+                        }
+                        consumed = true;
+                        self.dirty = true;
+                    }
+                }
+            }
+        }
+
         // Build the active tool and a context borrowing the scene + selection.
         let mut tool = self.active_tool();
         let level = self.selection.level;
         let mut tctx = ToolContext {
             scene: &mut self.scene,
             selection: &mut self.selection,
-            drag: None,
+            // A drag spans many frames, so its state is owned by the app and
+            // handed back to the tool on every frame of the gesture.
+            drag: self.tool_drag.take(),
         };
 
-        // Primary (left) button drives the active tool.
-        let primary = response.dragged_by(egui::PointerButton::Primary)
-            || response.drag_started_by(egui::PointerButton::Primary);
         let mut pending_undo: Option<(String, Scene)> = None;
         // For sub-object picking we stash the click ray and resolve it after the
         // tool context's borrows on the scene/selection are released.
         let mut click_pick: Option<openforge_core::math::Ray> = None;
         if let Some(pos) = response.interact_pointer_pos() {
-            let ndc_x = ((pos.x - rect.left()) / rect.width()) * 2.0 - 1.0;
-            let ndc_y = 1.0 - ((pos.y - rect.top()) / rect.height()) * 2.0;
-            let ray = self.camera.ray_from_ndc(ndc_x, ndc_y, aspect);
-            let pointer = Pointer { ray, ndc: glam::Vec2::new(ndc_x, ndc_y) };
+            let ndc = Self::viewport_ndc(pos, rect);
+            let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
+            let pointer = Pointer { ray, ndc };
 
-            if response.drag_started_by(egui::PointerButton::Primary) {
+            if !consumed && response.drag_started_by(egui::PointerButton::Primary) {
                 if self.edit_before.is_none() {
                     self.edit_before = Some(tctx.scene.clone());
                 }
                 tool.on_pointer_down(&mut tctx, &pointer);
                 self.dirty = true;
-            } else if response.dragged_by(egui::PointerButton::Primary) {
+            } else if !consumed && response.dragged_by(egui::PointerButton::Primary) {
                 tool.on_pointer_move(&mut tctx, &pointer);
                 self.dirty = true;
-            } else if response.drag_stopped() && primary {
+            } else if !consumed && response.drag_stopped() {
                 if let Some(outcome) = tool.on_pointer_up(&mut tctx, &pointer) {
                     let before = self.edit_before.take();
                     pending_undo = before.map(|b| (outcome.label, b));
                     self.dirty = true;
                 }
-            } else if response.clicked() {
+            } else if !consumed && response.clicked() {
                 if level == SelectLevel::Object {
                     // Object level: delegate to the select tool.
                     if matches!(self.tool, ActiveTool::Select) {
@@ -701,6 +839,8 @@ impl OpenForgeApp {
                 }
             }
         }
+        // Hand the (possibly advanced) drag state back to the app.
+        self.tool_drag = tctx.drag.take();
         drop(tctx);
 
         // Resolve a sub-object pick now that the borrows are released.
@@ -729,18 +869,22 @@ impl OpenForgeApp {
             }
         }
 
-        // Record the undo entry now that the scene borrow is released.
-        if let Some((label, before)) = pending_undo {
-            self.undo.push(label, before, self.scene.clone());
+        // Record the undo entries now that the scene borrow is released. A gizmo
+        // drag and a tool drag never end on the same frame, but both feed the
+        // same stack — and a gesture that moved nothing leaves no entry.
+        for (label, before) in [gizmo_undo, pending_undo].into_iter().flatten() {
+            if !self.scene.content_eq(&before) {
+                self.undo.push(label, before, self.scene.clone());
+            }
         }
 
         self.status = match self.tool {
             ActiveTool::Select => {
                 format!("Select — {} object(s) selected.", self.selection.node_count())
             }
-            ActiveTool::Move => "Move — drag to translate selection.".into(),
-            ActiveTool::Scale => "Scale — drag to scale selection.".into(),
-            ActiveTool::Rotate => "Rotate — drag to rotate selection.".into(),
+            ActiveTool::Move => "Move — drag an axis handle, or drag the mesh in the view plane.".into(),
+            ActiveTool::Scale => "Scale — drag an axis handle away from the centre.".into(),
+            ActiveTool::Rotate => "Rotate — drag one of the axis rings.".into(),
         };
     }
 
@@ -804,6 +948,9 @@ impl OpenForgeApp {
 
         // Overlay selected vertices as small dots (vertex level editing aid).
         self.paint_vertex_dots(&painter, rect);
+        // The transform gizmo sits above the geometry so its handles stay
+        // grabbable even when they overlap the mesh.
+        self.paint_gizmo(&painter);
 
         // Overlay label.
         let label = format!(
@@ -1393,6 +1540,7 @@ impl OpenForgeApp {
         painter.image(texture_id, rect, uv, egui::Color32::WHITE);
 
         self.paint_vertex_dots(&painter, rect);
+        self.paint_gizmo(&painter);
 
         let label = format!(
             "Perspective  |  wgpu  |  {} tris  |  {} draws  |  {} selected",
@@ -1443,6 +1591,68 @@ impl OpenForgeApp {
                 painter.circle_filled(center, rad, color);
             }
         }
+    }
+
+    /// Draw the transform gizmo over the viewport.
+    ///
+    /// Shared by both viewport backends: the handle layout was computed in
+    /// screen space by the input pass, so what is drawn here is exactly what
+    /// can be grabbed.
+    fn paint_gizmo(&self, painter: &egui::Painter) {
+        let Some(layout) = self.gizmo.layout.as_ref() else { return };
+        let mode = match self.tool {
+            ActiveTool::Select => return,
+            ActiveTool::Move => TransformMode::Move,
+            ActiveTool::Scale => TransformMode::Scale,
+            ActiveTool::Rotate => TransformMode::Rotate,
+        };
+        let hot = self.gizmo.highlight();
+
+        if mode == TransformMode::Rotate {
+            for (axis, pts) in &layout.rings {
+                if pts.len() < 2 {
+                    continue;
+                }
+                let on = Some(*axis) == hot;
+                let mut closed = pts.clone();
+                closed.push(pts[0]);
+                painter.add(egui::Shape::line(
+                    closed,
+                    egui::Stroke::new(if on { 3.0_f32 } else { 1.6_f32 }, axis.color(on)),
+                ));
+            }
+            return;
+        }
+
+        for (axis, tip) in &layout.arms {
+            let on = Some(*axis) == hot;
+            let color = axis.color(on);
+            painter.line_segment(
+                [layout.origin, *tip],
+                egui::Stroke::new(if on { 4.0_f32 } else { 2.4_f32 }, color),
+            );
+            if mode == TransformMode::Scale {
+                // A square cap reads as "scale" at a glance, a round one as
+                // "move".
+                painter.rect_filled(
+                    egui::Rect::from_center_size(*tip, egui::vec2(9.0, 9.0)),
+                    1.0,
+                    color,
+                );
+            } else {
+                painter.circle_filled(*tip, if on { 5.0_f32 } else { 4.0_f32 }, color);
+            }
+            if on {
+                painter.text(
+                    *tip + egui::vec2(9.0, -9.0),
+                    egui::Align2::LEFT_BOTTOM,
+                    axis.label(),
+                    egui::FontId::monospace(11.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+        painter.circle_filled(layout.origin, 3.5, egui::Color32::from_gray(235));
     }
 
     fn handle_status_bar(&self, ctx: &egui::Context) {
@@ -2015,4 +2225,350 @@ fn rfd_save_file() -> Option<PathBuf> {
         .add_filter("3D models", &["obj", "glb", "ply", "stl"])
         .set_file_name("export.obj")
         .save_file()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SCREEN: [f32; 2] = [1000.0, 700.0];
+
+    /// One frame of raw input: where the pointer is, and whether the primary
+    /// button went down or up on this frame.
+    fn frame(time: f64, pointer: egui::Pos2, click: Option<bool>) -> egui::RawInput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(SCREEN[0], SCREEN[1]),
+            )),
+            time: Some(time),
+            ..Default::default()
+        };
+        input.events.push(egui::Event::PointerMoved(pointer));
+        if let Some(pressed) = click {
+            input.events.push(egui::Event::PointerButton {
+                pos: pointer,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            });
+        }
+        input
+    }
+
+    /// Drive one frame of the app's viewport path (input + paint), headlessly,
+    /// returning the shapes the frame painted.
+    fn paint_once(
+        ctx: &egui::Context,
+        app: &mut OpenForgeApp,
+        input: egui::RawInput,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        ctx.run(input, |ctx| app.handle_central_viewport(ctx, None))
+            .shapes
+    }
+
+    /// Drive one frame and discard its output.
+    fn step(ctx: &egui::Context, app: &mut OpenForgeApp, input: egui::RawInput) {
+        let _ = paint_once(ctx, app, input);
+    }
+
+    /// How many stroked segments and filled paths a frame's shapes contain.
+    ///
+    /// The gizmo's axis arms are segments and its rotation rings are paths, so
+    /// counting them is how the tests see what was actually drawn.
+    fn stroked(shapes: &[egui::epaint::ClippedShape]) -> (usize, usize) {
+        fn walk(shape: &egui::Shape, lines: &mut usize, paths: &mut usize) {
+            match shape {
+                egui::Shape::LineSegment { .. } => *lines += 1,
+                egui::Shape::Path(_) => *paths += 1,
+                egui::Shape::Vec(inner) => {
+                    for s in inner {
+                        walk(s, lines, paths);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let (mut lines, mut paths) = (0, 0);
+        for clipped in shapes {
+            walk(&clipped.shape, &mut lines, &mut paths);
+        }
+        (lines, paths)
+    }
+
+    /// The app as it starts up, with the seed sphere selected and the Move tool
+    /// active — the state a user lands in after clicking the sphere and
+    /// pressing W.
+    fn app_ready_to_move() -> (OpenForgeApp, NodeId) {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let id = app
+            .scene
+            .iter()
+            .find(|n| n.is_mesh())
+            .map(|n| n.id)
+            .expect("the seed sphere exists");
+        app.selection.select_node(id);
+        app.tool = ActiveTool::Move;
+        (app, id)
+    }
+
+    /// Where an axis arm ends on screen, as the app laid it out this frame.
+    fn arm_tip(app: &OpenForgeApp, axis: gizmo::Axis) -> egui::Pos2 {
+        app.gizmo
+            .layout
+            .as_ref()
+            .expect("a transform tool with a selection lays the handles out")
+            .arms
+            .iter()
+            .find(|(a, _)| *a == axis)
+            .map(|(_, p)| *p)
+            .expect("the axis projects on screen")
+    }
+
+    #[test]
+    fn the_gizmo_appears_only_for_a_transform_tool_over_a_selection() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        assert!(app.gizmo.layout.is_some(), "Move tool + selection draws handles");
+
+        app.tool = ActiveTool::Select;
+        step(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None));
+        assert!(app.gizmo.layout.is_none(), "the Select tool has no handles");
+
+        app.tool = ActiveTool::Move;
+        app.selection.clear();
+        step(&ctx, &mut app, frame(2.0, egui::pos2(500.0, 350.0), None));
+        assert!(app.gizmo.layout.is_none(), "nothing selected means nothing to move");
+    }
+
+    #[test]
+    fn hovering_an_arm_highlights_it_and_only_it() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        step(&ctx, &mut app, frame(1.0, tip, None));
+        assert_eq!(app.gizmo.hovered, Some(gizmo::Axis::X));
+
+        // A corner of the viewport is nowhere near a handle.
+        step(&ctx, &mut app, frame(2.0, egui::pos2(20.0, 660.0), None));
+        assert_eq!(app.gizmo.hovered, None);
+    }
+
+    #[test]
+    fn dragging_an_arm_moves_along_that_axis_and_undoes_in_one_step() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        let before = app.scene.get(id).unwrap().transform;
+
+        // Press on the handle: the grab has to be taken here, because by the
+        // time the pointer has moved egui calls it a drag, not a hover.
+        step(&ctx, &mut app, frame(1.0, tip, Some(true)));
+        assert!(app.gizmo.is_dragging(), "pressing a handle starts a drag");
+        assert_eq!(app.gizmo.active, Some(gizmo::Axis::X));
+
+        // Drag clear of the handle and the selection follows the axis.
+        let dragged = tip + egui::vec2(140.0, 0.0);
+        step(&ctx, &mut app, frame(2.0, dragged, None));
+        let mid = app.scene.get(id).unwrap().transform;
+        assert!(app.gizmo.is_dragging());
+
+        // Release.
+        step(&ctx, &mut app, frame(3.0, dragged, Some(false)));
+        assert!(!app.gizmo.is_dragging(), "releasing ends the gesture");
+        assert_eq!(app.gizmo.active, None);
+
+        let after = app.scene.get(id).unwrap().transform;
+        assert!(
+            after.translation.x > before.translation.x + 0.05,
+            "moved along +X: {:?} -> {:?}",
+            before.translation,
+            after.translation
+        );
+        assert!((after.translation.y - before.translation.y).abs() < 1e-5, "Y is untouched");
+        assert!((after.translation.z - before.translation.z).abs() < 1e-5, "Z is untouched");
+        assert!(
+            (after.translation.x - mid.translation.x).abs() < 1e-5,
+            "the released position is the one that sticks"
+        );
+
+        // One undo step restores the whole gesture.
+        assert!(app.undo.can_undo(), "the gesture left an undo entry");
+        app.undo_edit();
+        let restored = app.scene.get(id).unwrap().transform;
+        assert!(
+            (restored.translation - before.translation).length() < 1e-5,
+            "undo restored the start: {:?}",
+            restored.translation
+        );
+    }
+
+    #[test]
+    fn a_press_that_misses_the_handles_falls_through_to_the_free_drag() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        let before = app.scene.get(id).unwrap().transform;
+
+        // Press in an empty corner, well away from the gizmo, and drag away.
+        let empty = egui::pos2(940.0, 40.0);
+        let moved = empty + egui::vec2(-120.0, 90.0);
+        step(&ctx, &mut app, frame(1.0, empty, Some(true)));
+        assert!(!app.gizmo.is_dragging(), "the handles were not grabbed");
+        step(&ctx, &mut app, frame(2.0, moved, None));
+        step(&ctx, &mut app, frame(3.0, moved + egui::vec2(-20.0, 20.0), None));
+        step(&ctx, &mut app, frame(4.0, moved + egui::vec2(-20.0, 20.0), Some(false)));
+
+        // The gizmo never claimed the gesture, so no axis state is left behind.
+        assert_eq!(app.gizmo.active, None);
+        assert!(!app.gizmo.is_dragging());
+
+        // The gesture went to the free-form tool instead, which slides the
+        // selection through the view plane: moved, but not off the ground.
+        let delta = app.scene.get(id).unwrap().transform.translation - before.translation;
+        assert!(delta.length() > 0.05, "the free drag moved the node: {delta:?}");
+        assert!(delta.y.abs() < 1e-4, "view-plane motion keeps the height: {delta:?}");
+        assert!(app.undo.can_undo(), "the free drag is undoable too");
+    }
+
+    #[test]
+    fn the_rotate_tool_uses_rings_instead_of_arms() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        app.tool = ActiveTool::Rotate;
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        // A point on the Z ring is grabbed as the Z axis, not as an arm tip.
+        let ring: Vec<egui::Pos2> = app
+            .gizmo
+            .layout
+            .as_ref()
+            .expect("rings are laid out")
+            .rings
+            .iter()
+            .find(|(a, pts)| *a == gizmo::Axis::Z && pts.len() > 4)
+            .map(|(_, pts)| pts.clone())
+            .expect("the Z ring projects");
+        let on_ring = ring[2];
+        step(&ctx, &mut app, frame(1.0, on_ring, None));
+        assert_eq!(app.gizmo.hovered, Some(gizmo::Axis::Z));
+
+        let before = app.scene.get(_id).unwrap().transform;
+        step(&ctx, &mut app, frame(2.0, on_ring, Some(true)));
+        assert_eq!(app.gizmo.active, Some(gizmo::Axis::Z));
+        // Sweep a quarter of the way round the ring and release.
+        let quarter = ring[ring.len() / 4];
+        step(&ctx, &mut app, frame(3.0, quarter, None));
+        step(&ctx, &mut app, frame(4.0, quarter, Some(false)));
+
+        let after = app.scene.get(_id).unwrap().transform;
+        assert!(
+            before.rotation.angle_between(after.rotation) > 0.05,
+            "the node spun: {:?} -> {:?}",
+            before.rotation,
+            after.rotation
+        );
+        assert!(
+            (after.translation - before.translation).length() < 1e-5,
+            "rotating does not move the node"
+        );
+    }
+
+    #[test]
+    fn scaling_an_arm_scales_the_selection() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        app.tool = ActiveTool::Scale;
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        let tip = arm_tip(&app, gizmo::Axis::Y);
+        let before = app.scene.get(id).unwrap().transform;
+        step(&ctx, &mut app, frame(1.0, tip, Some(true)));
+        assert_eq!(app.gizmo.active, Some(gizmo::Axis::Y));
+        // Push the handle further from the gizmo origin.
+        let out = tip + (tip - app.gizmo.layout.as_ref().unwrap().origin) * 0.5;
+        step(&ctx, &mut app, frame(2.0, out, None));
+        step(&ctx, &mut app, frame(3.0, out, Some(false)));
+
+        let after = app.scene.get(id).unwrap().transform;
+        assert!(
+            after.scale.y > before.scale.y * 1.05,
+            "scaled up: {:?} -> {:?}",
+            before.scale,
+            after.scale
+        );
+        assert!(
+            (after.translation - before.translation).length() < 1e-5,
+            "scaling does not move the node"
+        );
+    }
+
+    #[test]
+    fn the_move_gizmo_paints_one_stroke_per_axis() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+
+        // With no gizmo drawn, the frame is just the grid and the mesh.
+        app.tool = ActiveTool::Select;
+        let (plain, _) = stroked(&paint_once(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None)));
+
+        app.tool = ActiveTool::Move;
+        let (armed, _) = stroked(&paint_once(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None)));
+        assert_eq!(
+            armed,
+            plain + 3,
+            "the Move gizmo adds exactly three axis arms"
+        );
+    }
+
+    #[test]
+    fn the_rotate_gizmo_paints_rings_instead_of_arms() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+
+        app.tool = ActiveTool::Move;
+        let (move_lines, _) = stroked(&paint_once(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None)));
+
+        app.tool = ActiveTool::Rotate;
+        let (rotate_lines, rotate_paths) =
+            stroked(&paint_once(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None)));
+
+        assert!(
+            rotate_paths >= 3,
+            "one closed ring per axis, got {rotate_paths}"
+        );
+        assert_eq!(
+            rotate_lines + 3,
+            move_lines,
+            "the arms are replaced by rings, not drawn as well"
+        );
+    }
+
+    #[test]
+    fn the_handles_stay_a_constant_size_on_screen() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        let span = |app: &OpenForgeApp, axis: gizmo::Axis| {
+            let layout = app.gizmo.layout.as_ref().unwrap();
+            let tip = arm_tip(app, axis);
+            (tip - layout.origin).length()
+        };
+        let near = span(&app, gizmo::Axis::X);
+
+        // Pull the camera back and the handle keeps its pixel length.
+        app.camera.distance *= 4.0;
+        step(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None));
+        let far = span(&app, gizmo::Axis::X);
+        assert!(
+            (near - far).abs() < 0.02 * near.max(1.0),
+            "the arm keeps its screen length: {near} vs {far}"
+        );
+    }
 }

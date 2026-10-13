@@ -90,10 +90,15 @@ A sample GitHub Actions matrix is shown below.
 
 ## Using the app
 
-- **Left-drag** selects (with the Select tool) or manipulates the selection
-  (Move/Scale/Rotate).
+- **Left-drag** selects (with the Select tool), or drags the selection through
+  the view plane (with a transform tool).
+- **Q / W / E / R** switch Select / Move / Scale / Rotate. With a transform tool
+  active a **transform gizmo** sits on the selection: drag an axis arm to move or
+  scale along that axis, or an axis ring to rotate around it. The grabbed handle
+  highlights and is labelled while the drag is live, and the whole gesture is a
+  single undo step. Handles keep a constant size on screen whatever the camera
+  distance.
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
-- **Q / W / E / R** switch Select / Move / Scale / Rotate.
 - **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Delete** removes, **F** frames all.
 - **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY and STL.
 - **Create** menu adds primitives (box, sphere, cylinder, cone, plane).
@@ -115,9 +120,10 @@ mature commercial modeler. Sub-element editing, deformers, boolean CSG,
 skeletal skinning, materials, and a **depth-tested `wgpu` viewport** are in;
 what remains is mostly application surface. Natural next steps:
 
-- An interactive UV editor (the projection/unwrap/pack math already exists).
-- A deeper GPU viewport: selection outlines and wireframe, MSAA, a
-  materials-driven shader instead of one Lambert pass, and depth-buffer picking.
+- Wireframe and selection outlines in the viewport, and gizmo polish: plane and
+  centre handles, snapping, numeric entry, and per-face gizmo placement.
+- A deeper GPU viewport: MSAA, a materials-driven shader instead of one Lambert
+  pass, and depth-buffer picking so picking matches exactly what is drawn.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) mirroring the study architecture.
 

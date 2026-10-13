@@ -41,7 +41,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 11 crates (285 tests total, all green)
+## 4. Repo layout — 11 crates (311 `#[test]` fns; 312 tests run, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -50,12 +50,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 27 | Phong/Lambert materials, colors. |
 | `openforge-render` | 51 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target, scene/grid/gizmo pipelines, frame stats. |
-| `openforge-animation` | 51 | Keyframe tracks, interpolation, clips, player. |
+| `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
-| `openforge-app` | 12 (bin) | eframe/egui GUI. `app.rs` (~1900 lines) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-app` | 39 (bin) | eframe/egui GUI. `app.rs` (~2600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -85,6 +85,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   the canvas math and panel state, `app.rs` owns the wiring). See §8 for its
   gotchas: canvas rect construction, the placeholder UV slot, and one undo entry
   per drag.
+- **The transform gizmo is screen-space geometry** (`gizmo.rs`): the frame is
+  projected through the same `Camera` as the viewport, so handles are a constant
+  pixel length and picking is a 2D distance test. The layout is computed once by
+  the input pass and stored on the gizmo for the paint pass to reuse; the grab
+  is taken on the *press*, not on egui's later `drag_started`. See §8.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -119,9 +124,9 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** baseline commit `2a201c8`. Full workspace builds with **0 warnings**,
-**285 tests pass**, CI green on all 3 platforms. This session took two
-work-streams to done — the **wgpu viewport** (#1) and the **interactive UV
-editor** (#2) — and added a progress report:
+**312 tests pass**, CI green on all 3 platforms. Three work-streams are done —
+the **wgpu viewport** (#1), the **interactive UV editor** (#2) and the
+**transform gizmo** (#3) — plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -160,16 +165,53 @@ editor** (#2) — and added a progress report:
   affine selection maths and subset queries, plus the canvas mapping, picking,
   band selection and selection-retarget rules.
 
-**Verified this session:** `cargo build --workspace` → 0 warnings;
-`cargo test --workspace` → 285 pass; `cargo build --release -p openforge-app`
-(the CI build job) succeeds; `cargo clippy` reports nothing in
-`openforge-render`, `openforge-uv` or `openforge-app`; the app was launched
+- **A working transform gizmo**, and with it the transform tools actually
+  started working. `gizmo.rs` (new, `openforge-app`) holds the whole thing: the
+  world-space frame (arm/ring size derived from the camera so handles subtend a
+  constant ~90 px), the projection to screen, `Layout::hit_axis`/`hit_ring`
+  (2D distance to a segment / to a sampled ring), and the drag maths
+  (`closest_point_on_line`, `ray_plane`, `plane_angle`, `Anchor::measure` →
+  `Translate`/`Scale`/`Rotate` → `apply_measure`). `app.rs` wires it: `W`/`E`/`R`
+  put handles on the selection, the hovered or grabbed axis lights up and is
+  labelled, the drag is axis-constrained (it re-derives every node from its
+  drag-start transform each frame, so it is idempotent), and the gesture lands
+  as **one** undo entry on release.
+- **Two real bugs fell out of that work.** `ToolContext::drag` was rebuilt as
+  `None` every frame, so `TransformTool::on_pointer_move` returned immediately
+  and *Move/Scale/Rotate drags never moved anything*; and the release branch was
+  gated on `dragged_by(Primary)`, which is false on the release frame, so
+  `on_pointer_up` never ran and drags produced no undo entry. The app now owns
+  the drag state (`self.tool_drag`) and gates the release on `drag_stopped()`
+  alone. A press that misses the handles therefore falls through to the
+  free-form view-plane drag, which now works too.
+- **27 new tests**: 18 in `gizmo.rs` (pure math — pixel size, ring geometry,
+  hit-testing, the three drag measures, transform application) and 9 in
+  `app.rs`, which drive `handle_central_viewport` headlessly on a plain
+  `egui::Context` with synthetic pointer events: hit the arm and only that arm,
+  grab → drag → release moving the node along one axis and *not* Y/Z, one undo
+  step restoring the start, the miss falling through to the free-form drag, the
+  rotate rings spinning without translating, the scale ratio, and a shape-count
+  check that the Move gizmo paints exactly three extra strokes while Rotate
+  paints paths instead.
+
+**Verified this session:** `cargo build --release -p openforge-app` (the CI
+build job) → 0 warnings; `cargo test --workspace` → **312 pass, 0 failures**
+(`cargo build --workspace ... | grep -c warning` → 0); the app was launched
 locally and logged `eframe: ... Using wgpu.` with a Metal adapter and **no**
-`egui_wgpu` warnings. The UV panel was exercised by temporarily opening it with
-a mesh selected and tracing its canvas rect: it drew for 82 frames as a 300x300
-square directly above the status bar, with no panic.
-**Not verified:** how the window actually looks, and the UV canvas by eye — the
-agent has no display access, so a human should look at both once.
+`egui_wgpu` warnings, and it survived a 12 s run on the wgpu path without a
+panic. The UV panel was exercised by temporarily opening it with a mesh
+selected and tracing its canvas rect: it drew for 82 frames as a 300x300 square
+directly above the status bar, with no panic. The gizmo is covered end-to-end
+*without* a display: the `app.rs` test module runs the real
+`handle_central_viewport` against a plain `egui::Context` and asserts on the
+gesture (hover, grab, axis-constrained drag, release, undo) and on the shapes
+the frame painted.
+**Not verified:** how the window actually looks, the gizmo and the UV canvas by
+eye — the agent has no display access, so a human should look at all three once.
+`rustfmt` is not installed for this toolchain, so formatting was matched by hand.
+`cargo clippy -- -D warnings` still trips on **pre-existing** lints
+in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
+(`collapsible_if`, …): untouched here, and not part of CI.
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it). The engine
@@ -182,15 +224,19 @@ next steps:
    wireframe, MSAA, a materials-driven shader instead of the single hard-coded
    Lambert pass, and depth-buffer picking so sub-object picking matches exactly
    what is drawn. All additive to `GpuRenderer`.
-2. **Deepen the UV editor.** No texture background yet, no island-level ops
+2. **Extend the gizmo** (`gizmo.rs`, all additive): plane and centre handles,
+   snapping, numeric entry, and putting the gizmo at the selected *faces'*
+   centroid instead of the node's bounds centre (today a face/vertex-level drag
+   still moves the whole node, exactly as the core `TransformTool` always did).
+3. **Deepen the UV editor.** No texture background yet, no island-level ops
    (weld/split/mirror), no snapping, and the 3D face selection is pushed into
    the UV selection on demand rather than staying in sync.
-3. **Plugin/service host.** ZModeler's core idea: 23 services + pluggable tools.
+4. **Plugin/service host.** ZModeler's core idea: 23 services + pluggable tools.
    Design an `openforge-plugin` trait + registry so tools/formats become
    pluggable instead of hard-wired. This is the long road to true parity.
-4. **IO expansion.** Add COLLADA/DAE, OFF, or ASCII FBX (open subsets) to widen
+5. **IO expansion.** Add COLLADA/DAE, OFF, or ASCII FBX (open subsets) to widen
    format coverage beyond the current 4.
-5. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
+6. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
 
 **Honest gap to parity:** game-specific tooling (vehicles, LOD, dummies/TXD),
 the full panel/dialog surface, and exact format breadth remain the largest
@@ -222,6 +268,21 @@ deltas and are many work-streams, not one push.
   band) and the panel state; `app.rs` owns the wiring and pushes committed
   edits through `with_edit`. A live drag mutates directly and pushes **one**
   undo entry on release, the same rule the 3D transforms follow.
+- **The gizmo is hit-tested in *screen* space and grabbed on the *press*.**
+  Two consequences, both easy to get wrong: (a) take the grab on the frame the
+  button goes down — by the time egui reports `drag_started` the cursor has
+  already left the handle, so hit-testing there always misses; and read the
+  cursor from `ui.input(|i| i.pointer...)`, not `Response::hover_pos()`, which
+  goes `None` on exactly the frame a press starts. (b) The layout the input pass
+  computed is stored on the gizmo (`Gizmo::layout`) and reused by `paint_gizmo`;
+  recomputing it in the paint pass would let what is drawn drift from what can
+  be grabbed.
+- **A drag spans frames, so its state must live on the app.** `ToolContext::drag`
+  is constructed fresh each frame; `app.rs` keeps it in `self.tool_drag` and
+  hands it to the tool and back. Leave either half out and Move/Scale/Rotate
+  silently do nothing (or nothing is undoable). Likewise reach `on_pointer_up`
+  on `drag_stopped()` alone — gating it on `dragged_by(Primary)` never fires on
+  the release frame.
 - **Panel order in `update()` matters.** The status bar is added first so it
   owns the bottom edge, then the UV editor, then the side panels, and the
   central viewport last. That is what keeps the viewport's rect — and its mouse
