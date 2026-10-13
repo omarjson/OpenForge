@@ -14,13 +14,14 @@ A clean-room, open-source 3D modeling application written in Rust, targeting
 
 ## Architecture
 
-The project is a Cargo workspace of eleven crates; these are the main layers:
+The project is a Cargo workspace of twelve crates; these are the main layers:
 
 | Crate | Role | Notes |
 |-------|------|-------|
 | `openforge-core` | Scene graph, geometry, editing model | GUI- and renderer-agnostic. Nodes, meshes, selection, undo/redo, interactive tools, ray picking. |
 | `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL. Clean-room readers and writers. |
 | `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target, and the scene, grid and axis-gizmo passes. |
+| `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, outliner, properties, toolbar, hotkeys. |
 
 ### Core concepts
@@ -34,6 +35,10 @@ The project is a Cargo workspace of eleven crates; these are the main layers:
 - **`Tool`** — an interactive-tool trait. Ships with `SelectTool` and a
   `TransformTool` (move / scale / rotate) driven by viewport pointer rays.
 - **`Camera`** — a perspective orbit camera with pan/zoom and NDC→ray picking.
+- **`PluginHost`** — the seam plugins register into: a service registry, a tool
+  registry (tools are *factories*, since a tool carries drag state) and a format
+  filter registry that dispatches import/export on a file extension. Names are
+  unique and a rejected plugin leaves the host exactly as it was.
 
 ## Building
 
@@ -115,7 +120,11 @@ A sample GitHub Actions matrix is shown below.
   shininess and opacity, **Assign** it to the selection, or **New** to duplicate
   it. Assigned meshes are shaded with that material in both viewports. The
   outliner's checkbox hides a node from the viewport.
-- **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY and STL.
+- **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY and STL. Both go
+  through the plugin host's filter registry, so a third-party filter for another
+  extension needs no change to the app.
+- The **Plugins** section of the Properties panel lists the loaded plugins and
+  the services, tools and formats they contributed.
 - **Create** menu adds primitives (box, sphere, cylinder, cone, plane).
 
 ## Testing
@@ -140,7 +149,8 @@ what remains is mostly application surface. Natural next steps:
 - A deeper GPU viewport: MSAA, a materials-driven shader instead of one Lambert
   pass, and depth-buffer picking so picking matches exactly what is drawn.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.
-- Dynamic plugin loading (`cdylib` filters) mirroring the study architecture.
+- Dynamic plugin loading (`cdylib` filters) behind the host seam, which already
+  mirrors the study architecture's service/tool/filter split.
 
 ## License
 

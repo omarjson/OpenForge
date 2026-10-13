@@ -13,12 +13,13 @@ use openforge_core::node::NodeKind;
 use openforge_core::scene::Scene;
 use openforge_core::selection::{SelectLevel, Selection};
 use openforge_core::tool::{
-    DragState, Pointer, SelectTool, Tool, ToolContext, TransformMode, TransformTool,
+    DragState, Pointer, SelectTool, Tool, ToolContext, TransformMode,
 };
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
 use openforge_materials::{Material, MaterialLibrary};
+use openforge_plugin::PluginHost;
 use openforge_render::{FrameStats, NodeColors};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
@@ -93,6 +94,8 @@ pub struct OpenForgeApp {
     wireframe: viewport::Wireframe,
     /// The project's materials and textures.
     materials: MaterialLibrary,
+    /// Loaded plugins: services, tools and format filters.
+    plugins: PluginHost,
     /// The library entry the materials panel is editing.
     current_material: usize,
     /// Scene captured when a text field took focus, so committing the edit
@@ -151,19 +154,28 @@ impl OpenForgeApp {
             gizmo: gizmo::Gizmo::default(),
             wireframe: viewport::Wireframe::default(),
             materials: default_materials(),
+            plugins: openforge_plugin::builtin_host(),
             current_material: 0,
             rename_before: None,
             tool_drag: None,
         }
     }
 
+    /// The tool for the current mode, built by the plugin host.
+    ///
+    /// The built-in tools are plugins like any other, so this is the seam a
+    /// replacement `Move` would come through. The fallback only fires if the
+    /// host somehow lacks a built-in.
     fn active_tool(&mut self) -> Box<dyn Tool> {
-        match self.tool {
-            ActiveTool::Select => Box::new(SelectTool { additive: false }),
-            ActiveTool::Move => Box::new(TransformTool::new(TransformMode::Move)),
-            ActiveTool::Scale => Box::new(TransformTool::new(TransformMode::Scale)),
-            ActiveTool::Rotate => Box::new(TransformTool::new(TransformMode::Rotate)),
-        }
+        let name = match self.tool {
+            ActiveTool::Select => "Select",
+            ActiveTool::Move => "Move",
+            ActiveTool::Scale => "Scale",
+            ActiveTool::Rotate => "Rotate",
+        };
+        self.plugins
+            .make_tool(name)
+            .unwrap_or_else(|| Box::new(SelectTool { additive: false }))
     }
 
     /// Run a closure that may edit the scene, capturing undo state around it.
@@ -679,7 +691,9 @@ impl OpenForgeApp {
     }
 
     fn import_file(&mut self, path: PathBuf) {
-        match openforge_io::import_path(&path) {
+        // Through the plugin host's filter registry: a plugin that registers a
+        // new extension is picked up here with no change to the app.
+        match self.plugins.import(&path) {
             Ok(loaded) => {
                 let count = loaded.mesh_count();
                 self.with_edit("Import", |app| {
@@ -704,7 +718,7 @@ impl OpenForgeApp {
         };
         let name = self.scene.get(id).map(|n| n.name.clone()).unwrap_or_else(|_| "mesh".into());
         let data = openforge_io::MeshData { name, mesh, material: None };
-        match openforge_io::export_path(&path, &data) {
+        match self.plugins.export(&path, &data) {
             Ok(()) => self.status = format!("Exported to {}.", path.display()),
             Err(e) => self.status = format!("Export failed: {}", e),
         }
@@ -1612,6 +1626,8 @@ impl OpenForgeApp {
                         self.properties_panel(ui);
                         ui.separator();
                         self.materials_panel(ui);
+                        ui.separator();
+                        self.plugins_panel(ui);
                     });
                 });
         }
@@ -1662,6 +1678,54 @@ impl OpenForgeApp {
                 });
             }
         });
+    }
+
+    /// The lines the Plugins panel shows: the loaded plugins and the services,
+    /// tools and formats they contributed.
+    ///
+    /// Split out of the panel so the content can be asserted without a display;
+    /// an empty line means "separator" to [`Self::plugins_panel`].
+    fn plugin_report(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        for plugin in self.plugins.plugins() {
+            lines.push(format!("{} {}", plugin.name, plugin.version));
+            if !plugin.description.is_empty() {
+                lines.push(format!("    {}", plugin.description));
+            }
+        }
+        lines.push(String::new());
+        lines.push(format!("Services ({})", self.plugins.services.len()));
+        for (name, description) in self.plugins.services.entries() {
+            lines.push(format!("    {name} — {description}"));
+        }
+        lines.push(String::new());
+        lines.push(format!("Tools ({})", self.plugins.tool_count()));
+        for (name, description) in self.plugins.tool_entries() {
+            lines.push(format!("    {name} — {description}"));
+        }
+        lines.push(String::new());
+        lines.push(format!("Formats ({})", self.plugins.filters.len()));
+        for (id, label, extensions) in self.plugins.filters.entries() {
+            lines.push(format!("    {id} — {label} ({})", extensions.join(", ")));
+        }
+        lines
+    }
+
+    /// What the plugin host has loaded, as reported by [`Self::plugin_report`].
+    fn plugins_panel(&mut self, ui: &mut egui::Ui) {
+        egui::CollapsingHeader::new("Plugins")
+            .default_open(false)
+            .show(ui, |ui| {
+                for line in self.plugin_report() {
+                    if line.is_empty() {
+                        ui.separator();
+                    } else if let Some(detail) = line.strip_prefix("    ") {
+                        ui.label(egui::RichText::new(detail).weak().small());
+                    } else {
+                        ui.label(line);
+                    }
+                }
+            });
     }
 
     /// The material library: pick an entry, assign it to the selection and edit
@@ -2638,6 +2702,8 @@ fn rfd_save_file() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use openforge_io::{IoResult, LoadedScene, MeshData};
+    use openforge_plugin::{FormatFilter, Plugin, PluginError};
 
     const SCREEN: [f32; 2] = [1000.0, 700.0];
 
@@ -3322,5 +3388,194 @@ mod tests {
             (near - far).abs() < 0.02 * near.max(1.0),
             "the arm keeps its screen length: {near} vs {far}"
         );
+    }
+
+    // --- the plugin host --------------------------------------------------------
+
+    /// A unique temp path, so parallel tests do not collide.
+    fn temp_path(extension: &str) -> PathBuf {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("openforge-app-{}-{n}.{extension}", std::process::id()))
+    }
+
+    /// A format the engine does not ship: a fixed triangle in, a marker out.
+    struct DotFilter;
+
+    impl FormatFilter for DotFilter {
+        fn id(&self) -> &str {
+            "dot"
+        }
+
+        fn label(&self) -> &str {
+            "Triangle dot file"
+        }
+
+        fn extensions(&self) -> &[&str] {
+            &["dot"]
+        }
+
+        fn import(&self, _path: &std::path::Path) -> IoResult<LoadedScene> {
+            let mut mesh = Mesh::new();
+            mesh.add_vertex(Vec3::ZERO);
+            mesh.add_vertex(Vec3::X);
+            mesh.add_vertex(Vec3::Y);
+            mesh.add_face(&[0, 1, 2]);
+            mesh.compute_flat_normals();
+            Ok(LoadedScene {
+                meshes: vec![MeshData { name: "Dot".into(), mesh, material: None }],
+                materials: Vec::new(),
+            })
+        }
+
+        fn export(&self, path: &std::path::Path, _data: &MeshData) -> IoResult<()> {
+            std::fs::write(path, b"dot")?;
+            Ok(())
+        }
+    }
+
+    /// The plugin that registers [`DotFilter`].
+    struct DotPlugin;
+
+    impl Plugin for DotPlugin {
+        fn name(&self) -> &str {
+            "test.dot-format"
+        }
+
+        fn description(&self) -> &str {
+            "imports .dot files"
+        }
+
+        fn register(&self, host: &mut PluginHost) -> Result<(), PluginError> {
+            host.filters.insert(Box::new(DotFilter))
+        }
+    }
+
+    #[test]
+    fn the_plugins_panel_reports_what_the_host_loaded() {
+        let app = OpenForgeApp::with_gpu(None);
+        let report = app.plugin_report().join("\n");
+        assert!(report.contains("openforge.core-tools"), "{report}");
+        assert!(report.contains("openforge.interchange"), "{report}");
+        assert!(report.contains("Services (3)"), "{report}");
+        assert!(report.contains("Tools (4)"), "{report}");
+        assert!(report.contains("Formats (4)"), "{report}");
+        for tool in ["Select", "Move", "Scale", "Rotate"] {
+            assert!(report.contains(tool), "`{tool}` is missing from:\n{report}");
+        }
+        for format in ["obj", "glb", "ply", "stl"] {
+            assert!(report.contains(format), "`{format}` is missing from:\n{report}");
+        }
+    }
+
+    #[test]
+    fn the_side_panels_draw_without_a_display() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        let output = ctx.run(frame(0.0, egui::pos2(500.0, 350.0), None), |ctx| {
+            app.handle_side_panels(ctx);
+        });
+        assert!(!output.shapes.is_empty(), "the panels painted something");
+    }
+
+    #[test]
+    fn import_and_export_run_through_the_plugin_host() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let id = app.scene.iter().find(|n| n.is_mesh()).map(|n| n.id).expect("a seed mesh");
+        app.selection.select_node(id);
+
+        let path = temp_path("obj");
+        app.export_selected(path.clone());
+        assert!(app.status.contains("Exported"), "status: {}", app.status);
+        assert!(path.exists(), "the host filter wrote the file");
+
+        let before = app.scene.node_count();
+        app.import_file(path.clone());
+        assert!(app.status.contains("Imported"), "status: {}", app.status);
+        assert_eq!(app.scene.node_count(), before + 1, "the file came back as a node");
+        assert!(app.undo.can_undo(), "an import is undoable");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn exporting_with_nothing_selected_writes_nothing() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let path = temp_path("obj");
+        app.export_selected(path.clone());
+        assert!(app.status.contains("Select a mesh node"), "status: {}", app.status);
+        assert!(!path.exists(), "an empty selection writes no file");
+    }
+
+    #[test]
+    fn a_plugin_filter_extends_import_without_touching_the_app() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let before = app.scene.node_count();
+        let path = temp_path("dot");
+
+        // The engine ships no `.dot` filter, so this has to fail first.
+        app.import_file(path.clone());
+        assert!(app.status.contains("Import failed"), "status: {}", app.status);
+        assert_eq!(app.scene.node_count(), before);
+
+        // Registering one plugin is the whole change to the application.
+        app.plugins.register(&DotPlugin).expect("the dot filter loads");
+        app.import_file(path);
+        assert!(app.status.contains("Imported"), "status: {}", app.status);
+        assert_eq!(app.scene.node_count(), before + 1);
+        assert!(app.plugins.filters.for_extension("dot").is_some());
+    }
+
+    #[test]
+    fn a_plugin_cannot_steal_a_builtin_extension() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        // An id nobody uses, claiming an extension `obj` already serves.
+        struct Hijacker;
+        impl FormatFilter for Hijacker {
+            fn id(&self) -> &str {
+                "obj2"
+            }
+            fn label(&self) -> &str {
+                "Also OBJ"
+            }
+            fn extensions(&self) -> &[&str] {
+                &["obj"]
+            }
+            fn import(&self, _path: &std::path::Path) -> IoResult<LoadedScene> {
+                Err(openforge_io::IoError::Unsupported("no"))
+            }
+            fn export(&self, _path: &std::path::Path, _data: &MeshData) -> IoResult<()> {
+                Err(openforge_io::IoError::Unsupported("no"))
+            }
+        }
+        struct HijackPlugin;
+        impl Plugin for HijackPlugin {
+            fn name(&self) -> &str {
+                "test.hijack"
+            }
+            fn register(&self, host: &mut PluginHost) -> Result<(), PluginError> {
+                host.filters.insert(Box::new(Hijacker))
+            }
+        }
+
+        let err = app.plugins.register(&HijackPlugin).unwrap_err();
+        assert!(matches!(err, PluginError::Duplicate { kind: "extension", .. }), "{err:?}");
+        assert_eq!(app.plugins.filters.len(), 4, "the rejected plugin left nothing behind");
+        assert_eq!(app.plugins.filters.for_extension("obj").unwrap().id(), "obj");
+        assert_eq!(app.plugins.plugins().len(), 2, "not reported as loaded");
+    }
+
+    #[test]
+    fn the_active_tool_comes_from_the_plugin_host() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        for (mode, name) in [
+            (ActiveTool::Select, "Select"),
+            (ActiveTool::Move, "Move"),
+            (ActiveTool::Scale, "Scale"),
+            (ActiveTool::Rotate, "Rotate"),
+        ] {
+            app.tool = mode;
+            assert_eq!(app.active_tool().name(), name, "the host built {name}");
+        }
     }
 }

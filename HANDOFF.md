@@ -14,8 +14,9 @@ which was analyzed with the REA tool (`npx rea-agents@latest setup`) to learn it
 filters, native `.z3d` format) — **not** to copy any code.
 
 It is a growing feature-by-feature reimplementation. The engine layer is largely
-complete; the remaining work is mostly application surface (GUI, GPU viewport,
-interactive editors) and the plugin host.
+complete and the plugin host now exists as a first cut; the remaining work is
+mostly application surface (GUI, GPU viewport, interactive editors) and
+deepening the host (dynamic plugin loading, behaviour-carrying services).
 
 ## 2. HARD CONSTRAINTS — do not violate
 
@@ -41,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 11 crates (355 `#[test]` fns; 356 tests run, all green)
+## 4. Repo layout — 12 crates (380 `#[test]` fns; 382 tests run, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -55,10 +56,16 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
-| `openforge-app` | 74 (bin) | eframe/egui GUI. `app.rs` (~2600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
+| `openforge-app` | 81 (bin) | eframe/egui GUI. `app.rs` (~3600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
+- **A plugin registration either applies completely or not at all.** A plugin
+  fills a *staged* `PluginHost` of its own and only a clean registration is
+  merged in, so a plugin that clashes on its second entry cannot leave its
+  first behind. Names (service, tool, filter id, extension) are unique and a
+  clash is an error naming the offender — never a silent replacement.
 - **Extension traits, one impl per type-pair.** Rust allows only ONE
   `impl Trait for Type` per pair. Ops like `MeshOps` (openforge-ops) and `UvOps`
   (openforge-uv) are implemented for core's `Mesh` from *separate* crates. Their
@@ -124,10 +131,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** baseline commit `2a201c8`. Full workspace builds with **0 warnings**,
-**356 tests pass**, CI green on all 3 platforms. Six work-streams are done —
+**382 tests pass**, CI green on all 3 platforms. Seven work-streams are done —
 the **wgpu viewport** (#1), the **interactive UV editor** (#2), the
 **transform gizmo** (#3), the **edge overlay** (#4), the **sub-object
-transforms** (#5) and **materials** (#6) — plus a progress report:
+transforms** (#5), **materials** (#6) and the **plugin host** (#7) — plus a
+progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -232,6 +240,34 @@ transforms** (#5) and **materials** (#6) — plus a progress report:
   faces, the empty cases, corner dedup) and 1 end-to-end in `app.rs` — a
   vertex-level drag that asserts every other vertex is untouched.
 
+- **A plugin host, and the app goes through it.** New crate `openforge-plugin`
+  is the seam ZModeler's architecture is built around: a `ServiceRegistry`
+  (named capabilities), a tool registry of **factories** (`fn() -> Box<dyn Tool>`,
+  because a `Tool` carries an in-progress drag and sharing it would leak that
+  state) and a `FilterRegistry` that dispatches import/export on a file's
+  extension. The engine's own four tools and four formats are ordinary plugins
+  (`CoreToolsPlugin`, `InterchangePlugin`) registered by `builtin_host()`, so
+  the app never names a tool or a format again: `active_tool()` asks
+  `host.make_tool(name)` and `import_file`/`export_selected` call
+  `host.import`/`host.export`. Three rules keep it honest — names are unique
+  (a duplicate service, tool, filter id *or* extension is an error naming the
+  clash), registration is atomic (a plugin registers into a staged host and is
+  merged only if it succeeds, so a rejected plugin leaves nothing behind), and
+  the app's Properties panel gained a **Plugins** section listing the loaded
+  plugins and the services, tools and formats they contributed.
+- **18 tests** in `openforge-plugin`: extension dispatch and its
+  case/dot handling, the unique-name rules for all four kinds, the atomic
+  rollback of a plugin that clashes on its *second* registration,
+  import-only filters (with the `can_import` gate), the factory handing back a
+  fresh tool per request, and an empty host staying usable.
+- **7 more in `app.rs`**, which drive the seam end to end with no display:
+  import and export round-tripping a real file through the host and leaving an
+  undo entry, an empty selection writing no file, a `.dot` filter that fails to
+  import until one plugin is registered and works afterwards, a plugin trying to
+  steal `obj` being rejected with the host unchanged, the active tool coming
+  from `make_tool`, and the Plugins panel's report listing exactly the two
+  built-ins, three services, four tools and four formats.
+
 - **Materials are wired through to the pixels.** `openforge-materials` already
   had `Material`, `MaterialLibrary` and textures; nothing used them, and
   `Face::material` / `NodeKind::Mesh::material_slots` were dead weight. Core now
@@ -261,20 +297,22 @@ transforms** (#5) and **materials** (#6) — plus a progress report:
   renderer, refusing to delete an in-use or non-final material, and duplicating
   without aliasing the original mesh.
 
-**Verified this session:** `cargo build --release -p openforge-app` (the CI
-build job) → 0 warnings; `cargo test --workspace` → **356 pass, 0 failures**
-(`cargo build --workspace ... | grep -c warning` → 0); the app was launched
-locally and logged `eframe: ... Using wgpu.` with a Metal adapter and **no**
-`egui_wgpu` warnings, and it survived a 12 s run on the wgpu path without a
-panic. The UV panel was exercised by temporarily opening it with a mesh
-selected and tracing its canvas rect: it drew for 82 frames as a 300x300 square
-directly above the status bar, with no panic. The gizmo is covered end-to-end
+**Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
+build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
+build too); `cargo test --workspace` → **382 pass, 0 failures**
+(`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
+behind the UV canvas, the side panels and now the plugin seam are all covered
 *without* a display: the `app.rs` test module runs the real
-`handle_central_viewport` against a plain `egui::Context` and asserts on the
-gesture (hover, grab, axis-constrained drag, release, undo) and on the shapes
-the frame painted.
-**Not verified:** how the window actually looks, the gizmo and the UV canvas by
-eye — the agent has no display access, so a human should look at all three once.
+`handle_central_viewport` / `handle_side_panels` against a plain
+`egui::Context` with synthetic pointer events and asserts on both the gesture
+(hover, grab, axis-constrained drag, release, undo) and the shapes the frame
+painted, and on what the host did (import/export through a filter, a plugin's
+filter taking effect, a rejected plugin changing nothing).
+**Not verified:** how the window actually looks, and the gizmo, the UV canvas
+and the new Plugins panel by eye — the agent has no display access, so a human
+should look at all four once. (An earlier session did launch the app on the wgpu
+path and saw `eframe: ... Using wgpu.` with a Metal adapter, no `egui_wgpu`
+warnings and no panic over a 12 s run.)
 `rustfmt` is not installed for this toolchain, so formatting was matched by hand.
 `cargo clippy -- -D warnings` still trips on **pre-existing** lints
 in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
@@ -298,9 +336,12 @@ next steps:
 3. **Deepen the UV editor.** No texture background yet, no island-level ops
    (weld/split/mirror), no snapping, and the 3D face selection is pushed into
    the UV selection on demand rather than staying in sync.
-4. **Plugin/service host.** ZModeler's core idea: 23 services + pluggable tools.
-   Design an `openforge-plugin` trait + registry so tools/formats become
-   pluggable instead of hard-wired. This is the long road to true parity.
+4. **Deepen the plugin host.** The host is in and the app goes through it, but
+   three pieces are still hard-wired: tools are chosen through the app's
+   `ActiveTool` enum rather than by walking `host.tool_entries()`, a `Service`
+   carries a name and a description rather than behaviour, and plugins are
+   compiled in rather than *loaded* — a `cdylib`/WASM filter discovered at
+   runtime is the real prize. That is the long road to true parity.
 5. **IO expansion.** Add COLLADA/DAE, OFF, or ASCII FBX (open subsets) to widen
    format coverage beyond the current 4.
 6. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
@@ -391,6 +432,17 @@ deltas and are many work-streams, not one push.
 - **`scene.get()` returns `Result`** (not `Option`) — use `.ok()` / `if let Ok`.
 - **`selection.selected_nodes()`** yields `NodeId` by value; in `.filter(|id|)`
   the binding is `&NodeId`, so deref with `*id` (not `**id`).
+- **A Plugins-panel test asserts on `plugin_report()`, not on painted text.**
+  The `CollapsingHeader` is closed by default and a closed body is never laid
+  out, so its labels are not in the frame's shapes at all; the panel is a thin
+  loop over the report so the content can be checked without a display.
+- **Tools come from the plugin host, not `openforge-core` directly.**
+  `OpenForgeApp::active_tool()` calls `host.make_tool("Move")` and only falls
+  back to a bare `SelectTool` if the host somehow lacks a built-in, so
+  importing `TransformTool` into `app.rs` is now an unused import (a warning,
+  and the zero-warning bar). Same for formats: `import_file`/`export_selected`
+  go through `host.import`/`host.export`, and `openforge_io` is reached for its
+  data types (`MeshData`) only.
 
 ---
 

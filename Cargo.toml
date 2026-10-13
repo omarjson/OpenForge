@@ -11,6 +11,7 @@ members = [
     "crates/openforge-uv",
     "crates/openforge-boolean",
     "crates/openforge-rig",
+    "crates/openforge-plugin",
     "crates/openforge-app",
 ]
 
