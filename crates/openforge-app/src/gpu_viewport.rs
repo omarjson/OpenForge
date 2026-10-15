@@ -137,6 +137,36 @@ impl GpuViewport {
             PICK_RADIUS,
         )
     }
+
+    /// Ask the GPU which elements sit inside a dragged rectangle.
+    ///
+    /// `a` and `b` are the drag's corners in egui points; the rectangle is
+    /// resolved at the renderer's own resolution, so a marquee agrees with the
+    /// frame exactly the way a click does. `None` when the drag covers no
+    /// pixel of the target — there is then nothing to ask about — and the
+    /// level decides which elements the answer holds (see
+    /// [`GpuRenderer::pick_rect`]).
+    pub fn pick_rect(
+        &mut self,
+        state: &RenderState,
+        rect: egui::Rect,
+        a: egui::Pos2,
+        b: egui::Pos2,
+        scale: f32,
+        scene: &mut Scene,
+        camera: &OrbitCamera,
+        level: SelectLevel,
+    ) -> Option<Vec<PickElement>> {
+        let pixels = marquee_pixel_rect(a, b, rect, scale, self.renderer.size())?;
+        Some(self.renderer.pick_rect(
+            &state.device,
+            &state.queue,
+            scene,
+            camera,
+            pixels,
+            level,
+        ))
+    }
 }
 
 /// Convert world-space overlay edges into GPU line vertices for
@@ -189,6 +219,34 @@ pub fn pick_pixel(pos: egui::Pos2, rect: egui::Rect, scale: f32, size: [u32; 2])
     let x = ((pos.x - rect.min.x) * scale).floor().max(0.0) as u32;
     let y = ((pos.y - rect.min.y) * scale).floor().max(0.0) as u32;
     [x.min(size[0].saturating_sub(1)), y.min(size[1].saturating_sub(1))]
+}
+
+/// The offscreen pixel rectangle a dragged marquee covers, clipped into the
+/// target.
+///
+/// The two corners come in as pointer positions and go out as a half-open
+/// `[x0, y0, x1, y1]` in offscreen pixels, normalized so the drag's direction
+/// does not matter. Every pixel the drag touched is inside: the range starts
+/// at the floor of the nearer corner and ends at the ceiling of the further
+/// one, which leaves a drag that covers nothing at all — a click, or a
+/// degenerate target — as `None`, and the caller then treats the gesture as
+/// the click it was.
+pub fn marquee_pixel_rect(
+    a: egui::Pos2,
+    b: egui::Pos2,
+    rect: egui::Rect,
+    scale: f32,
+    size: [u32; 2],
+) -> Option<[u32; 4]> {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let (w, h) = (size[0] as f32, size[1] as f32);
+    let px = |p: egui::Pos2| [(p.x - rect.min.x) * scale, (p.y - rect.min.y) * scale];
+    let (a, b) = (px(a), px(b));
+    let x0 = a[0].min(b[0]).floor().clamp(0.0, w) as u32;
+    let x1 = a[0].max(b[0]).ceil().clamp(0.0, w) as u32;
+    let y0 = a[1].min(b[1]).floor().clamp(0.0, h) as u32;
+    let y1 = a[1].max(b[1]).ceil().clamp(0.0, h) as u32;
+    (x1 > x0 && y1 > y0).then_some([x0, y0, x1, y1])
 }
 
 /// The element a click at `level` should take from a pick's hits.
@@ -329,6 +387,62 @@ mod tests {
         }
         // A degenerate target still answers with something addressable.
         assert_eq!(pick_pixel(egui::pos2(100.0, 50.0), rect, 1.0, [0, 0]), [0, 0]);
+    }
+
+    #[test]
+    fn marquee_pixel_rect_normalizes_the_drag_into_pixels() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(320.0, 240.0));
+        // Every pixel the drag touched: floor at the near corner, ceiling at
+        // the far one.
+        let a = egui::pos2(110.4, 70.6);
+        let b = egui::pos2(140.2, 90.1);
+        assert_eq!(marquee_pixel_rect(a, b, rect, 1.0, [320, 240]), Some([10, 20, 41, 41]));
+        // The drag's direction does not matter.
+        assert_eq!(marquee_pixel_rect(b, a, rect, 1.0, [320, 240]), Some([10, 20, 41, 41]));
+        // A 2x display doubles the offsets, like a click's.
+        assert_eq!(marquee_pixel_rect(a, b, rect, 2.0, [640, 480]), Some([20, 41, 81, 81]));
+        // A sub-pixel drag still resolves to the one pixel it touched.
+        let p = egui::pos2(110.1, 70.1);
+        let q = egui::pos2(110.4, 70.4);
+        assert_eq!(marquee_pixel_rect(p, q, rect, 1.0, [320, 240]), Some([10, 20, 11, 21]));
+    }
+
+    #[test]
+    fn marquee_pixel_rect_clamps_into_the_target() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(320.0, 240.0));
+        // Dragged clean out of the viewport: clipped to the whole target.
+        let outside = marquee_pixel_rect(
+            egui::pos2(0.0, 0.0),
+            egui::pos2(900.0, 900.0),
+            rect,
+            1.0,
+            [320, 240],
+        );
+        assert_eq!(outside, Some([0, 0, 320, 240]));
+        // A scale of zero, negative or NaN falls back to 1, like a click's.
+        for scale in [0.0, -3.0, f32::NAN, f32::INFINITY] {
+            let r = marquee_pixel_rect(
+                egui::pos2(110.0, 70.0),
+                egui::pos2(120.0, 80.0),
+                rect,
+                scale,
+                [320, 240],
+            );
+            assert_eq!(r, Some([10, 20, 20, 30]), "scale {scale}");
+        }
+    }
+
+    #[test]
+    fn marquee_pixel_rect_is_none_when_it_covers_no_pixel() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(320.0, 240.0));
+        // A click, not a drag: nothing moved, so no pixel is covered.
+        let p = egui::pos2(110.0, 70.0);
+        assert_eq!(marquee_pixel_rect(p, p, rect, 1.0, [320, 240]), None);
+        // A degenerate target has no pixel to cover.
+        assert_eq!(marquee_pixel_rect(p, egui::pos2(200.0, 100.0), rect, 1.0, [0, 0]), None);
+        // A NaN corner never turns into a rectangle.
+        let nan = egui::pos2(f32::NAN, f32::NAN);
+        assert_eq!(marquee_pixel_rect(nan, nan, rect, 1.0, [320, 240]), None);
     }
 
     #[test]

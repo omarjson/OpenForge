@@ -15,6 +15,7 @@ use openforge_core::mesh::Mesh;
 use openforge_core::scene::Scene;
 use openforge_core::selection::{SelectLevel, Selection};
 use openforge_core::NodeId;
+use openforge_render::PickElement;
 use std::collections::BTreeSet;
 
 /// A perspective orbit camera.
@@ -570,6 +571,87 @@ pub fn pick_vertex(
     }
     let _ = cam_pos;
     best
+}
+
+/// Every element of the given level whose projection falls inside a viewport
+/// rectangle.
+///
+/// The rectangle is in the viewport's own screen space: `(0, 0)` is the
+/// viewport's top-left corner and its units match `size`. This is the CPU
+/// fallback for rectangle selection — it projects and tests, so unlike the GPU
+/// ID pass it cannot tell occluded geometry from visible geometry and will
+/// happily select through. Nodes that are hidden or frozen are skipped, like
+/// every other CPU picker here.
+///
+/// Rules per level:
+/// - `Object`: every mesh position inside the rectangle, so the caller can
+///   deduplicate them into node ids.
+/// - `Vertex`: every mesh position index inside the rectangle.
+/// - `Face`: every face with at least one corner position inside the
+///   rectangle.
+/// - `Edge`: nothing — there is no edge index in the mesh.
+///
+/// A point exactly on the rectangle's edge counts as inside. The result is
+/// deterministic: nodes in scene order, indices ascending, each element once.
+pub fn marquee_elements(
+    scene: &mut Scene,
+    vp: Mat4,
+    size: [f32; 2],
+    rect: egui::Rect,
+    level: SelectLevel,
+) -> Vec<PickElement> {
+    let mut out = Vec::new();
+    if level == SelectLevel::Edge {
+        return out;
+    }
+
+    let candidates: Vec<(NodeId, Mesh)> = scene
+        .iter()
+        .filter(|n| n.is_mesh() && n.visible && !n.frozen)
+        .filter_map(|n| n.mesh().map(|m| (n.id, m.clone())))
+        .collect();
+
+    for (id, mesh) in candidates {
+        let Ok(world) = scene.world_matrix(id) else { continue };
+        // Project every position once; all four rules below answer from this
+        // scratch rather than re-projecting a position per face corner.
+        let screen: Vec<Option<(f32, f32)>> = mesh
+            .positions
+            .iter()
+            .map(|p| project(vp, world.transform_point3(*p), size).map(|(x, y, _)| (x, y)))
+            .collect();
+        let inside = |vi: u32| -> bool {
+            match screen.get(vi as usize).copied().flatten() {
+                Some((x, y)) => {
+                    // Inclusive on both edges: a point exactly on the
+                    // rectangle belongs to the selection.
+                    x >= rect.min.x && x <= rect.max.x && y >= rect.min.y && y <= rect.max.y
+                }
+                None => false,
+            }
+        };
+        match level {
+            // Object level emits the positions, not one entry per node: the
+            // caller folds them into node ids itself.
+            SelectLevel::Object | SelectLevel::Vertex => {
+                for vi in 0..mesh.positions.len() as u32 {
+                    if inside(vi) {
+                        out.push(PickElement::Vertex { node: id, vertex: vi });
+                    }
+                }
+            }
+            SelectLevel::Face => {
+                for (fi, face) in mesh.faces.iter().enumerate() {
+                    // One entry per face even when several corners are inside.
+                    if face.corners.iter().any(|c| inside(c.position)) {
+                        out.push(PickElement::Face { node: id, face: fi as u32 });
+                    }
+                }
+            }
+            SelectLevel::Edge => {}
+        }
+    }
+    out
 }
 
 /// A vertex a drag can snap to: where it is in the world, where it lands on
@@ -1174,6 +1256,255 @@ mod tests {
         assert_eq!(tris[0].v[2].uv, Vec2::new(1.0, 1.0));
         assert_eq!(tris[1].v[0].uv, Vec2::new(0.0, 0.0));
         assert_eq!(tris[1].v[2].uv, Vec2::new(0.0, 1.0));
+    }
+
+    // --- marquee selection ----------------------------------------------------
+
+    /// The down-`+Z` view of [`looking_down_z`], pulled back far enough that
+    /// two quads side by side both fit inside the [400, 400] viewport.
+    fn looking_down_z_from_afar() -> Mat4 {
+        Mat4::perspective_rh(45.0_f32.to_radians(), 1.0, 0.1, 100.0)
+            * Mat4::look_at_rh(Vec3::new(0.0, 0.0, 10.0), Vec3::ZERO, Vec3::Y)
+    }
+
+    /// A node's positions in world space, so a test can derive its screen box
+    /// from the very points it expects inside.
+    fn world_positions(scene: &mut Scene, id: NodeId) -> Vec<Vec3> {
+        let Ok(world) = scene.world_matrix(id) else { return Vec::new() };
+        let Ok(node) = scene.get(id) else { return Vec::new() };
+        node.mesh()
+            .map(|m| m.positions.iter().map(|p| world.transform_point3(*p)).collect())
+            .unwrap_or_default()
+    }
+
+    /// The screen-space bounding box of `points`' projections, edges included.
+    fn screen_box(vp: Mat4, size: [f32; 2], points: &[Vec3]) -> egui::Rect {
+        let mut min = egui::pos2(f32::INFINITY, f32::INFINITY);
+        let mut max = egui::pos2(f32::NEG_INFINITY, f32::NEG_INFINITY);
+        for p in points {
+            let (x, y, _) = project(vp, *p, size).expect("the points under test are in front");
+            min.x = min.x.min(x);
+            min.y = min.y.min(y);
+            max.x = max.x.max(x);
+            max.y = max.y.max(y);
+        }
+        egui::Rect::from_min_max(min, max)
+    }
+
+    /// Two quads side by side in the XY plane, each with its own four
+    /// positions: the left one centred on x = -1.5, the right on x = 1.5.
+    fn two_quads() -> (Scene, NodeId, NodeId) {
+        let mut scene = Scene::new();
+        let left = scene.create_mesh("left", quad(0.0));
+        scene.get_mut(left).unwrap().set_translation(Vec3::new(-1.5, 0.0, 0.0));
+        let right = scene.create_mesh("right", quad(0.0));
+        scene.get_mut(right).unwrap().set_translation(Vec3::new(1.5, 0.0, 0.0));
+        (scene, left, right)
+    }
+
+    /// Two triangles in the XY plane with a gap between them: face 0 uses
+    /// positions 0..=2 on the left, face 1 uses positions 3..=5 on the right.
+    fn two_gapped_triangles() -> Mesh {
+        let mut m = Mesh::new();
+        for (x, y) in [(-2.5, -1.0), (-1.5, -1.0), (-2.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        for (x, y) in [(1.5, -1.0), (2.5, -1.0), (2.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        m.add_face(&[0, 1, 2]);
+        m.add_face(&[3, 4, 5]);
+        m.compute_flat_normals();
+        m
+    }
+
+    #[test]
+    fn a_box_over_one_quad_selects_only_that_nodes_positions() {
+        let (mut scene, _left, right) = two_quads();
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        let rect = screen_box(vp, size, &world_positions(&mut scene, right));
+
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Object);
+        let expected: Vec<PickElement> =
+            (0..4u32).map(|vi| PickElement::Vertex { node: right, vertex: vi }).collect();
+        assert_eq!(sel, expected, "the right quad's four positions, once each");
+    }
+
+    #[test]
+    fn vertex_level_selects_the_positions_inside_the_box() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        // A box around the quad's bottom half: corners 0 and 1 and a point
+        // between them are what it must hold, corners 2 and 3 stay above it.
+        let world = world_positions(&mut scene, id);
+        let rect = screen_box(vp, size, &[world[0], world[1], Vec3::new(0.0, -0.5, 0.0)]);
+
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Vertex);
+        assert_eq!(
+            sel,
+            vec![
+                PickElement::Vertex { node: id, vertex: 0 },
+                PickElement::Vertex { node: id, vertex: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn face_level_selects_only_the_face_under_the_box() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("triangles", two_gapped_triangles());
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        // Only the right triangle's three corners: the left face's corners
+        // lie far outside this box.
+        let world = world_positions(&mut scene, id);
+        let rect = screen_box(vp, size, &world[3..6]);
+
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Face);
+        assert_eq!(sel, vec![PickElement::Face { node: id, face: 1 }]);
+    }
+
+    #[test]
+    fn an_ngon_face_counts_once_even_when_several_corners_are_inside() {
+        let mut mesh = Mesh::new();
+        for i in 0..5 {
+            let a = i as f32 / 5.0 * std::f32::consts::TAU;
+            mesh.add_vertex(Vec3::new(a.cos(), a.sin(), 0.0));
+        }
+        mesh.add_face(&[0, 1, 2, 3, 4]);
+        mesh.compute_flat_normals();
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("pentagon", mesh);
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        // Four of the five corners are inside the box; the face is one hit.
+        let world = world_positions(&mut scene, id);
+        let rect = screen_box(vp, size, &world[0..4]);
+
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Face);
+        assert_eq!(sel, vec![PickElement::Face { node: id, face: 0 }]);
+    }
+
+    #[test]
+    fn a_box_outside_the_geometry_and_an_empty_box_select_nothing() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", quad(0.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+
+        // The quad fills the middle of the frame; this box sits in the empty
+        // top-left corner.
+        let outside = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0));
+        assert!(marquee_elements(&mut scene, vp, size, outside, SelectLevel::Object).is_empty());
+
+        // An empty (zero-area) box contains nothing at all: its edges only
+        // meet in a single point.
+        let empty = egui::Rect::from_min_max(egui::pos2(300.0, 300.0), egui::pos2(300.0, 300.0));
+        for level in [
+            SelectLevel::Object,
+            SelectLevel::Vertex,
+            SelectLevel::Face,
+            SelectLevel::Edge,
+        ] {
+            assert!(marquee_elements(&mut scene, vp, size, empty, level).is_empty());
+        }
+    }
+
+    #[test]
+    fn hidden_and_frozen_nodes_are_skipped_like_the_other_cpu_pickers() {
+        let mut scene = Scene::new();
+        // Three copies of one quad, so an unfiltered walk would see twelve
+        // positions where only the visible, unfrozen node may contribute four.
+        let shown = scene.create_mesh("shown", quad(0.0));
+        let hidden = scene.create_mesh("hidden", quad(0.0));
+        scene.get_mut(hidden).unwrap().visible = false;
+        let frozen = scene.create_mesh("frozen", quad(0.0));
+        scene.get_mut(frozen).unwrap().frozen = true;
+
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        let rect = screen_box(vp, size, &world_positions(&mut scene, shown));
+
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Vertex);
+        let expected: Vec<PickElement> =
+            (0..4u32).map(|vi| PickElement::Vertex { node: shown, vertex: vi }).collect();
+        assert_eq!(sel, expected);
+    }
+
+    #[test]
+    fn a_position_behind_the_camera_is_never_inside() {
+        let mut scene = Scene::new();
+        let front = scene.create_mesh("front", quad(0.0));
+        // The camera sits at z = 10 looking towards -Z, so a quad moved to
+        // z = 12 is behind the eye.
+        let behind = scene.create_mesh("behind", quad(0.0));
+        scene.get_mut(behind).unwrap().set_translation(Vec3::new(0.0, 0.0, 12.0));
+
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        for p in world_positions(&mut scene, behind) {
+            assert!(project(vp, p, size).is_none(), "behind the eye: {p:?}");
+        }
+
+        // A box over the whole viewport, that would swallow those points if
+        // behind-camera positions ever counted as inside.
+        let rect = egui::Rect::from_min_max(egui::pos2(-100.0, -100.0), egui::pos2(500.0, 500.0));
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Object);
+        let expected: Vec<PickElement> =
+            (0..4u32).map(|vi| PickElement::Vertex { node: front, vertex: vi }).collect();
+        assert_eq!(sel, expected, "only the quad in front of the eye");
+    }
+
+    #[test]
+    fn the_result_is_deterministic_with_each_element_once_and_indices_ascending() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("triangles", two_gapped_triangles());
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        let rect = screen_box(vp, size, &world_positions(&mut scene, id));
+
+        let first = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Vertex);
+        let second = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Vertex);
+        assert_eq!(first, second, "two calls, one answer");
+
+        assert_eq!(first.len(), 6, "all six positions, each once");
+        let indices: Vec<u32> = first.iter().map(|e| e.index()).collect();
+        assert_eq!(indices, (0..6).collect::<Vec<u32>>(), "indices ascending");
+        assert!(first.iter().all(|e| e.node() == id));
+    }
+
+    #[test]
+    fn edge_level_has_nothing_to_select() {
+        let mut scene = Scene::new();
+        scene.create_mesh("triangles", two_gapped_triangles());
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        let rect = egui::Rect::from_min_max(egui::pos2(-100.0, -100.0), egui::pos2(500.0, 500.0));
+        assert!(marquee_elements(&mut scene, vp, size, rect, SelectLevel::Edge).is_empty());
+    }
+
+    #[test]
+    fn a_point_exactly_on_the_box_edge_counts_as_inside() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        // Vertex 0 sits on the box's min corner — the top-left one, since
+        // the box extends to the right and down from it.
+        let (x, y, _) = project(vp, world_positions(&mut scene, id)[0], size).unwrap();
+        let on_the_edge = egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + 50.0, y + 50.0));
+
+        let sel = marquee_elements(&mut scene, vp, size, on_the_edge, SelectLevel::Vertex);
+        assert_eq!(sel, vec![PickElement::Vertex { node: id, vertex: 0 }]);
+
+        // One pixel inside the edge, the same corner is outside: the hit
+        // above came from the inclusive test, not from rounding.
+        let pulled_in =
+            egui::Rect::from_min_max(egui::pos2(x + 1.0, y + 1.0), egui::pos2(x + 51.0, y + 51.0));
+        assert!(marquee_elements(&mut scene, vp, size, pulled_in, SelectLevel::Vertex).is_empty());
     }
 }
 

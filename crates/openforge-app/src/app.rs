@@ -8,7 +8,7 @@ use crate::uv_editor::{self, UvEditor};
 use crate::viewport::{self, Camera};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
-use glam::{Vec2, Vec3, Vec4};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
 use openforge_core::scene::Scene;
@@ -135,6 +135,10 @@ pub struct OpenForgeApp {
     /// Where a live snapped drag is landing, as an absolute screen position:
     /// what the marker is painted at for as long as that drag runs.
     snap_marker: Option<egui::Pos2>,
+    /// A live rectangle-selection drag: its start and its current corner, in
+    /// absolute screen positions. Painted as a marquee and resolved into a
+    /// selection on release; `None` whenever no such drag is up.
+    marquee: Option<(egui::Pos2, egui::Pos2)>,
     /// How much edge overlay the viewport draws over the shading.
     wireframe: viewport::Wireframe,
     /// The project's materials and textures.
@@ -211,6 +215,7 @@ impl OpenForgeApp {
             gizmo: gizmo::Gizmo::default(),
             snap: snap::Snap::default(),
             snap_marker: None,
+            marquee: None,
             wireframe: viewport::Wireframe::default(),
             materials: default_materials(),
             texture_epoch: 0,
@@ -1190,6 +1195,113 @@ impl OpenForgeApp {
         gpu_viewport::chosen_hit(level, &hits)
     }
 
+    /// The element a click resolves to: the GPU ID pass first, the CPU raycast
+    /// as the fallback.
+    ///
+    /// The ID pass draws exactly what the frame drew, so a click can only land
+    /// on geometry the image shows. The raycast answers when there is no wgpu
+    /// backend, when the patch holds nothing the level can use, and for the
+    /// levels the ID pass does not serve.
+    fn resolve_click(
+        &mut self,
+        render_state: Option<&RenderState>,
+        rect: egui::Rect,
+        ray: openforge_core::math::Ray,
+        pos: egui::Pos2,
+        scale: f32,
+        level: SelectLevel,
+    ) -> Option<PickElement> {
+        self.gpu_pick(render_state, rect, pos, scale, level)
+            .or_else(|| match level {
+                SelectLevel::Face => viewport::pick_face(&mut self.scene, ray)
+                    .map(|hit| PickElement::Face { node: hit.node, face: hit.face }),
+                SelectLevel::Vertex => {
+                    let tol = (self.camera.distance * 0.02).max(0.01);
+                    viewport::pick_vertex(&mut self.scene, ray, self.camera.eye(), tol)
+                        .map(|hit| PickElement::Vertex { node: hit.node, vertex: hit.vertex })
+                }
+                _ => None,
+            })
+    }
+
+    /// Resolve a marquee rectangle into elements: the GPU's ID pass when there
+    /// is one — only it can tell hidden geometry from visible — and the CPU
+    /// projection otherwise.
+    ///
+    /// A GPU answer is trusted as it stands, empty or not: a rectangle over
+    /// empty space selects nothing, and one that covers no pixel of the target
+    /// at all covers no element either. Falling back to a projection that
+    /// selects through geometry would contradict the picture the click path
+    /// obeys; the projection is only for a machine without wgpu.
+    fn marquee_hits(
+        &mut self,
+        render_state: Option<&RenderState>,
+        rect: egui::Rect,
+        box_: egui::Rect,
+        vp: Mat4,
+        scale: f32,
+        level: SelectLevel,
+    ) -> Vec<PickElement> {
+        if let (Some(state), Some(gpu)) = (render_state, self.gpu.as_mut()) {
+            let camera = gpu_viewport::orbit_camera(&self.camera);
+            return gpu
+                .pick_rect(
+                    state,
+                    rect,
+                    box_.min,
+                    box_.max,
+                    scale,
+                    &mut self.scene,
+                    &camera,
+                    level,
+                )
+                .unwrap_or_default();
+        }
+        // The fallback works in viewport-local points, exactly like the
+        // painter's own projection.
+        let local = egui::Rect::from_min_max(
+            egui::pos2(box_.min.x - rect.min.x, box_.min.y - rect.min.y),
+            egui::pos2(box_.max.x - rect.min.x, box_.max.y - rect.min.y),
+        );
+        viewport::marquee_elements(&mut self.scene, vp, [rect.width(), rect.height()], local, level)
+    }
+
+    /// Apply what a rectangle (or a resolved click) found to the selection.
+    ///
+    /// A plain rectangle replaces the selection and Shift extends it; the
+    /// elements go in per node, node selection included, exactly like a click.
+    /// Selection only — nothing in the mesh changes, so there is nothing to
+    /// undo.
+    fn apply_marquee(&mut self, level: SelectLevel, hits: &[PickElement], additive: bool) {
+        if matches!(level, SelectLevel::Edge) {
+            return;
+        }
+        if !additive {
+            self.selection.clear();
+        }
+        for hit in hits {
+            if matches!(level, SelectLevel::Object) {
+                self.selection.select_node(hit.node());
+            } else {
+                self.selection.select_elements(hit.node(), [hit.index()]);
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// Paint the live rectangle-selection drag over the viewport.
+    ///
+    /// A wash with a firmer edge, drawn like the gizmo overlay — on top of
+    /// whichever backend painted the frame, so both show the same rectangle.
+    fn paint_marquee(&self, painter: &egui::Painter) {
+        let Some((a, b)) = self.marquee else { return };
+        let rect = egui::Rect::from_two_pos(a, b);
+        let fill = egui::Color32::from_rgba_unmultiplied(96, 156, 255, 32);
+        let stroke = egui::Color32::from_rgb(120, 176, 255);
+        painter.rect_filled(rect, 0.0, fill);
+        painter.rect_stroke(rect, 0.0, egui::Stroke::new(1.0_f32, stroke));
+    }
+
     /// Handle one frame of viewport interaction: camera controls, gizmo grabs,
     /// free-form tool drags and clicks.
     ///
@@ -1357,15 +1469,55 @@ impl OpenForgeApp {
             drag: self.tool_drag.take(),
         };
 
+        // A rectangle lives only while the primary button is held: if the
+        // release never arrived as a frame of its own — the window lost the
+        // pointer, say — the next frame drops it rather than leave it painted
+        // over the viewport.
+        if self.marquee.is_some()
+            && !ui.input(|i| i.pointer.primary_down())
+            && !response.drag_stopped()
+        {
+            self.marquee = None;
+            self.dirty = true;
+        }
+
         let mut pending_undo: Option<(String, Scene)> = None;
         // For sub-object picking we stash the click ray *and* the position it
         // landed on (the GPU pick needs the latter), and resolve both once the
         // tool context's borrows on the scene/selection are released.
         let mut click_pick: Option<(openforge_core::math::Ray, egui::Pos2)> = None;
+        // A released marquee, resolved the same way once the borrows are gone.
+        let mut marquee_pick: Option<(egui::Pos2, egui::Pos2)> = None;
         if let Some(pos) = response.interact_pointer_pos() {
             let ndc = Self::viewport_ndc(pos, rect);
             let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
             let pointer = Pointer { ray, ndc };
+
+            // Rectangle selection: in the Select tool a primary drag draws a
+            // marquee instead of reaching the tool, which only reacts to
+            // clicks — and the handle grab above has already had its say.
+            if !consumed && matches!(self.tool, ActiveTool::Select) {
+                if response.drag_started_by(egui::PointerButton::Primary) {
+                    // egui only calls a press a drag once the pointer has moved
+                    // a little, so the rectangle has to start at the press
+                    // origin, not at the position that decided the drag.
+                    let start = ui.input(|i| i.pointer.press_origin()).unwrap_or(pos);
+                    self.marquee = Some((start, pos));
+                    consumed = true;
+                    self.dirty = true;
+                } else if response.dragged_by(egui::PointerButton::Primary) {
+                    if let Some(marquee) = self.marquee.as_mut() {
+                        marquee.1 = pos;
+                        consumed = true;
+                        self.dirty = true;
+                    }
+                } else if response.drag_stopped() {
+                    if let Some(marquee) = self.marquee.take() {
+                        consumed = true;
+                        marquee_pick = Some(marquee);
+                    }
+                }
+            }
 
             if !consumed && response.drag_started_by(egui::PointerButton::Primary) {
                 if self.edit_before.is_none() {
@@ -1401,37 +1553,31 @@ impl OpenForgeApp {
         drop(tctx);
 
         // Resolve a sub-object pick now that the borrows are released. The GPU
-        // answers first when there is one: its ID pass draws exactly what the
-        // frame drew, so a click can only land on geometry the image shows.
-        // The CPU raycast stays as the fallback — for a machine without wgpu,
-        // an empty patch, or an element the level cannot use.
+        // answers first when there is one, the CPU raycast otherwise — see
+        // [`Self::resolve_click`].
         if let Some((ray, pos)) = click_pick {
-            let gpu_pick =
-                self.gpu_pick(render_state, rect, pos, ui.ctx().pixels_per_point(), level);
-            let picked = gpu_pick.or_else(|| match level {
-                SelectLevel::Face => viewport::pick_face(&mut self.scene, ray)
-                    .map(|hit| PickElement::Face { node: hit.node, face: hit.face }),
-                SelectLevel::Vertex => {
-                    let tol = (self.camera.distance * 0.02).max(0.01);
-                    viewport::pick_vertex(&mut self.scene, ray, self.camera.eye(), tol)
-                        .map(|hit| PickElement::Vertex { node: hit.node, vertex: hit.vertex })
+            let scale = ui.ctx().pixels_per_point();
+            if let Some(element) = self.resolve_click(render_state, rect, ray, pos, scale, level) {
+                self.apply_marquee(level, &[element], false);
+            }
+        }
+
+        // A released marquee turns into a selection: the rectangle's own
+        // answer, or — when the pointer came back to where it started, leaving
+        // no rectangle behind — the click that drag really was.
+        if let Some((a, b)) = marquee_pick {
+            let box_ = egui::Rect::from_two_pos(a, b);
+            let scale = ui.ctx().pixels_per_point();
+            if box_.width() <= 0.0 && box_.height() <= 0.0 {
+                let ray = Self::pick_ray(&self.camera, b, rect, aspect);
+                if let Some(element) = self.resolve_click(render_state, rect, ray, b, scale, level)
+                {
+                    self.apply_marquee(level, &[element], false);
                 }
-                _ => None,
-            });
-            if let Some(element) = picked {
-                match element {
-                    PickElement::Face { node, face } => {
-                        self.selection.clear();
-                        self.selection.select_node(node);
-                        self.selection.select_elements(node, [face]);
-                    }
-                    PickElement::Vertex { node, vertex } => {
-                        self.selection.clear();
-                        self.selection.select_node(node);
-                        self.selection.select_elements(node, [vertex]);
-                    }
-                }
-                self.dirty = true;
+            } else {
+                let additive = ui.input(|i| i.modifiers.shift);
+                let hits = self.marquee_hits(render_state, rect, box_, vp, scale, level);
+                self.apply_marquee(level, &hits, additive);
             }
         }
 
@@ -1448,9 +1594,20 @@ impl OpenForgeApp {
         self.status = match snap_readout {
             Some(readout) => readout,
             None => match self.tool {
-                ActiveTool::Select => {
-                    format!("Select — {} object(s) selected.", self.selection.node_count())
-                }
+                ActiveTool::Select => match self.selection.level {
+                    SelectLevel::Object => {
+                        format!("Select — {} object(s) selected.", self.selection.node_count())
+                    }
+                    SelectLevel::Vertex => format!(
+                        "Select — {} vertex(es) selected.",
+                        self.selection.total_element_count()
+                    ),
+                    SelectLevel::Face => format!(
+                        "Select — {} face(s) selected.",
+                        self.selection.total_element_count()
+                    ),
+                    SelectLevel::Edge => "Select — edges are not selectable yet.".into(),
+                },
                 ActiveTool::Move => {
                     "Move — drag an axis handle, or drag the mesh in the view plane.".into()
                 }
@@ -1544,6 +1701,7 @@ impl OpenForgeApp {
         // The transform gizmo sits above the geometry so its handles stay
         // grabbable even when they overlap the mesh.
         self.paint_gizmo(&painter);
+        self.paint_marquee(&painter);
 
         // Overlay label.
         let label = format!(
@@ -2535,6 +2693,7 @@ impl OpenForgeApp {
 
         self.paint_vertex_dots(&painter, rect);
         self.paint_gizmo(&painter);
+        self.paint_marquee(&painter);
 
         let label = format!(
             "Perspective  |  wgpu  |  {} tris  |  {} draws  |  {} selected",
@@ -3546,6 +3705,203 @@ mod tests {
             "undo restored the start: {:?}",
             restored.translation
         );
+    }
+
+    /// One frame of raw input with Shift held, for the additive-rectangle test.
+    fn shift_frame(time: f64, pointer: egui::Pos2, click: Option<bool>) -> egui::RawInput {
+        let mut input = frame(time, pointer, click);
+        input.modifiers = egui::Modifiers::SHIFT;
+        input
+    }
+
+    /// Drag a rectangle from `a` to `b` with the Select tool, then let go.
+    ///
+    /// A hover to settle, a press, a move past egui's click threshold, a move
+    /// to the far corner, a release: the frames a user's drag is made of.
+    /// `shift` holds the additive modifier for the whole gesture.
+    fn drag_rectangle(
+        ctx: &egui::Context,
+        app: &mut OpenForgeApp,
+        t: f64,
+        a: egui::Pos2,
+        b: egui::Pos2,
+        shift: bool,
+    ) {
+        let at = |time: f64, pointer: egui::Pos2, click: Option<bool>| {
+            if shift {
+                shift_frame(time, pointer, click)
+            } else {
+                frame(time, pointer, click)
+            }
+        };
+        step(ctx, app, at(t, a, None));
+        step(ctx, app, at(t + 0.1, a, Some(true)));
+        let mid = egui::pos2((a.x + b.x) / 2.0, (a.y + b.y) / 2.0);
+        step(ctx, app, at(t + 0.2, mid, None));
+        step(ctx, app, at(t + 0.3, b, None));
+        step(ctx, app, at(t + 0.4, b, Some(false)));
+    }
+
+    /// Where the selection's gizmo sits on screen: the app's own projection of
+    /// the mesh's centre, which is what a test needs to aim a rectangle at
+    /// geometry it cannot see.
+    fn gizmo_origin(ctx: &egui::Context, app: &mut OpenForgeApp, id: NodeId, t: f64) -> egui::Pos2 {
+        let tool = app.tool;
+        app.selection.select_node(id);
+        app.tool = ActiveTool::Move;
+        step(ctx, app, frame(t, egui::pos2(500.0, 350.0), None));
+        let origin = app
+            .gizmo
+            .layout
+            .as_ref()
+            .expect("a selection lays the gizmo out")
+            .origin;
+        app.tool = tool;
+        app.selection.clear();
+        origin
+    }
+
+    /// How many elements of `id` the selection holds.
+    fn selected_elements(app: &OpenForgeApp, id: NodeId) -> usize {
+        app.selection.selected_elements(id).map(|s| s.len()).unwrap_or(0)
+    }
+
+    /// Whether a frame painted a rectangle with exactly this rect.
+    fn paints_rect(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> bool {
+        fn walk(shape: &egui::Shape, rect: egui::Rect) -> bool {
+            match shape {
+                egui::Shape::Rect(r) => r.rect == rect,
+                egui::Shape::Vec(inner) => inner.iter().any(|s| walk(s, rect)),
+                _ => false,
+            }
+        }
+        shapes.iter().any(|clipped| walk(&clipped.shape, rect))
+    }
+
+    #[test]
+    fn a_dragged_rectangle_selects_the_faces_inside_it() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        let id = app
+            .scene
+            .iter()
+            .find(|n| n.is_mesh())
+            .map(|n| n.id)
+            .expect("the seed sphere exists");
+        let faces = app.scene.get(id).unwrap().mesh().unwrap().faces.len();
+        let centre = gizmo_origin(&ctx, &mut app, id, 0.0);
+        app.tool = ActiveTool::Select;
+        app.selection.level = SelectLevel::Face;
+
+        // A rectangle over the middle of the sphere: what the frame shows
+        // there is what a drag there selects.
+        let a = centre + egui::vec2(-70.0, -50.0);
+        let b = centre + egui::vec2(70.0, 50.0);
+        step(&ctx, &mut app, frame(1.0, a, None));
+        step(&ctx, &mut app, frame(1.1, a, Some(true)));
+        let shapes = paint_once(&ctx, &mut app, frame(1.2, b, None));
+
+        let live = app.marquee.expect("a drag draws a rectangle");
+        assert_eq!(live.0, a, "the rectangle starts where the button went down");
+        assert_eq!(live.1, b, "and follows the pointer while it drags");
+        let box_ = egui::Rect::from_two_pos(a, b);
+        assert!(paints_rect(&shapes, box_), "the live rectangle is painted");
+
+        step(&ctx, &mut app, frame(1.3, b, Some(false)));
+        assert!(app.marquee.is_none(), "letting go takes the rectangle down");
+        let selected = selected_elements(&app, id);
+        assert!(selected > 0, "the rectangle selected faces");
+        assert!(
+            selected < faces,
+            "and left the faces outside it alone: {selected} of {faces}"
+        );
+        assert!(app.selection.is_node_selected(id), "the node comes with its faces");
+    }
+
+    #[test]
+    fn shift_extends_the_selection_a_rectangle_found_and_a_plain_one_replaces_it() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        let id = app
+            .scene
+            .iter()
+            .find(|n| n.is_mesh())
+            .map(|n| n.id)
+            .expect("the seed sphere exists");
+        let centre = gizmo_origin(&ctx, &mut app, id, 0.0);
+        app.tool = ActiveTool::Select;
+        app.selection.level = SelectLevel::Face;
+
+        let near = (
+            centre + egui::vec2(-70.0, -50.0),
+            centre + egui::vec2(70.0, 50.0),
+        );
+        let wide = (
+            centre + egui::vec2(-130.0, -130.0),
+            centre + egui::vec2(130.0, 130.0),
+        );
+
+        drag_rectangle(&ctx, &mut app, 1.0, near.0, near.1, false);
+        let first = selected_elements(&app, id);
+        assert!(first > 0, "the first rectangle found faces");
+
+        // Shift keeps what was there and adds what the wider rectangle found.
+        drag_rectangle(&ctx, &mut app, 2.0, wide.0, wide.1, true);
+        let extended = selected_elements(&app, id);
+        assert!(
+            extended > first,
+            "shift extended the selection: {first} -> {extended}"
+        );
+
+        // Without Shift the same rectangle replaces it instead.
+        drag_rectangle(&ctx, &mut app, 3.0, near.0, near.1, false);
+        assert_eq!(
+            selected_elements(&app, id),
+            first,
+            "a plain rectangle replaces the selection with its own faces"
+        );
+    }
+
+    #[test]
+    fn an_object_rectangle_selects_the_nodes_it_holds_and_nothing_else() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        // A second node off to the side, so a rectangle can tell the two apart.
+        let far = app.scene.create_mesh("Far", mesh::uv_sphere(0.2, 8, 6));
+        app.scene.get_mut(far).unwrap().transform.translation = Vec3::new(6.0, 0.0, 0.0);
+        let near = app
+            .scene
+            .iter()
+            .find(|n| n.is_mesh() && n.id != far)
+            .map(|n| n.id)
+            .expect("the seed sphere exists");
+        let centre = gizmo_origin(&ctx, &mut app, near, 0.0);
+        app.tool = ActiveTool::Select;
+        app.selection.level = SelectLevel::Object;
+
+        // A rectangle over the seed sphere takes its node.
+        drag_rectangle(
+            &ctx,
+            &mut app,
+            1.0,
+            centre + egui::vec2(-20.0, -20.0),
+            centre + egui::vec2(20.0, 20.0),
+            false,
+        );
+        let selected: Vec<NodeId> = app.selection.selected_nodes().collect();
+        assert_eq!(selected, vec![near], "only the node under the rectangle");
+
+        // A rectangle over empty space takes nothing, and lets go of what was
+        // selected before.
+        drag_rectangle(
+            &ctx,
+            &mut app,
+            2.0,
+            egui::pos2(20.0, 640.0),
+            egui::pos2(60.0, 672.0),
+            false,
+        );
+        assert_eq!(app.selection.node_count(), 0, "empty space selects nothing");
     }
 
     #[test]
