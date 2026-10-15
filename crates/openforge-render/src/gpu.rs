@@ -2,14 +2,21 @@
 //!
 //! [`GpuRenderer`] owns an offscreen color + depth target, the pipelines built
 //! from the WGSL in [`crate::pipeline`], and the per-frame geometry buffers.
-//! [`GpuRenderer::render`] draws three things into that target, in order:
+//! [`GpuRenderer::render`] draws into that target, in order:
 //!
 //! 1. the ground grid (depth-tested, **no** depth write, so meshes always
 //!    composite over it — matching the old CPU painter behaviour),
 //! 2. the visible scene meshes (depth-tested *and* depth-written, which is the
 //!    whole point of moving off the painter's-algorithm CPU path),
-//! 3. a corner axis gizmo drawn with a rotation-only ortho camera, so it
+//! 3. the caller's wireframe / selection-outline edges as lines (depth-tested
+//!    with `LessEqual` and no depth write, so an edge lying exactly on a shaded
+//!    surface still draws while geometry behind it occludes it), and
+//! 4. a corner axis gizmo drawn with a rotation-only ortho camera, so it
 //!    tracks the orbit without ever being clipped by scene geometry.
+//!
+//! The target can run multi-sampled: construct with a sample count the color
+//! format supports (see [`supported_samples`]) and every pass resolves into
+//! the single-sampled [`GpuRenderer::color_texture`] the app presents.
 //!
 //! The app then presents the offscreen color texture as an egui image; see
 //! `openforge-app`'s `gpu_viewport` module. Nothing here depends on egui.
@@ -38,6 +45,31 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// [`egui_wgpu::Renderer::register_native_texture`]:
 ///     https://docs.rs/egui-wgpu/0.29/egui_wgpu/struct.Renderer.html
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// The multi-sample count [`GpuRenderer`] prefers when the adapter supports it.
+pub const PREFERRED_SAMPLES: u32 = 4;
+
+/// The sample count to build a [`GpuRenderer`] with: `requested` when the
+/// adapter supports that exact count for `format`, otherwise 1.
+///
+/// There is deliberately no silent downgrade — a caller that wants a fallback
+/// chain should try `PREFERRED_SAMPLES`, then smaller counts, and finally 1.
+pub fn supported_samples(
+    adapter: &wgpu::Adapter,
+    format: wgpu::TextureFormat,
+    requested: u32,
+) -> u32 {
+    if requested >= 2
+        && adapter
+            .get_texture_format_features(format)
+            .flags
+            .sample_count_supported(requested)
+    {
+        requested
+    } else {
+        1
+    }
+}
 
 /// Largest offscreen target we allocate (anything bigger is clamped).
 const MAX_TARGET_DIM: u32 = 8192;
@@ -199,7 +231,7 @@ pub struct FrameStats {
     pub vertices: usize,
     /// Indices (three per triangle) in the merged scene buffer.
     pub indices: usize,
-    /// Draw calls recorded for the frame (grid + scene + gizmo).
+    /// Draw calls recorded for the frame (grid + scene + edges + gizmo).
     pub draws: usize,
 }
 
@@ -239,15 +271,18 @@ fn face_from_cull(cull: CullMode) -> Option<wgpu::Face> {
 /// / [`color_view`](Self::color_view).
 pub struct GpuRenderer {
     size: [u32; 2],
+    samples: u32,
     color_texture: wgpu::Texture,
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    msaa_view: Option<wgpu::TextureView>,
     frame_uniforms: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
     gizmo_uniforms: wgpu::Buffer,
     gizmo_bind_group: wgpu::BindGroup,
     scene_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
+    edge_pipeline: wgpu::RenderPipeline,
     gizmo_pipeline: wgpu::RenderPipeline,
     grid_vertices: wgpu::Buffer,
     grid_vertex_count: u32,
@@ -258,15 +293,21 @@ pub struct GpuRenderer {
     scene_vertex_capacity: u64,
     scene_index_capacity: u64,
     scene_index_count: u32,
+    edge_vertices: wgpu::Buffer,
+    edge_vertex_capacity: u64,
+    edge_vertex_count: u32,
     stats: FrameStats,
 }
 
 impl GpuRenderer {
-    /// Build the pipelines, the bind groups and the static grid/gizmo geometry.
+    /// Build the pipelines, the bind groups and the static grid/gizmo geometry
+    /// for a `samples`-sampled target (`samples` is clamped to at least 1; use
+    /// [`supported_samples`] to pick a value the adapter supports).
     ///
     /// The offscreen target starts at 1x1; call [`resize`](Self::resize) with
     /// the real viewport size before the first frame.
-    pub fn new(device: &wgpu::Device) -> Self {
+    pub fn new(device: &wgpu::Device, samples: u32) -> Self {
+        let samples = samples.max(1);
         let vertex_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("openforge-scene-vertex"),
             source: wgpu::ShaderSource::Wgsl(pipeline::vertex_shader_wgsl().into()),
@@ -359,7 +400,10 @@ impl GpuRenderer {
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
                 }),
-                multisample: wgpu::MultisampleState::default(),
+                multisample: wgpu::MultisampleState {
+                    count: samples,
+                    ..Default::default()
+                },
                 fragment: Some(wgpu::FragmentState {
                     module: &fragment_module,
                     entry_point: "fs_main",
@@ -382,6 +426,16 @@ impl GpuRenderer {
             cull,
             true,
             wgpu::CompareFunction::Less,
+        );
+        // Edge overlay: depth tested so meshes occlude it, but no depth write,
+        // and `LessEqual` so an edge lying exactly on its own shaded surface
+        // still passes the test.
+        let edge_pipeline = build_pipeline(
+            "openforge-edges",
+            wgpu::PrimitiveTopology::LineList,
+            None,
+            false,
+            wgpu::CompareFunction::LessEqual,
         );
         // Grid: drawn first, depth tested but not written, so meshes composite
         // over it exactly like the CPU painter did.
@@ -432,19 +486,30 @@ impl GpuRenderer {
             wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
         );
 
-        let (color_texture, color_view, depth_view) = create_targets(device, MIN_TARGET_DIM, MIN_TARGET_DIM);
+        let edge_vertices = create_dynamic_buffer(
+            device,
+            "openforge-edge-vertices",
+            1024,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        );
+
+        let (color_texture, color_view, depth_view, msaa_view) =
+            create_targets(device, MIN_TARGET_DIM, MIN_TARGET_DIM, samples);
 
         Self {
             size: [MIN_TARGET_DIM, MIN_TARGET_DIM],
+            samples,
             color_texture,
             color_view,
             depth_view,
+            msaa_view,
             frame_uniforms,
             frame_bind_group,
             gizmo_uniforms,
             gizmo_bind_group,
             scene_pipeline,
             grid_pipeline,
+            edge_pipeline,
             gizmo_pipeline,
             grid_vertices,
             grid_vertex_count,
@@ -455,6 +520,9 @@ impl GpuRenderer {
             scene_vertex_capacity,
             scene_index_capacity,
             scene_index_count: 0,
+            edge_vertices,
+            edge_vertex_capacity: 1024,
+            edge_vertex_count: 0,
             stats: FrameStats::default(),
         }
     }
@@ -462,6 +530,11 @@ impl GpuRenderer {
     /// Current offscreen size in pixels.
     pub fn size(&self) -> [u32; 2] {
         self.size
+    }
+
+    /// The target's multi-sample count (1 when single-sampled).
+    pub fn samples(&self) -> u32 {
+        self.samples
     }
 
     /// The rendered image. Register this with the egui renderer (or read it
@@ -491,16 +564,19 @@ impl GpuRenderer {
         if size == self.size {
             return;
         }
-        let (color_texture, color_view, depth_view) = create_targets(device, size[0], size[1]);
+        let (color_texture, color_view, depth_view, msaa_view) =
+            create_targets(device, size[0], size[1], self.samples);
         self.size = size;
         self.color_texture = color_texture;
         self.color_view = color_view;
         self.depth_view = depth_view;
+        self.msaa_view = msaa_view;
     }
 
-    /// Draw the grid, the visible meshes of `scene` and the corner gizmo into
+    /// Draw the grid, the visible meshes of `scene`, the caller's `edges`
+    /// (wireframe / selection outline as line pairs) and the corner gizmo into
     /// the offscreen target, then submit the work. `time` feeds the shader's
-    /// reserved clock (currently unused).
+    /// reserved clock (currently unused); an empty `edges` skips the line pass.
     pub fn render(
         &mut self,
         device: &wgpu::Device,
@@ -510,8 +586,10 @@ impl GpuRenderer {
         colors: &NodeColors,
         camera: &OrbitCamera,
         time: f32,
+        edges: &[GpuVertex],
     ) -> FrameStats {
         self.upload(device, queue, scene, selection, colors);
+        self.upload_edges(device, queue, edges);
         self.write_uniforms(queue, camera, time);
 
         let gizmo = gizmo_viewport(self.size);
@@ -541,6 +619,7 @@ impl GpuRenderer {
         }
 
         self.scene_index_count = merged.indices.len() as u32;
+        // Grid + optional scene + gizmo; `upload_edges` adds the edge pass.
         self.stats = FrameStats {
             vertices: merged.vertices.len(),
             indices: merged.indices.len(),
@@ -569,6 +648,25 @@ impl GpuRenderer {
         }
     }
 
+    /// Upload the edge-overlay line vertices (two per edge). An empty slice
+    /// records no edge draw at all.
+    fn upload_edges(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, edges: &[GpuVertex]) {
+        self.edge_vertex_count = edges.len() as u32;
+        if edges.is_empty() {
+            return;
+        }
+        write_dynamic(
+            device,
+            queue,
+            &mut self.edge_vertices,
+            &mut self.edge_vertex_capacity,
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            "openforge-edge-vertices",
+            bytemuck::cast_slice(edges),
+        );
+        self.stats.draws += 1;
+    }
+
     /// Upload the per-frame uniforms (scene camera + gizmo camera).
     fn write_uniforms(&mut self, queue: &wgpu::Queue, camera: &OrbitCamera, time: f32) {
         let aspect = self.size[0] as f32 / self.size[1].max(1) as f32;
@@ -585,14 +683,21 @@ impl GpuRenderer {
         queue.write_buffer(&self.gizmo_uniforms, 0, bytemuck::bytes_of(&gizmo));
     }
 
-    /// Record the three draw passes. `gizmo` is `[x, y, size]` in pixels.
+    /// Record the draw passes (grid, scene, edges, gizmo). `gizmo` is
+    /// `[x, y, size]` in pixels.
     fn encode(&self, encoder: &mut wgpu::CommandEncoder, gizmo: [f32; 3]) {
         let clear = clear_color();
+        // With MSAA the pass renders into the multi-sampled texture and
+        // resolves into the single-sampled one the app presents.
+        let (color_view, resolve_target) = match &self.msaa_view {
+            Some(msaa) => (msaa, Some(&self.color_view)),
+            None => (&self.color_view, None),
+        };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("openforge-viewport"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &self.color_view,
-                resolve_target: None,
+                view: color_view,
+                resolve_target,
                 ops: wgpu::Operations {
                     load: wgpu::LoadOp::Clear(clear),
                     store: wgpu::StoreOp::Store,
@@ -625,7 +730,16 @@ impl GpuRenderer {
             pass.draw_indexed(0..self.scene_index_count, 0, 0..1);
         }
 
-        // 3. Corner gizmo: its own ortho camera, always drawn on top.
+        // 3. Edge overlay: depth tested (no write) so hidden edges are
+        //    occluded by the meshes in front of them.
+        if self.edge_vertex_count > 0 {
+            pass.set_pipeline(&self.edge_pipeline);
+            pass.set_bind_group(0, &self.frame_bind_group, &[]);
+            pass.set_vertex_buffer(0, self.edge_vertices.slice(..));
+            pass.draw(0..self.edge_vertex_count, 0..1);
+        }
+
+        // 4. Corner gizmo: its own ortho camera, always drawn on top.
         let [x, y, size] = gizmo;
         if size >= 1.0 {
             pass.set_viewport(x, y, size, size, 0.0, 1.0);
@@ -638,12 +752,22 @@ impl GpuRenderer {
     }
 }
 
-/// Create the offscreen color texture (with depth) for `size`.
+/// Create the offscreen target for a `width` x `height` viewport: the
+/// single-sampled color texture (also the MSAA resolve target), a depth
+/// texture, and — when `samples > 1` — the multi-sampled color view the passes
+/// actually render into.
 fn create_targets(
     device: &wgpu::Device,
     width: u32,
     height: u32,
-) -> (wgpu::Texture, wgpu::TextureView, wgpu::TextureView) {
+    samples: u32,
+) -> (
+    wgpu::Texture,
+    wgpu::TextureView,
+    wgpu::TextureView,
+    Option<wgpu::TextureView>,
+) {
+    let samples = samples.max(1);
     let extent = wgpu::Extent3d {
         width: width.max(MIN_TARGET_DIM),
         height: height.max(MIN_TARGET_DIM),
@@ -662,11 +786,24 @@ fn create_targets(
             | wgpu::TextureUsages::COPY_SRC,
         view_formats: &[],
     });
+    let msaa_view = (samples > 1).then(|| {
+        let msaa = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("openforge-msaa"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: samples,
+            dimension: wgpu::TextureDimension::D2,
+            format: COLOR_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        msaa.create_view(&wgpu::TextureViewDescriptor::default())
+    });
     let depth = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("openforge-depth"),
         size: extent,
         mip_level_count: 1,
-        sample_count: 1,
+        sample_count: samples,
         dimension: wgpu::TextureDimension::D2,
         format: DEPTH_FORMAT,
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -674,7 +811,7 @@ fn create_targets(
     });
     let color_view = color.create_view(&wgpu::TextureViewDescriptor::default());
     let depth_view = depth.create_view(&wgpu::TextureViewDescriptor::default());
-    (color, color_view, depth_view)
+    (color, color_view, depth_view, msaa_view)
 }
 
 fn create_dynamic_buffer(
@@ -917,21 +1054,24 @@ mod tests {
     /// Offscreen rows must be 256-byte aligned for texture→buffer copies.
     const ROW_BYTES: u32 = 256;
 
-    fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
+    /// An adapter plus its device, or `None` when no GPU is available. The
+    /// adapter stays around so tests can query format support.
+    fn headless_device() -> Option<(wgpu::Adapter, wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             force_fallback_adapter: false,
             compatible_surface: None,
         }))?;
-        pollster::block_on(adapter.request_device(
+        let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("openforge-smoke"),
                 ..Default::default()
             },
             None,
         ))
-        .ok()
+        .ok()?;
+        Some((adapter, device, queue))
     }
 
     /// A unit cube centred on the origin, with flat normals.
@@ -1032,7 +1172,7 @@ mod tests {
 
     #[test]
     fn renders_scene_offscreen_and_reflects_selection() {
-        let Some((device, queue)) = headless_device() else {
+        let Some((_adapter, device, queue)) = headless_device() else {
             eprintln!("skipping GPU smoke test: no wgpu adapter available");
             return;
         };
@@ -1042,14 +1182,14 @@ mod tests {
         let selection = Selection::new();
         let camera = OrbitCamera::default();
 
-        let mut renderer = GpuRenderer::new(&device);
+        let mut renderer = GpuRenderer::new(&device, 1);
         renderer.resize(&device, [TARGET, TARGET]);
         assert_eq!(renderer.size(), [TARGET, TARGET]);
 
         // 1. The cube renders: some pixels are lit geometry, the rest are the
         //    dark background (plus the grid, which never reaches this
         //    brightness).
-        let stats = renderer.render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0);
+        let stats = renderer.render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0, &[]);
         assert!(stats.indices > 0 && stats.indices.is_multiple_of(3), "{stats:?}");
         assert_eq!(stats.draws, 3);
         let pixels = read_pixels(&device, &queue, &renderer);
@@ -1063,7 +1203,7 @@ mod tests {
         if let Ok(node) = scene.get_mut(cube) {
             node.visible = false;
         }
-        renderer.render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0);
+        renderer.render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0, &[]);
         let hidden = read_pixels(&device, &queue, &renderer);
         assert_eq!(
             bright_neutral_pixels(&hidden, renderer.size()),
@@ -1078,22 +1218,47 @@ mod tests {
         }
         let mut selection = Selection::new();
         selection.select_node(cube);
-        renderer.render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0);
+        renderer
+            .render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0, &[]);
         let selected = read_pixels(&device, &queue, &renderer);
         assert!(
             orange_pixels(&selected, renderer.size()) > 0,
             "selected mesh was not tinted"
         );
         assert_ne!(selected, hidden);
+
+        // 4. The edge overlay draws as a line pass of its own: a warm line
+        //    floating clear of the cube shows up, and the stats count the
+        //    extra draw.
+        let unselected = Selection::new();
+        renderer.render(&device, &queue, &mut scene, &unselected, &NodeColors::default(), &camera, 0.0, &[]);
+        let plain = read_pixels(&device, &queue, &renderer);
+        assert_eq!(orange_pixels(&plain, renderer.size()), 0, "edge test baseline is tinted");
+        // Below the cube and clear of its body from the default camera, so
+        // only the line itself can paint these pixels.
+        let n = KEY_LIGHT.normalize();
+        let warm = linear_from_srgb_u8([255, 170, 60]);
+        let line = [
+            GpuVertex::new(Vec3::new(-0.5, -1.5, 0.0), n, [0.0, 0.0], warm),
+            GpuVertex::new(Vec3::new(0.5, -1.5, 0.0), n, [0.0, 0.0], warm),
+        ];
+        let stats = renderer
+            .render(&device, &queue, &mut scene, &unselected, &NodeColors::default(), &camera, 0.0, &line);
+        assert_eq!(stats.draws, 4, "the edge pass is its own draw");
+        let edged = read_pixels(&device, &queue, &renderer);
+        assert!(
+            orange_pixels(&edged, renderer.size()) > 0,
+            "the edge overlay never reached the target"
+        );
     }
 
     #[test]
     fn resize_is_clamped_and_a_no_op_when_unchanged() {
-        let Some((device, _queue)) = headless_device() else {
+        let Some((_adapter, device, _queue)) = headless_device() else {
             eprintln!("skipping GPU resize test: no wgpu adapter available");
             return;
         };
-        let mut renderer = GpuRenderer::new(&device);
+        let mut renderer = GpuRenderer::new(&device, 1);
         assert_eq!(renderer.size(), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
         renderer.resize(&device, [0, 0]);
         assert_eq!(renderer.size(), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
@@ -1106,5 +1271,45 @@ mod tests {
         let before = renderer.color_texture().width();
         renderer.resize(&device, [MAX_TARGET_DIM, 10]);
         assert_eq!(renderer.color_texture().width(), before);
+    }
+
+    #[test]
+    fn multisampled_target_resolves_into_the_presented_texture() {
+        let Some((adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU MSAA test: no wgpu adapter available");
+            return;
+        };
+        // Ask for the preferred count the way the app does; a device that
+        // cannot do 4x reports 1 and is exercised single-sampled below.
+        assert_eq!(supported_samples(&adapter, COLOR_FORMAT, 0), 1);
+        let samples = supported_samples(&adapter, COLOR_FORMAT, PREFERRED_SAMPLES);
+        assert!(samples == 1 || samples == PREFERRED_SAMPLES, "got {samples}");
+
+        let mut scene = Scene::new();
+        scene.create_mesh("Cube", unit_cube());
+        let camera = OrbitCamera::default();
+        let mut renderer = GpuRenderer::new(&device, samples);
+        assert_eq!(renderer.samples(), samples);
+        renderer.resize(&device, [TARGET, TARGET]);
+        assert_eq!(renderer.size(), [TARGET, TARGET]);
+
+        let stats = renderer.render(
+            &device,
+            &queue,
+            &mut scene,
+            &Selection::new(),
+            &NodeColors::default(),
+            &camera,
+            0.0,
+            &[],
+        );
+        assert!(stats.draws >= 3, "{stats:?}");
+        // The readback goes through the resolve: a broken MSAA configuration
+        // leaves this black (or fails validation before we get here).
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert!(
+            bright_neutral_pixels(&pixels, renderer.size()) > 0,
+            "nothing resolved into the color target with {samples}x MSAA"
+        );
     }
 }

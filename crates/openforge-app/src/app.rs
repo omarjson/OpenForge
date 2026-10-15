@@ -1932,6 +1932,22 @@ impl OpenForgeApp {
                         let size = [rect.width() * scale, rect.height() * scale];
                         let camera = gpu_viewport::orbit_camera(&self.camera);
                         let time = ui.input(|i| i.time) as f32;
+                        // The edge overlay is part of the GPU frame itself:
+                        // the renderer draws it as depth-tested lines, so the
+                        // app does not repaint it on top (the CPU fallback
+                        // below still does).
+                        let edge_vertices = if self.wireframe == viewport::Wireframe::Off {
+                            Vec::new()
+                        } else {
+                            let eye = self.camera.eye();
+                            let edges = viewport::collect_edges(
+                                &mut self.scene,
+                                &self.selection,
+                                self.wireframe,
+                                eye,
+                            );
+                            gpu_viewport::edge_vertices(&edges)
+                        };
                         Some(gpu.render(
                             state,
                             size,
@@ -1940,6 +1956,7 @@ impl OpenForgeApp {
                             &colors,
                             &camera,
                             time,
+                            &edge_vertices,
                         ))
                     }
                     _ => None,
@@ -1955,7 +1972,9 @@ impl OpenForgeApp {
     }
 
     /// Present the wgpu-rendered image and draw the CPU overlays on top of it:
-    /// the vertex-level dots and the stats label.
+    /// the vertex-level dots, the transform gizmo and the stats label. The
+    /// wireframe / selection outline is not repainted here — the renderer
+    /// already drew it as depth-tested line geometry inside the image.
     fn paint_gpu_viewport(
         &mut self,
         ui: &mut egui::Ui,
@@ -1971,7 +1990,6 @@ impl OpenForgeApp {
         painter.image(texture_id, rect, uv, egui::Color32::WHITE);
 
         self.paint_vertex_dots(&painter, rect);
-        self.paint_wireframe(&painter, rect);
         self.paint_gizmo(&painter);
 
         let label = format!(
@@ -2025,13 +2043,15 @@ impl OpenForgeApp {
         }
     }
 
-    /// Draw the edge overlay (wireframe and/or selection outline).
+    /// Draw the edge overlay (wireframe and/or selection outline) on the CPU
+    /// path.
     ///
-    /// Shared by both viewport backends, like the gizmo: the edges are built
-    /// from the scene in world space and projected through the same camera, so
-    /// the two paths agree. Edges are drawn on top of the shading — the CPU
-    /// path has no depth buffer to consult — which is why `collect_edges` drops
-    /// the ones only ever seen from behind.
+    /// Edges are built from the scene in world space and projected through the
+    /// same camera the GPU path uses. They are drawn on top of the shading —
+    /// the CPU path has no depth buffer to consult — which is why
+    /// `collect_edges` drops the ones only ever seen from behind. The GPU path
+    /// draws the same collected edges as depth-tested line geometry instead
+    /// (see `gpu_viewport::edge_vertices`).
     fn paint_wireframe(&mut self, painter: &egui::Painter, rect: egui::Rect) {
         if self.wireframe == viewport::Wireframe::Off {
             return;
@@ -2049,11 +2069,24 @@ impl OpenForgeApp {
                 continue;
             };
             let (width, color) = if edge.face_selected {
-                (2.0_f32, egui::Color32::from_rgb(255, 170, 60))
+                (2.0_f32, egui::Color32::from_rgb(
+                    viewport::EDGE_FACE_SELECTED_SRGB[0],
+                    viewport::EDGE_FACE_SELECTED_SRGB[1],
+                    viewport::EDGE_FACE_SELECTED_SRGB[2],
+                ))
             } else if edge.node_selected {
-                (1.6_f32, egui::Color32::from_rgb(90, 190, 255))
+                (1.6_f32, egui::Color32::from_rgb(
+                    viewport::EDGE_NODE_SELECTED_SRGB[0],
+                    viewport::EDGE_NODE_SELECTED_SRGB[1],
+                    viewport::EDGE_NODE_SELECTED_SRGB[2],
+                ))
             } else {
-                (1.0_f32, egui::Color32::from_rgba_unmultiplied(150, 158, 172, 130))
+                (1.0_f32, egui::Color32::from_rgba_unmultiplied(
+                    viewport::EDGE_PLAIN_SRGB[0],
+                    viewport::EDGE_PLAIN_SRGB[1],
+                    viewport::EDGE_PLAIN_SRGB[2],
+                    viewport::EDGE_PLAIN_ALPHA,
+                ))
             };
             painter.line_segment(
                 [

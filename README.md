@@ -20,7 +20,7 @@ The project is a Cargo workspace of twelve crates; these are the main layers:
 |-------|------|-------|
 | `openforge-core` | Scene graph, geometry, editing model | GUI- and renderer-agnostic. Nodes, meshes, selection, undo/redo, interactive tools, ray picking. |
 | `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL. Clean-room readers and writers. |
-| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target, and the scene, grid and axis-gizmo passes. |
+| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), and the scene, grid, edge-overlay and axis-gizmo passes. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, outliner, properties, toolbar, hotkeys. |
 
@@ -107,7 +107,10 @@ A sample GitHub Actions matrix is shown below.
   selection outline, then every visible mesh's wireframe (**View → Wireframe**
   shows the current mode). Edges of the selected faces are highlighted, and
   edges seen only from behind are dropped so a closed mesh doesn't draw its own
-  far side through the shading.
+  far side through the shading. On the wgpu backend the overlay is drawn inside
+  the frame (depth-tested, so meshes occlude hidden edges) and the viewport is
+  anti-aliased when the GPU supports it; the CPU fallback paints the edges on
+  top.
 - **Vertex / Face level** editing: select sub-objects and the gizmo moves to their
   centroid, where a drag moves *only* those vertices — the node's own transform
   is left alone. Changing level clears the element selection, because a face
@@ -144,9 +147,8 @@ mature commercial modeler. Sub-element editing, deformers, boolean CSG,
 skeletal skinning, materials, and a **depth-tested `wgpu` viewport** are in;
 what remains is mostly application surface. Natural next steps:
 
-- Wireframe and selection outlines in the viewport, and gizmo polish: plane and
-  centre handles, snapping, numeric entry, and per-face gizmo placement.
-- A deeper GPU viewport: MSAA, a materials-driven shader instead of one Lambert
+- Gizmo polish: plane and centre handles, snapping, and numeric entry.
+- A deeper GPU viewport: a materials-driven shader instead of one Lambert
   pass, and depth-buffer picking so picking matches exactly what is drawn.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) behind the host seam, which already

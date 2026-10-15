@@ -7,13 +7,16 @@
 //! keeps painting through the CPU path in [`crate::viewport`], so the viewport
 //! degrades instead of failing.
 
-use crate::viewport::Camera;
+use crate::viewport::{self, Camera, OverlayEdge};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
 use openforge_core::scene::Scene;
 use openforge_core::selection::Selection;
-use openforge_render::gpu::{FrameStats, GpuRenderer};
-use openforge_render::{NodeColors, OrbitCamera};
+use openforge_render::gpu::{
+    linear_from_srgb_u8, supported_samples, FrameStats, GpuRenderer, COLOR_FORMAT, KEY_LIGHT,
+    PREFERRED_SAMPLES,
+};
+use openforge_render::{GpuVertex, NodeColors, OrbitCamera};
 use wgpu::FilterMode;
 
 /// The wgpu viewport and the egui handle its image is drawn through.
@@ -25,8 +28,12 @@ pub struct GpuViewport {
 impl GpuViewport {
     /// Build the backend on `state`'s device and register its (1x1) image with
     /// egui. The real size arrives with the first [`render`](Self::render).
+    ///
+    /// The offscreen target runs multi-sampled whenever the adapter supports
+    /// the preferred count for the color format egui requires.
     pub fn new(state: &RenderState) -> Self {
-        let renderer = GpuRenderer::new(&state.device);
+        let samples = supported_samples(&state.adapter, COLOR_FORMAT, PREFERRED_SAMPLES);
+        let renderer = GpuRenderer::new(&state.device, samples);
         let texture_id = state.renderer.write().register_native_texture(
             &state.device,
             renderer.color_view(),
@@ -37,6 +44,8 @@ impl GpuViewport {
 
     /// Render one frame of `scene` at `size` in physical pixels, returning the
     /// egui image handle holding that frame plus [`FrameStats`] describing it.
+    /// `edges` are the wireframe / selection-outline lines to draw inside the
+    /// frame (see [`edge_vertices`]); an empty slice skips the line pass.
     ///
     /// The handle is returned rather than exposed as an accessor on purpose:
     /// resizing re-registers the egui texture (egui holds a bind group over the
@@ -51,6 +60,7 @@ impl GpuViewport {
         colors: &NodeColors,
         camera: &OrbitCamera,
         time: f32,
+        edges: &[GpuVertex],
     ) -> (egui::TextureId, FrameStats) {
         let size = target_size_px(size);
         if size != self.renderer.size() {
@@ -71,9 +81,40 @@ impl GpuViewport {
             colors,
             camera,
             time,
+            edges,
         );
         (self.texture_id, stats)
     }
+}
+
+/// Convert world-space overlay edges into GPU line vertices for
+/// [`GpuRenderer::render`].
+///
+/// Two vertices per edge (a line-list pair), coloured exactly like the CPU
+/// painter's edge overlay (`viewport::EDGE_*`, converted from sRGB to the
+/// linear space the offscreen target expects). The normal points at the key
+/// light, so the shader's `N·L` term is 1 and each edge keeps its authored
+/// colour.
+pub fn edge_vertices(edges: &[OverlayEdge]) -> Vec<GpuVertex> {
+    let normal = KEY_LIGHT.normalize();
+    let mut out = Vec::with_capacity(edges.len() * 2);
+    for edge in edges {
+        let (srgb, alpha) = if edge.face_selected {
+            (viewport::EDGE_FACE_SELECTED_SRGB, 1.0)
+        } else if edge.node_selected {
+            (viewport::EDGE_NODE_SELECTED_SRGB, 1.0)
+        } else {
+            (
+                viewport::EDGE_PLAIN_SRGB,
+                viewport::EDGE_PLAIN_ALPHA as f32 / 255.0,
+            )
+        };
+        let mut color = linear_from_srgb_u8(srgb);
+        color[3] = alpha;
+        out.push(GpuVertex::new(edge.a, normal, [0.0, 0.0], color));
+        out.push(GpuVertex::new(edge.b, normal, [0.0, 0.0], color));
+    }
+    out
 }
 
 /// Convert a viewport size in points to offscreen pixels, never returning a
@@ -105,7 +146,6 @@ pub fn orbit_camera(camera: &Camera) -> OrbitCamera {
 mod tests {
     use super::*;
     use glam::Vec3;
-    use openforge_render::gpu::COLOR_FORMAT;
 
     /// egui_wgpu only accepts this format for `register_native_texture`.
     #[test]
@@ -141,5 +181,44 @@ mod tests {
         assert_eq!(gpu.eye(), camera.eye());
         assert_eq!(gpu.view_matrix(), camera.view_matrix());
         assert_eq!(gpu.view_proj(16.0 / 9.0), camera.view_proj(16.0 / 9.0));
+    }
+
+    #[test]
+    fn edge_vertices_pair_the_endpoints_with_the_overlay_colours() {
+        let edges = [
+            OverlayEdge { a: Vec3::ZERO, b: Vec3::X, node_selected: true, face_selected: true },
+            OverlayEdge { a: Vec3::Y, b: Vec3::Z, node_selected: true, face_selected: false },
+            OverlayEdge { a: Vec3::X, b: Vec3::Y, node_selected: false, face_selected: false },
+        ];
+        let verts = edge_vertices(&edges);
+        assert_eq!(verts.len(), edges.len() * 2);
+
+        // Each pair shares its colour, serves as one line, and carries a unit
+        // normal pointed at the key light (`N·L == 1`, so the shader returns
+        // the authored colour unlit).
+        let light = KEY_LIGHT.normalize();
+        for pair in verts.chunks(2) {
+            assert_eq!(pair[0].color, pair[1].color);
+            assert_eq!(pair[0].uv, [0.0, 0.0]);
+            for v in pair {
+                let n = Vec3::from(v.normal);
+                assert!((n.length() - 1.0).abs() < 1e-5);
+                assert!((n.dot(light) - 1.0).abs() < 1e-5);
+            }
+        }
+        assert_eq!(Vec3::from(verts[0].position), Vec3::ZERO);
+        assert_eq!(Vec3::from(verts[1].position), Vec3::X);
+
+        // Face-selected wins over node-selected; plain edges keep their alpha.
+        assert_eq!(verts[0].color, linear_from_srgb_u8(viewport::EDGE_FACE_SELECTED_SRGB));
+        assert_eq!(verts[2].color, linear_from_srgb_u8(viewport::EDGE_NODE_SELECTED_SRGB));
+        let mut plain = linear_from_srgb_u8(viewport::EDGE_PLAIN_SRGB);
+        plain[3] = viewport::EDGE_PLAIN_ALPHA as f32 / 255.0;
+        assert_eq!(verts[4].color, plain);
+    }
+
+    #[test]
+    fn edge_vertices_are_empty_without_edges() {
+        assert!(edge_vertices(&[]).is_empty());
     }
 }

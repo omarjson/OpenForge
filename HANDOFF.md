@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (380 `#[test]` fns; 382 tests run, all green)
+## 4. Repo layout — 12 crates (383 `#[test]` fns; 385 tests run, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -50,14 +50,14 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 27 | Phong/Lambert materials, colors. |
-| `openforge-render` | 54 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target, scene/grid/gizmo pipelines, frame stats. |
+| `openforge-render` | 55 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 81 (bin) | eframe/egui GUI. `app.rs` (~3600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-app` | 83 (bin) | eframe/egui GUI. `app.rs` (~3600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -130,11 +130,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 
 ## 7. Current state & what's next
 
-**State:** baseline commit `2a201c8`. Full workspace builds with **0 warnings**,
-**382 tests pass**, CI green on all 3 platforms. Seven work-streams are done —
-the **wgpu viewport** (#1), the **interactive UV editor** (#2), the
-**transform gizmo** (#3), the **edge overlay** (#4), the **sub-object
-transforms** (#5), **materials** (#6) and the **plugin host** (#7) — plus a
+**State:** every commit since baseline `2a201c8` is landed on `main`. Full
+workspace builds with **0 warnings**, **385 tests pass**, CI green on all 3
+platforms. Eight work-streams are done — the **wgpu viewport** (#1), the
+**interactive UV editor** (#2), the **transform gizmo** (#3), the **edge
+overlay** (#4), the **sub-object transforms** (#5), **materials** (#6), the
+**plugin host** (#7) and the **GPU edge overlay + MSAA** (#8) — plus a
 progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
@@ -297,9 +298,30 @@ progress report:
   renderer, refusing to delete an in-use or non-final material, and duplicating
   without aliasing the original mesh.
 
+- **The GPU viewport grew MSAA and draws the wireframe itself.** The offscreen
+  target now runs 4x multi-sampled when the adapter supports it: the app asks
+  `openforge_render::gpu::supported_samples` (which never downgrades silently),
+  `GpuRenderer::new` takes the sample count, the pipelines and the depth
+  attachment match it, and every pass resolves into the single-sampled
+  `Rgba8UnormSrgb` texture egui presents and the smoke test reads back. The
+  wireframe / selection outline is no longer an egui overlay on the GPU path:
+  the app converts `viewport::collect_edges`' world-space edges into line
+  vertices (`gpu_viewport::edge_vertices`, the same `EDGE_*` colours the CPU
+  painter uses) and the renderer draws them as a depth-tested `LessEqual` line
+  pass of its own, so meshes occlude hidden edges while an edge lying exactly on
+  its own shaded surface still draws. `FrameStats::draws` counts that pass
+  (grid + scene + edges + gizmo). The CPU fallback keeps painting edges on top
+  as before.
+- **3 new tests**: 1 in `openforge-render` (an adapter-guarded MSAA smoke test
+  that builds a 4x renderer, renders, and reads the resolved target back) and 2
+  in `openforge-app` (`edge_vertices` pair/colour/normal rules — including the
+  unlit `N·L == 1` normal that keeps edge colours authored — and the empty
+  case). The existing edge-overlay smoke test also asserts the new line pass: a
+  warm line floats clear of the cube, `draws` goes to 4 and the pixels arrive.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **382 pass, 0 failures**
+build too); `cargo test --workspace` → **385 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels and now the plugin seam are all covered
 *without* a display: the `app.rs` test module runs the real
@@ -308,9 +330,10 @@ behind the UV canvas, the side panels and now the plugin seam are all covered
 (hover, grab, axis-constrained drag, release, undo) and the shapes the frame
 painted, and on what the host did (import/export through a filter, a plugin's
 filter taking effect, a rejected plugin changing nothing).
-**Not verified:** how the window actually looks, and the gizmo, the UV canvas
-and the new Plugins panel by eye — the agent has no display access, so a human
-should look at all four once. (An earlier session did launch the app on the wgpu
+**Not verified:** how the window actually looks, and the gizmo, the UV canvas,
+the new Plugins panel, and the GPU edge overlay by eye (its depth-tested look
+and the MSAA smoothing) — the agent has no display access, so a human should
+look at all of those once. (An earlier session did launch the app on the wgpu
 path and saw `eframe: ... Using wgpu.` with a Metal adapter, no `egui_wgpu`
 warnings and no panic over a 12 s run.)
 `rustfmt` is not installed for this toolchain, so formatting was matched by hand.
@@ -324,15 +347,17 @@ layer is essentially done, and the two largest application-surface gaps — the
 GPU viewport and the UV editor — now have real implementations. Prioritized
 next steps:
 
-1. **Deepen the GPU viewport** (best next value). It renders shaded geometry;
-   the editor surface around it is still missing — GPU selection outlines and
-   wireframe, MSAA, a materials-driven shader instead of the single hard-coded
-   Lambert pass, and depth-buffer picking so sub-object picking matches exactly
-   what is drawn. All additive to `GpuRenderer`.
+1. **Deepen the GPU viewport** (still the best next value). MSAA and the
+   depth-tested edge overlay are in; what remains of the editor surface is a
+   materials-driven shader (today the GPU path shades one colour per node — the
+   first face's material — while the CPU path resolves the slot per face) and
+   depth-buffer picking so sub-object picking matches exactly what is drawn
+   (an ID pass, or a depth read aligned with the CPU raycast). All additive to
+   `GpuRenderer`.
 2. **Extend the gizmo** (`gizmo.rs`, all additive): plane and centre handles,
-   snapping, numeric entry, and putting the gizmo at the selected *faces'*
-   centroid instead of the node's bounds centre (today a face/vertex-level drag
-   still moves the whole node, exactly as the core `TransformTool` always did).
+   snapping, and numeric entry. (Sub-object pivots are done: a vertex/face-level
+   drag moves only its own geometry, via `gizmo::Targets` +
+   `viewport::element_centroid`.)
 3. **Deepen the UV editor.** No texture background yet, no island-level ops
    (weld/split/mirror), no snapping, and the 3D face selection is pushed into
    the UV selection on demand rather than staying in sync.
@@ -366,6 +391,20 @@ deltas and are many work-streams, not one push.
   rejects a viewport/scissor rect that overflows the attachment; use
   `gpu::gizmo_viewport`, which clamps to fit. (c) Author sRGB colours, not raw
   linear bytes, or the image is washed out.
+- **MSAA turns the render target into two textures.** With a sample count > 1
+  the pass renders into the multi-sampled color texture and resolves into the
+  single-sampled one — that single-sampled texture is what egui registers and
+  what the smoke test reads back. The depth attachment and *every* pipeline's
+  `multisample` state must use the same count, and `GpuRenderer::new` takes the
+  count as a parameter: the app asks
+  `supported_samples(adapter, COLOR_FORMAT, PREFERRED_SAMPLES)` rather than
+  assuming 4x (no silent downgrade — a device that cannot do it reports 1).
+- **The GPU edge overlay replaces the egui one, it does not stack with it.**
+  When the GPU backend is active the edges are line geometry inside the frame
+  (depth-tested, `LessEqual`, no depth write); `paint_gpu_viewport` therefore
+  must not also call `paint_wireframe`, or every edge draws twice. The CPU
+  fallback still paints the overlay on top, and both paths share the
+  `viewport::EDGE_*` colours through `gpu_viewport::edge_vertices`.
 - **eframe picks its backend from `renderer: eframe::Renderer::Wgpu`** in
   `main.rs`. eframe's default features still include `glow`, so without that line
   the GPU path would silently never activate and the app would quietly stay on

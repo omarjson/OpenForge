@@ -276,6 +276,15 @@ impl Wireframe {
     }
 }
 
+/// Edge-overlay colours, authored as sRGB bytes so the CPU painter and the
+/// GPU edge pass draw the same colours. The GPU path converts them to linear
+/// space (the offscreen target is sRGB).
+pub const EDGE_FACE_SELECTED_SRGB: [u8; 3] = [255, 170, 60];
+pub const EDGE_NODE_SELECTED_SRGB: [u8; 3] = [90, 190, 255];
+pub const EDGE_PLAIN_SRGB: [u8; 3] = [150, 158, 172];
+/// Alpha of the plain (unselected) edge colour.
+pub const EDGE_PLAIN_ALPHA: u8 = 130;
+
 /// One world-space edge of the overlay, flagged for how it should be coloured.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct OverlayEdge {
