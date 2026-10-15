@@ -31,6 +31,14 @@ pub const VIEW_SPAN: f32 = 1.4;
 /// Click radius, in pixels, for picking a UV entry.
 pub const PICK_RADIUS: f32 = 8.0;
 
+/// Tolerance the editor's island operations use to weld UVs across a shared
+/// mesh edge: wide enough to absorb the float noise a projection leaves
+/// behind, far below any meaningful UV distance.
+pub const ISLAND_TOLERANCE: f32 = 1e-4;
+
+/// Gutter left around every island by the Pack Islands button, in UV units.
+pub const ISLAND_MARGIN: f32 = 0.02;
+
 /// The canvas size in points that the panel aims for, clamped to what is free.
 pub const CANVAS_SIZE: f32 = 300.0;
 
@@ -93,6 +101,25 @@ pub fn band_select(mesh: &Mesh, canvas: egui::Rect, a: egui::Pos2, b: egui::Pos2
         .filter(|(_, uv)| uv.is_finite() && band.contains(uv_to_canvas(**uv, canvas)))
         .map(|(i, _)| i as u32)
         .collect()
+}
+
+/// Every UV entry of every island the given entries touch.
+///
+/// A UV index can be shared by several faces, so this walks the mesh's island
+/// partition (via [`UvOps::uv_face_islands`]) and unions the entries of each
+/// island that uses at least one of `indices`. The result is sorted and
+/// deduplicated like every other index list the panel produces; unknown or
+/// out-of-range indices contribute nothing.
+pub fn island_selection(mesh: &Mesh, indices: &[u32], tolerance: f32) -> Vec<u32> {
+    let wanted: BTreeSet<u32> = indices.iter().copied().collect();
+    let mut selected: BTreeSet<u32> = BTreeSet::new();
+    for faces in mesh.uv_face_islands(tolerance) {
+        let entries = mesh.uv_island_uv_indices(&faces);
+        if entries.iter().any(|e| wanted.contains(e)) {
+            selected.extend(entries);
+        }
+    }
+    selected.into_iter().collect()
 }
 
 /// The face-outline segments to draw, as UV pairs.
@@ -291,6 +318,7 @@ pub fn draw_canvas(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use glam::Vec3;
 
     fn canvas() -> egui::Rect {
         egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(500.0, 450.0))
@@ -299,6 +327,40 @@ mod tests {
     fn mesh_with_uvs(uvs: &[Vec2]) -> Mesh {
         let mut m = Mesh::new();
         m.uvs = uvs.to_vec();
+        m
+    }
+
+    /// Two quads sharing the position edge `{1, 2}`, each corner on its own uv
+    /// entry and matching UVs along the shared edge: one island, entries `0..8`.
+    fn two_quads() -> Mesh {
+        let mut m = mesh_with_uvs(&[
+            Vec2::new(0.0, 0.0), // 0: face 0, pos 0
+            Vec2::new(1.0, 0.0), // 1: face 0, pos 1 (shared)
+            Vec2::new(1.0, 1.0), // 2: face 0, pos 2 (shared)
+            Vec2::new(0.0, 1.0), // 3: face 0, pos 3
+            Vec2::new(1.0, 0.0), // 4: face 1, pos 1 (shared, matches 1)
+            Vec2::new(2.0, 0.0), // 5: face 1, pos 4
+            Vec2::new(2.0, 1.0), // 6: face 1, pos 5
+            Vec2::new(1.0, 1.0), // 7: face 1, pos 2 (shared, matches 2)
+        ]);
+        for p in [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0), // shared
+            (1.0, 1.0, 0.0), // shared
+            (0.0, 1.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (2.0, 1.0, 0.0),
+        ] {
+            m.add_vertex(Vec3::new(p.0, p.1, p.2));
+        }
+        m.add_face(&[0, 1, 2, 3]);
+        m.add_face(&[1, 4, 5, 2]);
+        for (i, c) in m.faces[0].corners.iter_mut().enumerate() {
+            c.uv = i as u32;
+        }
+        for (i, c) in m.faces[1].corners.iter_mut().enumerate() {
+            c.uv = 4 + i as u32;
+        }
         m
     }
 
@@ -384,6 +446,81 @@ mod tests {
         );
         // A zero-size band selects nothing.
         assert!(band_select(&mesh, c, c.center(), c.center()).is_empty());
+    }
+
+    #[test]
+    fn selecting_an_entry_of_a_welded_pair_returns_its_whole_island() {
+        let m = two_quads();
+        // Entry 2 belongs to face 0; both faces weld into one island.
+        assert_eq!(
+            island_selection(&m, &[2], ISLAND_TOLERANCE),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn a_shifted_shared_edge_keeps_each_island_to_itself() {
+        let mut m = two_quads();
+        m.uvs[4] = Vec2::new(0.8, 0.0); // no longer matches face 0's (1, 0)
+        // Face 0's entries come back, face 1's stay out...
+        assert_eq!(island_selection(&m, &[2], ISLAND_TOLERANCE), vec![0, 1, 2, 3]);
+        // ...and the other island grown from its own entry does the reverse.
+        assert_eq!(island_selection(&m, &[5], ISLAND_TOLERANCE), vec![4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn entries_from_several_islands_unite_sorted_and_deduplicated() {
+        let mut m = two_quads();
+        m.uvs[4] = Vec2::new(0.8, 0.0); // face 1 is now its own island
+        // One entry per island: the union of both islands, sorted.
+        assert_eq!(
+            island_selection(&m, &[5, 2], ISLAND_TOLERANCE),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        // Several entries of one island still contribute it exactly once.
+        assert_eq!(island_selection(&m, &[2, 2, 3], ISLAND_TOLERANCE), vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn unnamed_empty_and_out_of_range_entries_select_nothing() {
+        let mut m = two_quads();
+        m.uvs.push(Vec2::new(0.5, 0.5)); // entry 8: no corner uses it
+        assert!(island_selection(&m, &[8], ISLAND_TOLERANCE).is_empty());
+        assert!(island_selection(&m, &[], ISLAND_TOLERANCE).is_empty());
+        assert!(island_selection(&m, &[99], ISLAND_TOLERANCE).is_empty());
+        // A dead index next to a live one is ignored, not fatal.
+        assert_eq!(
+            island_selection(&m, &[2, 99], ISLAND_TOLERANCE),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn the_tolerance_decides_whether_shared_edge_uvs_weld() {
+        // 1e-2 apart: split at the editor's tolerance, one island above it.
+        let mut apart = two_quads();
+        apart.uvs[4] = Vec2::new(1.01, 0.0);
+        assert_eq!(island_selection(&apart, &[2], ISLAND_TOLERANCE), vec![0, 1, 2, 3]);
+        assert_eq!(
+            island_selection(&apart, &[2], 0.02),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+        // A 1e-6 gap is float noise: welded at the editor's tolerance.
+        let mut noise = two_quads();
+        noise.uvs[4] = Vec2::new(1.0 + 1e-6, 0.0);
+        assert_eq!(
+            island_selection(&noise, &[2], ISLAND_TOLERANCE),
+            vec![0, 1, 2, 3, 4, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn a_mesh_without_faces_has_no_islands() {
+        // UVs but no faces: nothing to walk.
+        let m = mesh_with_uvs(&[Vec2::ZERO, Vec2::ONE]);
+        assert!(island_selection(&m, &[0], ISLAND_TOLERANCE).is_empty());
+        // A truly empty mesh stays empty for any index.
+        assert!(island_selection(&Mesh::new(), &[0, 1], ISLAND_TOLERANCE).is_empty());
     }
 
     #[test]

@@ -3185,6 +3185,21 @@ impl OpenForgeApp {
         self.uv.select_only(uvs);
     }
 
+    /// Grow the UV selection to the whole islands the current entries sit in.
+    ///
+    /// Selection only: no undo entry, because nothing in the mesh changes.
+    fn uv_select_island(&mut self, id: NodeId) {
+        let indices = self.uv.indices();
+        let Some(mesh) = self.uv_mesh_uvs(id) else { return };
+        let island = uv_editor::island_selection(mesh, &indices, uv_editor::ISLAND_TOLERANCE);
+        if island.is_empty() {
+            self.status = "Select a UV to grow into its island.".into();
+            return;
+        }
+        self.status = format!("{} UVs in the selected island(s).", island.len());
+        self.uv.select_only(island);
+    }
+
     fn frame_all(&mut self) {
         let ids = self.scene.all_ids();
         let b = self.scene.world_bounds(&ids);
@@ -4183,6 +4198,54 @@ mod tests {
         // With nothing selected it falls back to the material the panel edits.
         app.selection.clear();
         assert_eq!(app.uv_background_texture(), Some(index));
+    }
+
+    /// Two quads sharing the position edge `{1, 2}` whose shared-edge UVs
+    /// differ, so they are two separate UV islands: entries `0..4` and `4..8`.
+    fn two_island_quads() -> Mesh {
+        let mut m = Mesh::new();
+        for p in [
+            (0.0, 0.0, 0.0),
+            (1.0, 0.0, 0.0), // shared
+            (1.0, 1.0, 0.0), // shared
+            (0.0, 1.0, 0.0),
+            (2.0, 0.0, 0.0),
+            (2.0, 1.0, 0.0),
+        ] {
+            m.add_vertex(Vec3::new(p.0, p.1, p.2));
+        }
+        m.uvs = vec![
+            Vec2::new(0.0, 0.0), // 0
+            Vec2::new(1.0, 0.0), // 1
+            Vec2::new(1.0, 1.0), // 2
+            Vec2::new(0.0, 1.0), // 3
+            Vec2::new(0.8, 0.0), // 4: shifted off face 0's (1, 0)
+            Vec2::new(2.0, 0.0), // 5
+            Vec2::new(2.0, 1.0), // 6
+            Vec2::new(0.8, 1.0), // 7: shifted off face 0's (1, 1)
+        ];
+        m.add_face(&[0, 1, 2, 3]);
+        m.add_face(&[1, 4, 5, 2]);
+        for (i, c) in m.faces[0].corners.iter_mut().enumerate() {
+            c.uv = i as u32;
+        }
+        for (i, c) in m.faces[1].corners.iter_mut().enumerate() {
+            c.uv = 4 + i as u32;
+        }
+        m
+    }
+
+    #[test]
+    fn the_island_button_grows_the_selection_to_the_whole_island() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let id = app.scene.create_mesh("Two Island Quads", two_island_quads());
+        // One entry of the first island selected, as a canvas click leaves it.
+        app.uv.select_only([2]);
+        app.uv_select_island(id);
+        // The whole first island, and nothing of the second.
+        assert_eq!(app.uv.indices(), vec![0, 1, 2, 3]);
+        assert!(app.status.contains("4 UVs in the selected island"), "status: {}", app.status);
+        assert!(!app.undo.can_undo(), "a selection change is no undo entry");
     }
 
     #[test]
