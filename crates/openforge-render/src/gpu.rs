@@ -14,6 +14,12 @@
 //! 4. a corner axis gizmo drawn with a rotation-only ortho camera, so it
 //!    tracks the orbit without ever being clipped by scene geometry.
 //!
+//! [`GpuRenderer::pick`] re-draws the scene into a single-channel integer
+//! target (an "ID pass": one element id per texel, same camera, same depth
+//! test, same culling) and reads a small patch back around the cursor. That is
+//! what makes sub-object picking agree with the drawn frame: nothing the image
+//! occludes or culls can be picked.
+//!
 //! The target can run multi-sampled: construct with a sample count the color
 //! format supports (see [`supported_samples`]) and every pass resolves into
 //! the single-sampled [`GpuRenderer::color_texture`] the app presents.
@@ -27,6 +33,7 @@
 use crate::camera::OrbitCamera;
 use crate::gpu_types::{FrameUniforms, GpuVertex, TextureLayer};
 use crate::mesh_upload::{build_scene_materials, MeshBuffers, NodeMaterials};
+use crate::pick::{resolve_patch, PickElement, PickGeometry, PickVertex};
 use crate::pipeline::{self, CullMode};
 use glam::{Mat4, Vec3, Vec4};
 use openforge_core::scene::Scene;
@@ -51,6 +58,18 @@ pub const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormS
 
 /// Most texture layers one scene pass uploads (layer 0 is the white layer).
 pub const MAX_TEXTURE_LAYERS: u32 = 64;
+
+/// Color format of the ID ("pick") pass: one unsigned 32-bit element id per
+/// texel, zero where nothing was drawn.
+pub const PICK_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Uint;
+
+/// Row alignment wgpu demands of every texture→buffer copy.
+const PICK_ROW_ALIGNMENT: u32 = 256;
+
+/// Largest cursor radius a pick resolves over, in pixels. A patch this wide
+/// is already 129x129 texels: more than any click needs, and small enough to
+/// map back synchronously.
+const MAX_PICK_RADIUS: u32 = 64;
 
 /// The multi-sample count [`GpuRenderer`] prefers when the adapter supports it.
 pub const PREFERRED_SAMPLES: u32 = 4;
@@ -260,6 +279,20 @@ fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
     }
 }
 
+/// Attribute layout matching [`PickVertex`]'s `@location`s and byte offsets.
+const PICK_VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 2] = [
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Uint32, offset: 12, shader_location: 1 },
+];
+
+fn pick_vertex_layout() -> wgpu::VertexBufferLayout<'static> {
+    wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<PickVertex>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &PICK_VERTEX_ATTRIBUTES,
+    }
+}
+
 fn face_from_cull(cull: CullMode) -> Option<wgpu::Face> {
     match cull {
         CullMode::None => None,
@@ -297,6 +330,16 @@ pub struct GpuRenderer {
     grid_pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
     gizmo_pipeline: wgpu::RenderPipeline,
+    /// ID-pass pipelines: faces as triangles, mesh vertices as points.
+    pick_pipeline: wgpu::RenderPipeline,
+    pick_point_pipeline: wgpu::RenderPipeline,
+    /// The ID pass's own uniform block (just `view_proj`) and bind group,
+    /// kept apart from the frame's so a pick never disturbs a rendered frame.
+    pick_uniforms: wgpu::Buffer,
+    pick_bind_group: wgpu::BindGroup,
+    /// The ID pass's attachments, built on the first pick and rebuilt when the
+    /// viewport is resized.
+    pick_target: Option<PickTarget>,
     grid_vertices: wgpu::Buffer,
     grid_vertex_count: u32,
     gizmo_vertices: wgpu::Buffer,
@@ -519,6 +562,109 @@ impl GpuRenderer {
             wgpu::CompareFunction::Always,
         );
 
+        // --- The ID ("pick") pass ---------------------------------------------
+        // A pick is a second draw of the same scene into a single-channel
+        // integer target. It has its own shader, layout and attachments and
+        // shares no state with the frame, so a pick can run at any time —
+        // multi-sampled frame or not — without disturbing what is on screen.
+        let pick_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("openforge-pick"),
+            source: wgpu::ShaderSource::Wgsl(pipeline::pick_shader_wgsl().into()),
+        });
+        let pick_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("openforge-pick-layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: wgpu::BufferSize::new(64),
+                },
+                count: None,
+            }],
+        });
+        let pick_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("openforge-pick-pipeline-layout"),
+            bind_group_layouts: &[&pick_layout],
+            push_constant_ranges: &[],
+        });
+        let pick_uniforms = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("openforge-pick-uniforms"),
+            contents: bytemuck::bytes_of(&Mat4::IDENTITY.to_cols_array()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let pick_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("openforge-pick-bind-group"),
+            layout: &pick_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: pick_uniforms.as_entire_binding(),
+            }],
+        });
+        let build_pick_pipeline = |label: &str,
+                                   topology: wgpu::PrimitiveTopology,
+                                   cull_mode: Option<wgpu::Face>,
+                                   depth_compare: wgpu::CompareFunction| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(label),
+                layout: Some(&pick_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &pick_module,
+                    entry_point: "vs_main",
+                    compilation_options: Default::default(),
+                    buffers: &[pick_vertex_layout()],
+                },
+                primitive: wgpu::PrimitiveState {
+                    topology,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode,
+                    unclipped_depth: false,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: DEPTH_FORMAT,
+                    depth_write_enabled: true,
+                    depth_compare,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                // Ids must survive a readback unblended, so the ID target is
+                // never multi-sampled — whatever the frame runs at.
+                multisample: wgpu::MultisampleState { count: 1, ..Default::default() },
+                fragment: Some(wgpu::FragmentState {
+                    module: &pick_module,
+                    entry_point: "fs_main",
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: PICK_FORMAT,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                multiview: None,
+                cache: None,
+            })
+        };
+        // Faces: exactly the visible pass's culling and depth test.
+        let pick_pipeline = build_pick_pipeline(
+            "openforge-pick-faces",
+            wgpu::PrimitiveTopology::TriangleList,
+            cull,
+            wgpu::CompareFunction::Less,
+        );
+        // Vertices: points drawn after the faces, one pixel each, so a vertex
+        // wins over the surface it lies on (`LessEqual` for the coincident
+        // depth) without ever beating a face genuinely in front of it.
+        let pick_point_pipeline = build_pick_pipeline(
+            "openforge-pick-vertices",
+            wgpu::PrimitiveTopology::PointList,
+            None,
+            wgpu::CompareFunction::LessEqual,
+        );
+
         let grid = grid_vertices(GRID_HALF_EXTENT);
         let grid_vertex_count = grid.len() as u32;
         let grid_vertices = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -581,6 +727,11 @@ impl GpuRenderer {
             grid_pipeline,
             edge_pipeline,
             gizmo_pipeline,
+            pick_pipeline,
+            pick_point_pipeline,
+            pick_uniforms,
+            pick_bind_group,
+            pick_target: None,
             grid_vertices,
             grid_vertex_count,
             gizmo_vertices,
@@ -748,6 +899,162 @@ impl GpuRenderer {
         queue.submit(Some(encoder.finish()));
 
         self.stats
+    }
+
+    /// Re-draw `scene` as element ids and resolve what sits under `cursor`
+    /// (offscreen pixels, top-left origin), nearest first within `radius`.
+    ///
+    /// The pass draws the same geometry through the same camera with the same
+    /// depth test and back-face culling as the visible frame, so what comes
+    /// back matches what the image shows: an occluded vertex, or a face whose
+    /// back faces the camera, cannot be picked. Ids are read back
+    /// synchronously, so call this on a click rather than every frame.
+    ///
+    /// `radius` is clamped to [`MAX_PICK_RADIUS`]; an empty scene — or one
+    /// whose every mesh is hidden or frozen — resolves to nothing without
+    /// touching the GPU.
+    pub fn pick(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &mut Scene,
+        camera: &OrbitCamera,
+        cursor: [f32; 2],
+        radius: u32,
+    ) -> Vec<PickElement> {
+        let geometry = PickGeometry::build(scene);
+        if geometry.is_empty() {
+            return Vec::new();
+        }
+
+        let size = self.size;
+        let aspect = size[0] as f32 / size[1].max(1) as f32;
+        queue.write_buffer(
+            &self.pick_uniforms,
+            0,
+            bytemuck::bytes_of(&camera.view_proj(aspect).to_cols_array()),
+        );
+
+        // The patch around the cursor, clipped to the target: at the edges it
+        // shrinks, and the cursor is no longer at its middle.
+        let cx = (cursor[0].floor().max(0.0) as u32).min(size[0] - 1);
+        let cy = (cursor[1].floor().max(0.0) as u32).min(size[1] - 1);
+        let radius = radius.min(MAX_PICK_RADIUS);
+        let x0 = cx.saturating_sub(radius);
+        let y0 = cy.saturating_sub(radius);
+        let x1 = (cx + radius + 1).min(size[0]);
+        let y1 = (cy + radius + 1).min(size[1]);
+        let patch = [x1 - x0, y1 - y0];
+        let row_bytes = pick_row_bytes(patch[0]);
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("openforge-pick-readback"),
+            size: row_bytes as u64 * patch[1] as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        // A scene of nothing but loose vertices has no triangles, and wgpu
+        // rejects a zero-sized buffer.
+        let triangles = (!geometry.triangles.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("openforge-pick-face-vertices"),
+                contents: bytemuck::cast_slice(&geometry.triangles),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        let points = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("openforge-pick-point-vertices"),
+            contents: bytemuck::cast_slice(&geometry.points),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        self.ensure_pick_target(device);
+        let target = self.pick_target.as_ref().expect("pick target was just built");
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("openforge-pick"),
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("openforge-pick"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target.view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &target.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            pass.set_bind_group(0, &self.pick_bind_group, &[]);
+            if let Some(buffer) = &triangles {
+                pass.set_pipeline(&self.pick_pipeline);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..geometry.triangles.len() as u32, 0..1);
+            }
+            // Points come last, so a vertex pixel wins over the face under it.
+            pass.set_pipeline(&self.pick_point_pipeline);
+            pass.set_vertex_buffer(0, points.slice(..));
+            pass.draw(0..geometry.points.len() as u32, 0..1);
+        }
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &target.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x: x0, y: y0, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &readback,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(row_bytes),
+                    rows_per_image: Some(patch[1]),
+                },
+            },
+            wgpu::Extent3d {
+                width: patch[0],
+                height: patch[1],
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::Maintain::Wait);
+        let data = slice.get_mapped_range();
+        // Copies pad every row to 256 bytes; strip the padding on the way out.
+        let mut ids: Vec<u32> = Vec::with_capacity((patch[0] * patch[1]) as usize);
+        for row in 0..patch[1] as usize {
+            let start = row * row_bytes as usize;
+            let end = start + patch[0] as usize * 4;
+            ids.extend_from_slice(bytemuck::cast_slice(&data[start..end]));
+        }
+        drop(data);
+        readback.unmap();
+
+        resolve_patch(&ids, patch[0], patch[1], [cx - x0, cy - y0])
+            .into_iter()
+            .filter_map(|hit| geometry.element(hit.id))
+            .collect()
+    }
+
+    /// Make sure the ID pass's attachments match the current viewport size,
+    /// building them on the first pick and after every resize.
+    fn ensure_pick_target(&mut self, device: &wgpu::Device) {
+        if self.pick_target.as_ref().map(|t| t.size) != Some(self.size) {
+            self.pick_target = Some(PickTarget::new(device, self.size));
+        }
     }
 
     /// Merge the scene's visible meshes into the dynamic vertex/index buffers.
@@ -1053,6 +1360,59 @@ fn create_targets(
     (color, color_view, depth_view, msaa_view)
 }
 
+/// The ID pass's attachments: the integer image its ids land in and a
+/// single-sampled depth buffer with the visible pass's depth semantics, plus
+/// the size they were built for.
+struct PickTarget {
+    size: [u32; 2],
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+}
+
+impl PickTarget {
+    /// Build the attachments for a `size` viewport.
+    fn new(device: &wgpu::Device, size: [u32; 2]) -> Self {
+        let extent = wgpu::Extent3d {
+            width: size[0].max(MIN_TARGET_DIM),
+            height: size[1].max(MIN_TARGET_DIM),
+            depth_or_array_layers: 1,
+        };
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("openforge-pick-ids"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: PICK_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let depth = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("openforge-pick-depth"),
+            size: extent,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: DEPTH_FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        Self {
+            size,
+            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
+            texture,
+            depth_view: depth.create_view(&wgpu::TextureViewDescriptor::default()),
+        }
+    }
+}
+
+/// Row pitch for the ID readback: wgpu requires texture→buffer rows to be
+/// padded to 256 bytes.
+fn pick_row_bytes(width: u32) -> u32 {
+    (width * 4).div_ceil(PICK_ROW_ALIGNMENT) * PICK_ROW_ALIGNMENT
+}
+
 fn create_dynamic_buffer(
     device: &wgpu::Device,
     label: &str,
@@ -1271,10 +1631,54 @@ mod tests {
     }
 
     #[test]
+    fn pick_vertex_layout_matches_pick_vertex_size() {
+        let layout = pick_vertex_layout();
+        assert_eq!(layout.array_stride, std::mem::size_of::<PickVertex>() as u64);
+        assert_eq!(layout.attributes.len(), 2);
+        assert_eq!(layout.attributes[0].shader_location, 0);
+        assert_eq!(layout.attributes[0].format, wgpu::VertexFormat::Float32x3);
+        assert_eq!(layout.attributes[1].shader_location, 1);
+        assert_eq!(layout.attributes[1].offset, 12);
+        assert_eq!(layout.attributes[1].format, wgpu::VertexFormat::Uint32);
+        // The id lands exactly at the end of the stride: no gap between the
+        // position and the id a shader could read garbage from.
+        assert_eq!(layout.attributes[1].offset + 4, layout.array_stride);
+    }
+
+    #[test]
+    fn pick_rows_are_padded_to_the_copy_alignment() {
+        assert_eq!(pick_row_bytes(1), 256);
+        assert_eq!(pick_row_bytes(64), 256);
+        // A 65-pixel row is 260 bytes: the next multiple of 256.
+        assert_eq!(pick_row_bytes(65), 512);
+        assert_eq!(pick_row_bytes(128), 512);
+        for width in [1u32, 7, 32, 63, 64, 65, 128, 129, 256] {
+            let bytes = pick_row_bytes(width);
+            assert_eq!(bytes % PICK_ROW_ALIGNMENT, 0, "width {width}");
+            assert!(bytes >= width * 4, "width {width}");
+        }
+    }
+
+    #[test]
+    fn pick_format_is_an_integer_target() {
+        assert_eq!(PICK_FORMAT, wgpu::TextureFormat::R32Uint);
+        // Not a depth format and not blendable: an id must survive as-is.
+        assert!(!PICK_FORMAT.is_depth_stencil_format());
+        assert!(!PICK_FORMAT.is_srgb());
+    }
+
+    #[test]
+    fn pick_radius_stays_sane() {
+        // The clamp exists so a patch cannot grow into a full-screen readback.
+        assert!(MAX_PICK_RADIUS >= 8 && MAX_PICK_RADIUS <= 128);
+    }
+
+    #[test]
     fn shaders_are_valid_wgsl() {
         for (name, src) in [
             ("vertex", pipeline::vertex_shader_wgsl()),
             ("fragment", pipeline::fragment_shader_wgsl()),
+            ("pick", pipeline::pick_shader_wgsl()),
         ] {
             let module = naga::front::wgsl::parse_str(src).unwrap_or_else(|e| {
                 panic!("{name} shader failed to parse: {}", e.emit_to_string(src))
@@ -1750,6 +2154,141 @@ mod tests {
         assert!(
             bright_neutral_pixels(&pixels, renderer.size()) > 0,
             "nothing resolved into the color target with {samples}x MSAA"
+        );
+    }
+
+    /// A 2x2 quad in the XY plane facing +Z, sharing its four corners.
+    fn unit_quad() -> openforge_core::mesh::Mesh {
+        let mut m = openforge_core::mesh::Mesh::new();
+        m.add_vertex(Vec3::new(-1.0, -1.0, 0.0));
+        m.add_vertex(Vec3::new(1.0, -1.0, 0.0));
+        m.add_vertex(Vec3::new(1.0, 1.0, 0.0));
+        m.add_vertex(Vec3::new(-1.0, 1.0, 0.0));
+        m.add_face(&[0, 1, 2, 3]);
+        m
+    }
+
+    /// A mesh holding a single loose vertex, and no faces at all.
+    fn lone_vertex() -> openforge_core::mesh::Mesh {
+        let mut m = openforge_core::mesh::Mesh::new();
+        m.add_vertex(Vec3::ZERO);
+        m
+    }
+
+    /// A camera looking down -Z from +Z, so "in front" is +Z.
+    fn front_camera() -> OrbitCamera {
+        OrbitCamera {
+            yaw: std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+            distance: 4.0,
+            ..OrbitCamera::default()
+        }
+    }
+
+    /// The offscreen pixel a world point projects to, using the same mapping
+    /// the app's `viewport::project` uses (top-left origin, y down).
+    fn pixel_of(camera: &OrbitCamera, size: [u32; 2], p: Vec3) -> [f32; 2] {
+        let aspect = size[0] as f32 / size[1].max(1) as f32;
+        let clip = camera.view_proj(aspect) * p.extend(1.0);
+        let ndc = clip.truncate() / clip.w;
+        [
+            (ndc.x * 0.5 + 0.5) * size[0] as f32,
+            (0.5 - ndc.y * 0.5) * size[1] as f32,
+        ]
+    }
+
+    #[test]
+    fn the_pick_pass_resolves_what_the_frame_shows() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU pick test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let front = scene.create_mesh("front", unit_quad());
+        let back = scene.create_mesh("back", unit_quad());
+        scene.get_mut(front).unwrap().set_translation(Vec3::new(0.0, 0.0, 0.5));
+        scene.get_mut(back).unwrap().set_translation(Vec3::new(0.0, 0.0, -0.5));
+        let camera = front_camera();
+
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let centre = [TARGET as f32 / 2.0, TARGET as f32 / 2.0];
+        let front_face = PickElement::Face { node: front, face: 0 };
+        let back_face = PickElement::Face { node: back, face: 0 };
+
+        // The nearer quad's face is the only thing under a cursor at the
+        // centre: the other is behind it, and the quad corners are ~15 px away
+        // so no vertex element can reach the patch.
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 4);
+        assert_eq!(hits, vec![front_face], "the near face must win");
+
+        // A cursor clear of every quad resolves nothing at all.
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, [2.0, 2.0], 4);
+        assert!(hits.is_empty(), "empty space picked {hits:?}");
+
+        // Hiding the near node lets the pick fall through to the visible one.
+        scene.get_mut(front).unwrap().visible = false;
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 4);
+        assert_eq!(hits, vec![back_face], "the pick must follow visibility");
+        scene.get_mut(front).unwrap().visible = true;
+
+        // Reversing the near quad's winding back-culls it from the frame, so
+        // the pick must not find it either.
+        scene.get_mut(front).unwrap().mesh_mut().unwrap().faces[0].corners.reverse();
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 4);
+        assert_eq!(hits, vec![back_face], "a back-culled face must not be pickable");
+    }
+
+    #[test]
+    fn a_vertex_is_picked_at_its_pixel_unless_occluded() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU vertex pick test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let quad = scene.create_mesh("quad", unit_quad());
+        // A loose vertex (a node with no faces at all), right behind the quad's
+        // middle to start with.
+        let loose = scene.create_mesh("loose", lone_vertex());
+        scene.get_mut(loose).unwrap().set_translation(Vec3::new(0.0, 0.0, -1.0));
+        let camera = front_camera();
+
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let size = renderer.size();
+
+        // A cursor on the quad's (-1,-1) corner picks that vertex, not the face
+        // covering the same pixel.
+        let corner = pixel_of(&camera, size, Vec3::new(-1.0, -1.0, 0.0));
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, corner, 2);
+        assert_eq!(
+            hits.first(),
+            Some(&PickElement::Vertex { node: quad, vertex: 0 }),
+            "a vertex on its own pixel must win over its face: {hits:?}"
+        );
+
+        // The loose vertex projects to the centre pixel, but it sits behind the
+        // quad there: the frame does not show it, so the pick must not find it.
+        let centre = pixel_of(&camera, size, Vec3::ZERO);
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 2);
+        assert!(
+            hits.iter().all(|e| !matches!(e, PickElement::Vertex { node, .. } if *node == loose)),
+            "an occluded vertex was picked: {hits:?}"
+        );
+        assert_eq!(hits.first(), Some(&PickElement::Face { node: quad, face: 0 }));
+
+        // Move it in front of the quad: now the point pass draws it over the
+        // face there, so it resolves — while the same vertex behind the quad
+        // did not.
+        scene.get_mut(loose).unwrap().set_translation(Vec3::new(0.0, 0.0, 1.0));
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 2);
+        assert!(
+            hits.contains(&PickElement::Vertex { node: loose, vertex: 0 }),
+            "a vertex in front of the surface must be picked: {hits:?}"
+        );
+        assert!(
+            hits.contains(&PickElement::Face { node: quad, face: 0 }),
+            "the face behind the vertex should still resolve: {hits:?}"
         );
     }
 }

@@ -21,7 +21,7 @@ use openforge_core::NodeId;
 use openforge_ops::MeshOps;
 use openforge_materials::{Material, MaterialLibrary, Texture};
 use openforge_plugin::PluginHost;
-use openforge_render::{FaceShading, FrameStats, NodeMaterials, TextureLayer};
+use openforge_render::{FaceShading, FrameStats, NodeMaterials, PickElement, TextureLayer};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
 use std::path::PathBuf;
@@ -1169,7 +1169,39 @@ impl OpenForgeApp {
         camera.ray_from_ndc(ndc.x, ndc.y, aspect)
     }
 
-    fn handle_viewport_input(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    /// What the GPU's ID pass finds under a click, at the current selection
+    /// level.
+    ///
+    /// `None` when there is no wgpu backend, or when the patch around the
+    /// click holds no element the level can use — the caller then falls back
+    /// to its own raycast.
+    fn gpu_pick(
+        &mut self,
+        render_state: Option<&RenderState>,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        scale: f32,
+        level: SelectLevel,
+    ) -> Option<PickElement> {
+        let Some(state) = render_state else { return None };
+        let Some(gpu) = self.gpu.as_mut() else { return None };
+        let camera = gpu_viewport::orbit_camera(&self.camera);
+        let hits = gpu.pick(state, rect, pos, scale, &mut self.scene, &camera);
+        gpu_viewport::chosen_hit(level, &hits)
+    }
+
+    /// Handle one frame of viewport interaction: camera controls, gizmo grabs,
+    /// free-form tool drags and clicks.
+    ///
+    /// `render_state` is the wgpu device when eframe runs the wgpu backend:
+    /// sub-object clicks then resolve through the renderer's ID pass first (see
+    /// [`Self::gpu_pick`]), which is what makes picking match the drawn image.
+    fn handle_viewport_input(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        render_state: Option<&RenderState>,
+    ) {
         let response = ui.interact(rect, ui.id().with("viewport"), egui::Sense::click_and_drag());
         let aspect = rect.width() / rect.height().max(1.0);
 
@@ -1326,9 +1358,10 @@ impl OpenForgeApp {
         };
 
         let mut pending_undo: Option<(String, Scene)> = None;
-        // For sub-object picking we stash the click ray and resolve it after the
+        // For sub-object picking we stash the click ray *and* the position it
+        // landed on (the GPU pick needs the latter), and resolve both once the
         // tool context's borrows on the scene/selection are released.
-        let mut click_pick: Option<openforge_core::math::Ray> = None;
+        let mut click_pick: Option<(openforge_core::math::Ray, egui::Pos2)> = None;
         if let Some(pos) = response.interact_pointer_pos() {
             let ndc = Self::viewport_ndc(pos, rect);
             let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
@@ -1358,8 +1391,8 @@ impl OpenForgeApp {
                         self.dirty = true;
                     }
                 } else {
-                    // Face/Vertex level: stash the ray and pick below.
-                    click_pick = Some(ray);
+                    // Face/Vertex level: stash the click and pick below.
+                    click_pick = Some((ray, pos));
                 }
             }
         }
@@ -1367,29 +1400,38 @@ impl OpenForgeApp {
         self.tool_drag = tctx.drag.take();
         drop(tctx);
 
-        // Resolve a sub-object pick now that the borrows are released.
-        if let Some(ray) = click_pick {
-            match level {
-                SelectLevel::Face => {
-                    if let Some(hit) = viewport::pick_face(&mut self.scene, ray) {
-                        self.selection.clear();
-                        self.selection.select_node(hit.node);
-                        self.selection.select_elements(hit.node, [hit.face]);
-                        self.dirty = true;
-                    }
-                }
+        // Resolve a sub-object pick now that the borrows are released. The GPU
+        // answers first when there is one: its ID pass draws exactly what the
+        // frame drew, so a click can only land on geometry the image shows.
+        // The CPU raycast stays as the fallback — for a machine without wgpu,
+        // an empty patch, or an element the level cannot use.
+        if let Some((ray, pos)) = click_pick {
+            let gpu_pick =
+                self.gpu_pick(render_state, rect, pos, ui.ctx().pixels_per_point(), level);
+            let picked = gpu_pick.or_else(|| match level {
+                SelectLevel::Face => viewport::pick_face(&mut self.scene, ray)
+                    .map(|hit| PickElement::Face { node: hit.node, face: hit.face }),
                 SelectLevel::Vertex => {
                     let tol = (self.camera.distance * 0.02).max(0.01);
-                    if let Some(hit) =
-                        viewport::pick_vertex(&mut self.scene, ray, self.camera.eye(), tol)
-                    {
+                    viewport::pick_vertex(&mut self.scene, ray, self.camera.eye(), tol)
+                        .map(|hit| PickElement::Vertex { node: hit.node, vertex: hit.vertex })
+                }
+                _ => None,
+            });
+            if let Some(element) = picked {
+                match element {
+                    PickElement::Face { node, face } => {
                         self.selection.clear();
-                        self.selection.select_node(hit.node);
-                        self.selection.select_elements(hit.node, [hit.vertex]);
-                        self.dirty = true;
+                        self.selection.select_node(node);
+                        self.selection.select_elements(node, [face]);
+                    }
+                    PickElement::Vertex { node, vertex } => {
+                        self.selection.clear();
+                        self.selection.select_node(node);
+                        self.selection.select_elements(node, [vertex]);
                     }
                 }
-                _ => {}
+                self.dirty = true;
             }
         }
 
@@ -2412,7 +2454,7 @@ impl OpenForgeApp {
                 if rect.width() < 1.0 || rect.height() < 1.0 {
                     return;
                 }
-                self.handle_viewport_input(ui, rect);
+                self.handle_viewport_input(ui, rect, render_state);
 
                 // Render offscreen with wgpu when a device is available, and
                 // fall back to the CPU painter when it is not. Both paths show
@@ -2808,6 +2850,13 @@ impl OpenForgeApp {
             {
                 self.uv_select_from_faces(id);
             }
+            if ui
+                .add_enabled(selected > 0, egui::Button::new("Island"))
+                .on_hover_text("Select every UV of the islands the selection touches")
+                .clicked()
+            {
+                self.uv_select_island(id);
+            }
         });
 
         ui.horizontal(|ui| {
@@ -2852,13 +2901,26 @@ impl OpenForgeApp {
                     .range(1..=8)
                     .prefix("grid "),
             );
+            // The two packers share this grid but group differently: "Pack"
+            // welds faces by coincident positions (uv_repack), "Pack Islands"
+            // by UV continuity across shared mesh edges (uv_pack_islands).
             if ui
                 .add_enabled(has_uvs, egui::Button::new("Pack"))
-                .on_hover_text("Repack UV islands into a grid atlas")
+                .on_hover_text("Copy-position grid repack")
                 .clicked()
             {
                 let grid = self.uv.grid;
                 self.uv_apply(id, "UV Pack", move |m| m.uv_repack(grid));
+            }
+            if ui
+                .add_enabled(has_uvs, egui::Button::new("Pack Islands"))
+                .on_hover_text("Pack each UV island into its own atlas cell, preserving its layout")
+                .clicked()
+            {
+                let grid = self.uv.grid.max(1);
+                self.uv_apply(id, "UV Pack Islands", move |m| {
+                    m.uv_pack_islands(grid, uv_editor::ISLAND_MARGIN);
+                });
             }
             ui.separator();
             let can_transform = selected > 0;

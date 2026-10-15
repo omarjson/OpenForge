@@ -138,6 +138,47 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 "#
 }
 
+/// Both stages of the ID ("pick") pass, as one module.
+///
+/// The pass draws the scene a second time into a single-channel unsigned
+/// integer target, writing each vertex's element id instead of a color: no
+/// lighting, no texturing, no blending — and the id rides flat, so every
+/// fragment of a triangle reports the same element however it interpolates.
+/// Pair it with [`crate::pick::PickVertex`], whose `@location`s and 16-byte
+/// stride match this module.
+pub fn pick_shader_wgsl() -> &'static str {
+    r#"
+struct PickUniforms {
+    view_proj: mat4x4<f32>,
+};
+
+@group(0) @binding(0) var<uniform> pick: PickUniforms;
+
+struct VsIn {
+    @location(0) position: vec3<f32>,
+    @location(1) id: u32,
+};
+
+struct VsOut {
+    @builtin(position) clip_pos: vec4<f32>,
+    @location(0) @interpolate(flat) id: u32,
+};
+
+@vertex
+fn vs_main(in: VsIn) -> VsOut {
+    var out: VsOut;
+    out.clip_pos = pick.view_proj * vec4<f32>(in.position, 1.0);
+    out.id = in.id;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) u32 {
+    return in.id;
+}
+"#
+}
+
 /// Texture format for the depth attachment, as a wgpu format name.
 pub fn depth_format() -> &'static str {
     "Depth32Float"
@@ -236,6 +277,21 @@ mod tests {
             assert!(vs.contains(location), "vertex stage lost {location}");
             assert!(fs.contains(location), "fragment stage lost {location}");
         }
+    }
+
+    #[test]
+    fn pick_wgsl_carries_the_id_through_flat() {
+        let src = pick_shader_wgsl();
+        assert!(src.contains("@vertex") && src.contains("@fragment"));
+        assert!(src.contains("fn vs_main") && src.contains("fn fs_main"));
+        assert!(src.contains("@location(1) id: u32"));
+        // Flat: an element id may not be blended between vertices.
+        assert!(src.contains("@location(0) @interpolate(flat) id: u32"));
+        assert!(src.contains("out.id = in.id;"));
+        // The target is an integer image, so the fragment stage writes u32.
+        assert!(src.contains("-> @location(0) u32"));
+        assert!(!src.contains("textureSample"), "an id pass samples nothing");
+        assert!(!src.contains("light"), "an id pass is unlit");
     }
 
     #[test]

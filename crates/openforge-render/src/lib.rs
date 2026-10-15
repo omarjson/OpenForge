@@ -16,6 +16,7 @@
 pub mod camera;
 pub mod gpu_types;
 pub mod mesh_upload;
+pub mod pick;
 pub mod pipeline;
 
 #[cfg(feature = "gpu")]
@@ -27,6 +28,7 @@ pub use mesh_upload::{
     build_scene, build_scene_materials, build_scene_with, FaceShading, MeshBuffers, NodeColors,
     NodeMaterials,
 };
+pub use pick::{resolve_patch, PickElement, PickGeometry, PickHit, PickVertex};
 pub use pipeline::{
     color_format, default_pass, depth_format, fragment_shader_wgsl, texture_format,
     vertex_shader_wgsl, CullMode, RenderPassDesc,

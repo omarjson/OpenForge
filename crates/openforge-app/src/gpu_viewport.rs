@@ -11,12 +11,12 @@ use crate::viewport::{self, Camera, OverlayEdge};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
 use openforge_core::scene::Scene;
-use openforge_core::selection::Selection;
+use openforge_core::selection::{SelectLevel, Selection};
 use openforge_render::gpu::{
     linear_from_srgb_u8, supported_samples, FrameStats, GpuRenderer, COLOR_FORMAT, KEY_LIGHT,
     PREFERRED_SAMPLES,
 };
-use openforge_render::{GpuVertex, NodeMaterials, OrbitCamera, TextureLayer};
+use openforge_render::{GpuVertex, NodeMaterials, OrbitCamera, PickElement, TextureLayer};
 use wgpu::FilterMode;
 
 /// Edge length, in texels, of every layer of the GPU texture array.
@@ -25,6 +25,13 @@ use wgpu::FilterMode;
 /// texture to this before handing it over. 256 keeps a library of a dozen
 /// textures under a few megabytes while staying sharp at viewport sizes.
 pub const TEXTURE_LAYER_SIZE: u32 = 256;
+
+/// Cursor radius, in pixels, a GPU pick resolves within.
+///
+/// The ID pass draws mesh vertices as single pixels, so this radius is what
+/// makes a click *near* a vertex land on it; it doubles as the tolerance for
+/// face picks at grazing angles.
+pub const PICK_RADIUS: u32 = 12;
 
 /// The wgpu viewport and the egui handle its image is drawn through.
 pub struct GpuViewport {
@@ -102,6 +109,34 @@ impl GpuViewport {
         );
         (self.texture_id, stats)
     }
+
+    /// Ask the GPU what sits under the pointer, nearest first.
+    ///
+    /// `pos` and `rect` are in egui points, and `scale` is the context's
+    /// `pixels_per_point`: the renderer re-draws the scene the last frame drew
+    /// as element ids, so the answer is exactly what the image shows — an
+    /// occluded vertex, or a face whose back is turned, resolves to nothing.
+    /// An empty result means "nothing there": the caller falls back to its own
+    /// raycast.
+    pub fn pick(
+        &mut self,
+        state: &RenderState,
+        rect: egui::Rect,
+        pos: egui::Pos2,
+        scale: f32,
+        scene: &mut Scene,
+        camera: &OrbitCamera,
+    ) -> Vec<PickElement> {
+        let pixel = pick_pixel(pos, rect, scale, self.renderer.size());
+        self.renderer.pick(
+            &state.device,
+            &state.queue,
+            scene,
+            camera,
+            [pixel[0] as f32, pixel[1] as f32],
+            PICK_RADIUS,
+        )
+    }
 }
 
 /// Convert world-space overlay edges into GPU line vertices for
@@ -142,6 +177,35 @@ pub fn target_size_px(points: [f32; 2]) -> [u32; 2] {
     [w, h]
 }
 
+/// The offscreen pixel a pointer position lands on, clamped into the target.
+///
+/// The frame is rendered at `rect.size() * scale` physical pixels with a
+/// top-left origin, so a pointer's offset from the viewport's own top-left
+/// corner scales straight onto a pixel — no flipping, since both put y down.
+/// A click that lands outside (a stale rect, say) clamps rather than
+/// addressing a texel the pick pass never drew.
+pub fn pick_pixel(pos: egui::Pos2, rect: egui::Rect, scale: f32, size: [u32; 2]) -> [u32; 2] {
+    let scale = if scale.is_finite() && scale > 0.0 { scale } else { 1.0 };
+    let x = ((pos.x - rect.min.x) * scale).floor().max(0.0) as u32;
+    let y = ((pos.y - rect.min.y) * scale).floor().max(0.0) as u32;
+    [x.min(size[0].saturating_sub(1)), y.min(size[1].saturating_sub(1))]
+}
+
+/// The element a click at `level` should take from a pick's hits.
+///
+/// Hits come back nearest first, but a level only accepts what it edits: the
+/// pass draws vertices as points over the faces they lie on, so a face-level
+/// click has to skip past a nearer vertex and a vertex-level click has to skip
+/// the face covering it. Object and edge levels pick nothing here — object
+/// clicks go through the select tool, which owns node picking.
+pub fn chosen_hit(level: SelectLevel, hits: &[PickElement]) -> Option<PickElement> {
+    hits.iter().copied().find(|hit| match (level, hit) {
+        (SelectLevel::Face, PickElement::Face { .. }) => true,
+        (SelectLevel::Vertex, PickElement::Vertex { .. }) => true,
+        _ => false,
+    })
+}
+
 /// Map the app's CPU painter camera onto the GPU camera.
 ///
 /// The two are intentionally separate types (the GPU camera is tuned for clip
@@ -163,6 +227,7 @@ pub fn orbit_camera(camera: &Camera) -> OrbitCamera {
 mod tests {
     use super::*;
     use glam::Vec3;
+    use openforge_core::NodeId;
 
     /// egui_wgpu only accepts this format for `register_native_texture`.
     #[test]
@@ -237,5 +302,50 @@ mod tests {
     #[test]
     fn edge_vertices_are_empty_without_edges() {
         assert!(edge_vertices(&[]).is_empty());
+    }
+
+    #[test]
+    fn pick_pixel_scales_the_pointer_offset_onto_the_target() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(320.0, 240.0));
+        // 1:1: the offset from the viewport's corner is the pixel.
+        assert_eq!(pick_pixel(egui::pos2(110.0, 70.0), rect, 1.0, [320, 240]), [10, 20]);
+        // A 2x display doubles it.
+        assert_eq!(pick_pixel(egui::pos2(110.0, 70.0), rect, 2.0, [640, 480]), [20, 40]);
+        // Sub-pixel positions floor into the pixel they are inside.
+        assert_eq!(pick_pixel(egui::pos2(110.9, 70.9), rect, 1.0, [320, 240]), [10, 20]);
+    }
+
+    #[test]
+    fn pick_pixel_clamps_into_the_target() {
+        let rect = egui::Rect::from_min_size(egui::pos2(100.0, 50.0), egui::vec2(320.0, 240.0));
+        // Outside the viewport (left/above): the first texel.
+        assert_eq!(pick_pixel(egui::pos2(0.0, 0.0), rect, 1.0, [320, 240]), [0, 0]);
+        // Outside on the far side: the last texel, never past the target.
+        assert_eq!(pick_pixel(egui::pos2(900.0, 900.0), rect, 1.0, [320, 240]), [319, 239]);
+        // A scale of zero or NaN must not address a texel outside the target.
+        for scale in [0.0, -3.0, f32::NAN, f32::INFINITY] {
+            let p = pick_pixel(egui::pos2(110.0, 70.0), rect, scale, [320, 240]);
+            assert_eq!(p, [10, 20], "scale {scale}");
+        }
+        // A degenerate target still answers with something addressable.
+        assert_eq!(pick_pixel(egui::pos2(100.0, 50.0), rect, 1.0, [0, 0]), [0, 0]);
+    }
+
+    #[test]
+    fn chosen_hit_skips_elements_the_level_cannot_use() {
+        let face = PickElement::Face { node: NodeId(2), face: 7 };
+        let vertex = PickElement::Vertex { node: NodeId(1), vertex: 3 };
+
+        // A vertex point sits on top of its face: a face click must skip it.
+        assert_eq!(chosen_hit(SelectLevel::Face, &[vertex, face]), Some(face));
+        assert_eq!(chosen_hit(SelectLevel::Vertex, &[face, vertex]), Some(vertex));
+        // A level with no usable hit falls through to the caller's raycast.
+        assert_eq!(chosen_hit(SelectLevel::Vertex, &[face]), None);
+        assert_eq!(chosen_hit(SelectLevel::Face, &[vertex]), None);
+        assert_eq!(chosen_hit(SelectLevel::Face, &[]), None);
+        // Node clicks go through the select tool, and edges are not pickable
+        // yet: neither takes anything from a pick.
+        assert_eq!(chosen_hit(SelectLevel::Object, &[vertex, face]), None);
+        assert_eq!(chosen_hit(SelectLevel::Edge, &[vertex, face]), None);
     }
 }
