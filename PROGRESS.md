@@ -11,24 +11,24 @@ ENGINE
   Modeling ops (extrude, inset, bevel, mirror, weld, deformers) ████████████████░░░░  80%
   Boolean CSG                                          █████████████░░░░░░░  65%
   Generators & algorithms (primitives, Catmull-Clark, noise, L-systems) ████████████████░░░░  80%
-  Materials & textures                                 ████████████░░░░░░░░  60%
+  Materials & textures                                 ██████████████░░░░░░  72%
   Animation (tracks, clips, playback)                  ███████████░░░░░░░░░  55%
   Rigging & skinning                                   ████████████░░░░░░░░  60%
   UV math (project, unwrap, pack, edits)               ████████████████░░░░  80%
 
 APPLICATION SURFACE
-  GPU viewport (depth, shading, grid, gizmo)           ██████████████░░░░░░  70%
+  GPU viewport (depth, shading, grid, gizmo)           ███████████████░░░░░  78%
   Viewport editing UX (gizmos, wireframe, outlines, picking) ███████████████░░░░░  75%
-  UV editor UI                                         ████████░░░░░░░░░░░░  40%
-  Panels & dialogs (outliner, properties, toolbars)    █████████░░░░░░░░░░░  48%
+  UV editor UI                                         ██████████░░░░░░░░░░  50%
+  Panels & dialogs (outliner, properties, toolbars)    ██████████░░░░░░░░░░  51%
   Import/export UX                                     ████████░░░░░░░░░░░░  40%
   Plugin / service host                                ███████░░░░░░░░░░░░░  35%
   Game tooling (LOD, dummies/TXD, vehicles)            █░░░░░░░░░░░░░░░░░░░   5%
 
-  OVERALL (unweighted mean of 16 areas)                ███████████░░░░░░░░░  58%
+  OVERALL (unweighted mean of 16 areas)                ████████████░░░░░░░░  61%
 
-Measured from the repo: 12 crates · 413 test fns · 22303 lines of Rust
-Exact mean of the curated area scores: 58.9% (sum 943 over 16 areas)
+Measured from the repo: 12 crates · 439 test fns · 23747 lines of Rust
+Exact mean of the curated area scores: 61.0% (sum 976 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

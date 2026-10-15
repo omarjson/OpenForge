@@ -20,7 +20,7 @@ The project is a Cargo workspace of twelve crates; these are the main layers:
 |-------|------|-------|
 | `openforge-core` | Scene graph, geometry, editing model | GUI- and renderer-agnostic. Nodes, meshes, selection, undo/redo, interactive tools, ray picking. |
 | `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL. Clean-room readers and writers. |
-| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), and the scene, grid, edge-overlay and axis-gizmo passes. |
+| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, and a material texture array the scene pass samples per face. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, outliner, properties, toolbar, hotkeys. |
 
@@ -122,14 +122,26 @@ A sample GitHub Actions matrix is shown below.
   (marked with a gold cross-hair while the drag is live). Hold **Ctrl** to
   invert snapping for as long as it is held, even mid-drag, and the status bar
   shows the value the drag is snapping to.
+- **Textures.** A material can carry a **diffuse map**: the **Materials** panel
+  picks one from the library (with a thumbnail and a **None** entry), **Load
+  Texture…** imports a PNG or JPEG and maps it onto the material being edited,
+  and **Checker** generates a procedural checkerboard. A **Checker Test** preset
+  ships with a 256px checkerboard, so assigning it to a mesh shows texturing
+  without importing anything. Textured faces are shaded as `texel × material
+  colour` in *both* viewports — on the wgpu path through a texture array the
+  scene pass samples per face, in the CPU fallback through an egui mesh that
+  multiplies the texel by the shaded vertex colour — and the **UV editor** paints
+  the map behind the UVs (toggle it in the Materials panel) with `v = 0` at the
+  bottom of the tile. UVs come from the mesh: the sphere primitive carries
+  spherical UVs, and imports bring their own.
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
 - **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Ctrl+D** duplicates the selection,
   **Delete** removes, **F** frames all.
 - The **Properties** panel renames a node (one undo step per rename) and the
   **Materials** panel lists the library: pick an entry to edit its colour,
-  shininess and opacity, **Assign** it to the selection, or **New** to duplicate
-  it. Assigned meshes are shaded with that material in both viewports. The
-  outliner's checkbox hides a node from the viewport.
+  shininess, opacity and texture, **Assign** it to the selection, or **New** to
+  duplicate it. Assigned meshes are shaded with that material in both viewports.
+  The outliner's checkbox hides a node from the viewport.
 - **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY and STL. Both go
   through the plugin host's filter registry, so a third-party filter for another
   extension needs no change to the app.
@@ -151,15 +163,19 @@ real files to disk and re-imports them for all four formats.
 
 This is a deliberately solid *foundation*, not a feature-complete clone of a
 mature commercial modeler. Sub-element editing, deformers, boolean CSG,
-skeletal skinning, materials, and a **depth-tested `wgpu` viewport** are in;
-what remains is mostly application surface. Natural next steps:
+skeletal skinning, materials, **texture mapping end to end** and a
+**depth-tested `wgpu` viewport** are in; what remains is mostly application
+surface. Natural next steps:
 
 - Gizmo polish: plane and centre handles, and numeric entry for rotation and
   scale (translation already has fields). Snapping is in for the grid and for
   vertices; snapping to edges, faces and midpoints, and snapping during the
   free-form view-plane drag, are still to come.
-- A deeper GPU viewport: a materials-driven shader instead of one Lambert
-  pass, and depth-buffer picking so picking matches exactly what is drawn.
+- A deeper GPU viewport: depth-buffer picking so picking matches exactly what is
+  drawn, then the materials node graph — normal/specular maps and mipmapped
+  sampling on top of the diffuse map that samples today.
+- A deeper UV editor: island-level operations, snapping, and live sync with the
+  3D face selection.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) behind the host seam, which already
   mirrors the study architecture's service/tool/filter split.

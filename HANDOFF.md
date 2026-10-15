@@ -42,22 +42,22 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (413 `#[test]` fns; 415 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (439 `#[test]` fns; 441 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 31 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. |
+| `openforge-core` | 32 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs. |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
-| `openforge-materials` | 27 | Phong/Lambert materials, colors. |
-| `openforge-render` | 61 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, frame stats. |
+| `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
+| `openforge-render` | 70 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 104 (bin) | eframe/egui GUI. `app.rs` (~4100 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-app` | 112 (bin) | eframe/egui GUI. `app.rs` (~4400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel + texture background). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -94,12 +94,34 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   resolves a face to a library slot (an out-of-range index falls back to slot 0).
   Assign a whole node with `Node::assign_material`, named faces with
   `Node::assign_material_to_faces` (it appends the slot to the node's list when
-  new and leaves other faces alone). The renderer only ever receives colours —
-  `NodeColors` (one per node) with `build_scene_with`, or `NodeMaterials` (one
-  per face) with `build_scene_materials`. Both viewport paths must resolve
-  identically: `viewport::collect_triangles` for the CPU painter, the app's
-  `node_materials()` for the GPU path, both through `viewport::material_base`
-  (which folds in the node- and face-selection tints).
+  new and leaves other faces alone). The renderer only ever receives shading —
+  `NodeColors` (one colour per node) with `build_scene_with`, or `NodeMaterials`
+  (one `FaceShading` — colour plus optional texture layer — per face) with
+  `build_scene_materials`. Both viewport paths must resolve identically:
+  `viewport::collect_triangles` for the CPU painter, the app's `node_materials()`
+  for the GPU path, both through `viewport::material_base` (which folds in the
+  node- and face-selection tints) and `viewport::face_texture` (which resolves a
+  face's map, ignoring one the library cannot find).
+- **Textures travel as array layers, and layer 0 is white.** `GpuRenderer`
+  owns one `texture_2d_array` (repeat addressing, linear filtering) plus a
+  sampler; the app hands it `TextureLayer`s through `set_textures`, in library
+  order, starting at array layer 1. Layer 0 is a reserved white texel
+  (`openforge_render::WHITE_LAYER`) that untextured faces name, so the fragment
+  shader has no branch and no derivative non-uniformity: `colour * white` is the
+  old flat shade. A vertex's `tex_layer` (a `f32`, from
+  `FaceShading::layer` via `MeshBuffers`) joins the dedup key, so a textured and
+  an untextured face meeting at a corner keep their own sampling. **Array layers
+  must share one size**, so the app resamples every library texture to
+  `gpu_viewport::TEXTURE_LAYER_SIZE` with `Texture::resized` before upload, on a
+  library *revision* (`texture_epoch`), not per frame.
+- **The CPU painter shades texture the same way, through egui.** A textured face
+  is one `egui::Mesh` (`textured_triangle`) over an `egui::TextureHandle` cached
+  per library texture; egui multiplies the texel by the vertex colour, which is
+  the shaded `material_base` colour, exactly like the shader's
+  `colour * texel * lit`. UVs are passed straight through: egui's texture origin
+  (0,0) is the image's top-left, which is `Texture` row 0, which is `v = 0` —
+  the same convention wgpu samples. Only the **UV editor** flips (`v = 0` at the
+  *bottom* of the tile), because it draws the UV space v-up.
 - **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
   the canvas math and panel state, `app.rs` owns the wiring). See §8 for its
   gotchas: canvas rect construction, the placeholder UV slot, and one undo entry
@@ -154,12 +176,13 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **415 tests pass**, CI green on all 3
-platforms. Ten work-streams are done — the **wgpu viewport** (#1), the
+workspace builds with **0 warnings**, **441 tests pass**, CI green on all 3
+platforms. Eleven work-streams are done — the **wgpu viewport** (#1), the
 **interactive UV editor** (#2), the **transform gizmo** (#3), the **edge
 overlay** (#4), the **sub-object transforms** (#5), **materials** (#6), the
 **plugin host** (#7), the **GPU edge overlay + MSAA** (#8), **per-face
-materials** (#9) and **snapping** (#10) — plus a progress report:
+materials** (#9), **snapping** (#10) and **textures end to end** (#11) — plus a
+progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -425,27 +448,80 @@ materials** (#9) and **snapping** (#10) — plus a progress report:
   a marked vertex of another mesh (checking the marker comes and goes with the
   drag), and the `G` cycle.
 
+- **Textures, end to end** (work-stream #11). `openforge-materials` gained
+  `Texture::resized` (clamped bilinear, same-size copies bit-exact, name kept),
+  and `openforge-core`'s `uv_sphere` now fills its `uvs` with the spherical
+  coordinates it was already computing (with every corner's UV index its
+  position index, so mapping the sphere is a no-op) — before this the default
+  scene had no UVs at all.
+  `openforge-render`: `GpuVertex` grew `tex_layer` (**48 → 52 bytes**, the
+  attribute joins the layout at offset 48 / `@location(4)`, and the *dedup key*,
+  so faces on different maps do not merge); `GpuRenderer::new` now takes the
+  `queue` and reserves **array layer 0 as white**; new
+  `TextureLayer { width, height, rgba }` + `GpuRenderer::set_textures` rebuild
+  the array (and both bind groups that hold its view) and fill every layer
+  white before the caller's pixels go in, so a layer with a missing or
+  mis-sized buffer shades as if it were untextured; the scene pass binds
+  `texture_2d_array<f32>` + a filtering sampler and samples with
+  **`textureSampleLevel(..., 0.0)`**, because a per-face layer index is
+  non-uniform control flow and naga rejects `textureSample` there. `NodeMaterials`
+  now stores a `FaceShading { color, layer: Option<usize> }` per face
+  (`Texture::flat`/`textured`, `From<[f32; 4]>`), and `MeshBuffers` gained
+  `build_with_face_shading` (the colour-only `build_with_face_colors` delegates
+  to it).
+  The app resolves each face's map through one shared rule
+  (`viewport::face_texture`, which ignores a map pointing at a texture the
+  library no longer holds), resamples the library to 256² layers on a
+  `texture_epoch` revision and uploads them, paints textured faces in the CPU
+  viewport as `egui::Mesh` triangles (`textured_triangle`, one cached
+  `TextureHandle` per library texture), paints the material's texture behind
+  the UV editor's tile (`v = 0` at the tile's *bottom*, matching the v-up UV
+  space, with a light quarter-grid over it), and grew the Materials panel a
+  texture picker (with a 20px thumbnail), **Load Texture…** (rfd, PNG/JPEG) and
+  **Checker** (a procedural checkerboard), plus a "Checker Test" preset that
+  ships a 256px checkerboard so texturing can be seen without importing
+  anything. Slot 0 stays untextured.
+- **26 new tests**: 1 in `openforge-core` (the sphere's UVs),
+  8 in `openforge-materials` (`resized`: upscale corners/palette, bit-exact
+  same-size, checkerboard downscale, stretch, solid, zero size, empty source,
+  name), 9 in `openforge-render` (the layer offset and its dedup behaviour,
+  `WHITE_LAYER` for flat faces, per-face layers through `build_scene_materials`,
+  the 52-byte vertex, the two stages' varying locations, plus an
+  adapter-guarded **GPU readback test**: a cube with two 1×1 textures — a red
+  and a green layer — shows *both* pure channels and neither hue without the
+  maps), and 8 in `openforge-app`: the shared `face_texture` rule (including a
+  dangling map and an out-of-range slot), UVs on collected triangles, both paths
+  seeing the texture, the epoch/layer-size invariants, a failed import changing
+  nothing, mapping onto the panel material feeding the UV editor,
+  `textured_triangle`'s mesh, and the UV editor's background quad with its v
+  orientation.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **415 pass, 0 failures**
+build too); `cargo test --workspace` → **441 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
-behind the UV canvas, the side panels, the snapping gestures and now the plugin
-seam are all covered *without* a display: the `app.rs` test module runs the real
+behind the UV canvas, the side panels, the snapping gestures, the plugin
+seam and now texture sampling on both paths are all covered *without* a
+display: the `app.rs` test module runs the real
 `handle_central_viewport` / `handle_side_panels` against a plain
 `egui::Context` with synthetic pointer events and asserts on both the gesture
 (hover, grab, axis-constrained drag, release, undo) and the shapes the frame
 painted, and on what the host did (import/export through a filter, a plugin's
-filter taking effect, a rejected plugin changing nothing).
+filter taking effect, a rejected plugin changing nothing). The texture sampling
+itself is proven by a headless GPU readback (red and green layers on a cube
+show both hues, neither without the maps) rather than by eye.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
 path** (assign one face a different material and confirm the two paths agree
-visually), and the **snapping feedback** (the gold marker on the vertex a drag
+visually), the **snapping feedback** (the gold marker on the vertex a drag
 is about to land on, the live status readout, and Ctrl switching snapping on and
-off mid-drag) — the agent has no display access, so a human should
-look at all of those once. (An earlier session did launch the app on the wgpu
-path and saw `eframe: ... Using wgpu.` with a Metal adapter, no `egui_wgpu`
-warnings and no panic over a 12 s run.)
+off mid-drag), and the **textured look** (the checker preset on a sphere, the
+texture picker and its thumbnail, the UV editor's texture background and
+whether the two viewports agree on orientation) — the agent has no display
+access, so a human should look at all of those once. (An earlier session did
+launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
+adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
 `rustfmt` is not installed for this toolchain, so formatting was matched by hand.
 `cargo clippy -- -D warnings` still trips on **pre-existing** lints
 in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
@@ -453,19 +529,18 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **58.9%**, which the overall bar shows as 58%). The engine
+16 curated areas is **61.0%**, which the overall bar shows as 61%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
-implementations, with materials shading per face on both paths as of #9 and the
-gizmo snapping as of #10. Prioritized next steps:
+implementations, with materials shading per face on both paths as of #9, the
+gizmo snapping as of #10 and textures sampling on both paths as of #11.
+Prioritized next steps:
 
 1. **Deepen the GPU viewport** (still the best next value). MSAA, the
-   depth-tested edge overlay and **per-face material shading** (work-stream #9)
-   are in; what remains of the editor surface is **depth-buffer picking** so
-   sub-object picking matches exactly what is drawn (an ID pass, or a depth read
-   aligned with the CPU raycast). The shading itself is still flat colour +
-   Lambert with no texture sampling — that is the material node graph in item 6.
-   All additive to `GpuRenderer`.
+   depth-tested edge overlay, per-face material shading (#9) and texture
+   sampling (#11) are in; what remains of the editor surface is **depth-buffer
+   picking** so sub-object picking matches exactly what is drawn (an ID pass, or
+   a depth read aligned with the CPU raycast).
 2. **Extend the gizmo further** (`gizmo.rs`, all additive): plane and centre
    handles, and numeric entry for rotation/scale (translation already has
    DragValues in Properties). Snapping landed in #10 but is deliberately partial:
@@ -475,9 +550,10 @@ gizmo snapping as of #10. Prioritized next steps:
    during free drags too. (Sub-object pivots are done: a vertex/face-level drag
    moves only its own geometry, via `gizmo::Targets` +
    `viewport::element_centroid`.)
-3. **Deepen the UV editor.** No texture background yet, no island-level ops
-   (weld/split/mirror), no snapping, and the 3D face selection is pushed into
-   the UV selection on demand rather than staying in sync.
+3. **Deepen the UV editor.** The texture background landed in #11; still
+   missing: island-level ops (weld/split/mirror), snapping, per-face map
+   assignment from the canvas, and the 3D face selection staying in sync with
+   the UV selection rather than being pushed on demand.
 4. **Deepen the plugin host.** The host is in and the app goes through it, but
    three pieces are still hard-wired: tools are chosen through the app's
    `ActiveTool` enum rather than by walking `host.tool_entries()`, a `Service`
@@ -486,10 +562,11 @@ gizmo snapping as of #10. Prioritized next steps:
    runtime is the real prize. That is the long road to true parity.
 5. **IO expansion.** Add COLLADA/DAE, OFF, or ASCII FBX (open subsets) to widen
    format coverage beyond the current 4.
-6. **Materials node editor.** Replace basic Phong/Lambert with a node graph, and
-   sample textures in the shader (the library already has textures; neither
-   viewport samples them yet). Per-face material assignment — the reason slots
-   exist per face — landed in #9.
+6. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
+   The GPU scene pass now samples a **diffuse** map (#11); normal, specular and
+   emissive maps, per-face map assignment and mipmapped/anisotropic sampling are
+   the remaining pieces. Per-face material assignment — the reason slots exist
+   per face — landed in #9.
 
 **Honest gap to parity:** game-specific tooling (vehicles, LOD, dummies/TXD),
 the full panel/dialog surface, and exact format breadth remain the largest
@@ -534,7 +611,34 @@ deltas and are many work-streams, not one push.
   owns the canvas math (`v` grows *upward*; UV↔canvas mapping, picking, rubber
   band) and the panel state; `app.rs` owns the wiring and pushes committed
   edits through `with_edit`. A live drag mutates directly and pushes **one**
-  undo entry on release, the same rule the 3D transforms follow.
+  undo entry on release, the same rule the 3D transforms follow. Its texture
+  background follows the selected mesh's material, falling back to the material
+  the Materials panel is editing, and `draw_canvas` takes it as an
+  `Option<egui::TextureId>` — a canvas without one paints the plain dark tile.
+- **A texture array's layers share one size, and its sampler needs a level.**
+  Three things bite when wiring textures into the GPU pass: (a) array layers
+  must all be the same dimensions, so the app resamples through
+  `Texture::resized` before `set_textures` — a mismatched layer is filled white
+  rather than failing; (b) `textureSample` (no level) inside a branch or with a
+  per-face array index is a **derivative-uniformity** error in naga, which
+  rejects the shader at pipeline creation — use `textureSampleLevel(..., 0.0)`;
+  (c) `set_textures` changes the array's *view*, so every bind group holding it
+  must be rebuilt (the uniform buffers stay), and the app must not upload per
+  frame — it uploads on a `texture_epoch` revision.
+- **One UV convention, two places that flip it.** `Texture` row 0 is `v = 0`;
+  wgpu samples uv `(0, 0)` as texel `(0, 0)`, and egui's texture space has
+  `(0, 0)` at the *top-left* — which is also row 0. So the CPU painter and the
+  GPU pass both pass UVs straight through, and only the **UV editor** flips
+  (`Rect::from_min_max(pos2(0.0, 1.0), pos2(1.0, 0.0))`), because it draws the
+  UV space `v`-up like every modelling app. `painter.image` and `Shape::Mesh`
+  are both `Shape::Mesh` under the hood — that is how the tests see them.
+- **`GpuVertex` changes ripple into every vertex constructor and the dedup
+  key.** `tex_layer` (offset 48, 4 bytes, `@location(4)`) is read by *all four*
+  pipelines from one shared vertex buffer, so grid/edge/gizmo vertices simply
+  name `WHITE_LAYER` (0.0) and are unaffected; forgetting a `size_of` assertion
+  is what the layout test guards. Material layers join the dedup key, or two
+  faces on different maps merge their shared corners and one of them samples
+  the wrong texture.
 - **The gizmo is hit-tested in *screen* space and grabbed on the *press*.**
   Two consequences, both easy to get wrong: (a) take the grab on the frame the
   button goes down — by the time egui reports `drag_started` the cursor has
