@@ -140,6 +140,40 @@ impl PickGeometry {
         self.elements.is_empty()
     }
 
+    /// Every element found in a read-back ID patch, for rectangle selection.
+    ///
+    /// Unlike [`resolve_patch`], which answers "what is under the cursor", a
+    /// rectangle asks "what is anywhere under it": distances do not matter and
+    /// neither does where in the patch an id showed up. Ids are taken once
+    /// each and answered in element-table order — ascending ids, the order
+    /// [`build`] wrote them in — which makes the result deterministic whatever
+    /// the pass rasterized and in whatever order the patch holds the ids.
+    ///
+    /// `patch` is row-major and tightly packed: `width * height` ids, `0` for
+    /// nothing. A zero-sized or short patch resolves to nothing, and so does
+    /// an id past the table (`0` is the clear value, never an element).
+    ///
+    /// [`build`]: PickGeometry::build
+    pub fn elements_in_patch(&self, patch: &[u32], width: u32, height: u32) -> Vec<PickElement> {
+        let (w, h) = (width as usize, height as usize);
+        if w == 0 || h == 0 || patch.len() < w * h {
+            return Vec::new();
+        }
+        // One slot per id: index 0 is the clear value, nothing marks it.
+        let mut seen = vec![false; self.elements.len() + 1];
+        let mut ids: Vec<u32> = Vec::new();
+        for &id in &patch[..w * h] {
+            let slot = id as usize;
+            if slot == 0 || slot >= seen.len() || seen[slot] {
+                continue;
+            }
+            seen[slot] = true;
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids.into_iter().filter_map(|id| self.element(id)).collect()
+    }
+
     /// Append an element and return its 1-based id, so `0` stays reserved for
     /// "no element here".
     fn push_element(&mut self, element: PickElement) -> u32 {
@@ -396,5 +430,69 @@ mod tests {
         // An out-of-bounds centre is clamped, not trusted.
         let hits = resolve_patch(&patch, 2, 2, [9, 9]);
         assert_eq!(hits[0].id, 2);
+    }
+
+    #[test]
+    fn a_rectangle_finds_every_element_under_it_once() {
+        let mut scene = Scene::new();
+        let node = scene.create_mesh("quad", unit_quad());
+        let geo = PickGeometry::build(&mut scene);
+
+        // Row-major, so the vertex id is seen before the face id: the result
+        // still comes back in table order (face first, it was pushed first).
+        let patch = [
+            0, 4, 0,
+            0, 1, 0,
+            1, 0, 0,
+        ];
+        let found = geo.elements_in_patch(&patch, 3, 3);
+        assert_eq!(found, vec![
+            PickElement::Face { node, face: 0 },
+            PickElement::Vertex { node, vertex: 2 },
+        ]);
+    }
+
+    #[test]
+    fn clear_values_and_unknown_ids_fall_out_of_a_rectangle() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", unit_quad());
+        let geo = PickGeometry::build(&mut scene);
+
+        // 0 is the clear value; 99 is past the five-element table.
+        let patch = [0u32; 9];
+        assert!(geo.elements_in_patch(&patch, 3, 3).is_empty());
+        let patch = [99, 0, 99, 0, 99, 0, 99, 0, 99];
+        assert!(geo.elements_in_patch(&patch, 3, 3).is_empty());
+    }
+
+    #[test]
+    fn a_short_or_empty_rectangle_resolves_to_nothing() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", unit_quad());
+        let geo = PickGeometry::build(&mut scene);
+
+        assert!(geo.elements_in_patch(&[], 0, 0).is_empty());
+        assert!(geo.elements_in_patch(&[], 2, 2).is_empty(), "short buffer");
+        assert!(geo.elements_in_patch(&[1, 1, 1], 2, 2).is_empty(), "short buffer");
+        assert!(PickGeometry::default().elements_in_patch(&[1], 1, 1).is_empty());
+    }
+
+    #[test]
+    fn a_rectangle_answers_in_element_table_order_not_patch_order() {
+        let mut scene = Scene::new();
+        let node = scene.create_mesh("quad", unit_quad());
+        let geo = PickGeometry::build(&mut scene);
+
+        // Vertex ids 5 (index 3), 3 (index 1), 2 (index 0) and the face id 1
+        // appear in that order in the patch; they come back indices ascending,
+        // with the face that was pushed before any of them first of all.
+        let patch = [0u32, 1, 5, 0, 3, 2];
+        let found = geo.elements_in_patch(&patch, 3, 2);
+        assert_eq!(found, vec![
+            PickElement::Face { node, face: 0 },
+            PickElement::Vertex { node, vertex: 0 },
+            PickElement::Vertex { node, vertex: 1 },
+            PickElement::Vertex { node, vertex: 3 },
+        ]);
     }
 }

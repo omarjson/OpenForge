@@ -37,7 +37,7 @@ use crate::pick::{resolve_patch, PickElement, PickGeometry, PickVertex};
 use crate::pipeline::{self, CullMode};
 use glam::{Mat4, Vec3, Vec4};
 use openforge_core::scene::Scene;
-use openforge_core::selection::Selection;
+use openforge_core::selection::{SelectLevel, Selection};
 use wgpu::util::DeviceExt;
 
 /// Depth format of the offscreen pass.
@@ -922,9 +922,108 @@ impl GpuRenderer {
         cursor: [f32; 2],
         radius: u32,
     ) -> Vec<PickElement> {
+        // The patch around the cursor, clipped to the target: at the edges it
+        // shrinks, and the cursor is no longer at its middle.
+        let cx = (cursor[0].floor().max(0.0) as u32).min(self.size[0] - 1);
+        let cy = (cursor[1].floor().max(0.0) as u32).min(self.size[1] - 1);
+        let radius = radius.min(MAX_PICK_RADIUS);
+        let rect = [
+            cx.saturating_sub(radius),
+            cy.saturating_sub(radius),
+            (cx + radius + 1).min(self.size[0]),
+            (cy + radius + 1).min(self.size[1]),
+        ];
+        let Some((geometry, ids)) = self.read_id_rect(device, queue, scene, camera, rect, true)
+        else {
+            return Vec::new();
+        };
+        resolve_patch(
+            &ids,
+            rect[2] - rect[0],
+            rect[3] - rect[1],
+            [cx - rect[0], cy - rect[1]],
+        )
+        .into_iter()
+        .filter_map(|hit| geometry.element(hit.id))
+        .collect()
+    }
+
+    /// Re-draw `scene` as element ids and resolve every element inside an
+    /// offscreen pixel rectangle `[x0, y0, x1, y1]` (top-left origin,
+    /// half-open like every wgpu extent).
+    ///
+    /// This is the rectangle-selection counterpart of [`Self::pick`]: the same
+    /// pass with the same depth test and culling, but what comes back is every
+    /// distinct element anywhere in the rectangle, in element-table order —
+    /// distance to the middle means nothing to a rectangle. The result is
+    /// filtered to what the level can select, exactly like [`Self::pick`]'s
+    /// hits are: vertex elements for `Vertex`, face elements (and the vertex
+    /// pixels that put a node in the rectangle) for `Object`, face elements
+    /// alone for `Face`, nothing for `Edge`.
+    ///
+    /// A face rectangle draws no vertex points: they are 1-pixel dots sitting
+    /// on their own face, and a pixel hole in the face at every vertex would
+    /// be the one way the picture and the pick could disagree.
+    pub fn pick_rect(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &mut Scene,
+        camera: &OrbitCamera,
+        rect: [u32; 4],
+        level: SelectLevel,
+    ) -> Vec<PickElement> {
+        // No edge pass exists, so an edge rectangle is empty by definition.
+        if matches!(level, SelectLevel::Edge) {
+            return Vec::new();
+        }
+        let rect = [
+            rect[0].min(self.size[0]),
+            rect[1].min(self.size[1]),
+            rect[2].min(self.size[0]),
+            rect[3].min(self.size[1]),
+        ];
+        let with_points = !matches!(level, SelectLevel::Face);
+        let Some((geometry, ids)) =
+            self.read_id_rect(device, queue, scene, camera, rect, with_points)
+        else {
+            return Vec::new();
+        };
+        let elements = geometry.elements_in_patch(&ids, rect[2] - rect[0], rect[3] - rect[1]);
+        elements
+            .into_iter()
+            .filter(|element| match level {
+                SelectLevel::Vertex => matches!(element, PickElement::Vertex { .. }),
+                // An object rectangle keeps both kinds: the app only needs the
+                // node, and the CPU fallback answers with positions too.
+                SelectLevel::Object => true,
+                SelectLevel::Face => matches!(element, PickElement::Face { .. }),
+                SelectLevel::Edge => false,
+            })
+            .collect()
+    }
+
+    /// Draw the ID pass for `scene` once and read the half-open rectangle
+    /// `[x0, y0, x1, y1]` back out of it as tightly packed ids.
+    ///
+    /// `None` when the scene has nothing to pick or the rectangle is empty:
+    /// neither is worth touching the GPU for.
+    fn read_id_rect(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        scene: &mut Scene,
+        camera: &OrbitCamera,
+        rect: [u32; 4],
+        with_points: bool,
+    ) -> Option<(PickGeometry, Vec<u32>)> {
+        let (x0, y0, x1, y1) = (rect[0], rect[1], rect[2], rect[3]);
+        if x1 <= x0 || y1 <= y0 {
+            return None;
+        }
         let geometry = PickGeometry::build(scene);
         if geometry.is_empty() {
-            return Vec::new();
+            return None;
         }
 
         let size = self.size;
@@ -935,15 +1034,6 @@ impl GpuRenderer {
             bytemuck::bytes_of(&camera.view_proj(aspect).to_cols_array()),
         );
 
-        // The patch around the cursor, clipped to the target: at the edges it
-        // shrinks, and the cursor is no longer at its middle.
-        let cx = (cursor[0].floor().max(0.0) as u32).min(size[0] - 1);
-        let cy = (cursor[1].floor().max(0.0) as u32).min(size[1] - 1);
-        let radius = radius.min(MAX_PICK_RADIUS);
-        let x0 = cx.saturating_sub(radius);
-        let y0 = cy.saturating_sub(radius);
-        let x1 = (cx + radius + 1).min(size[0]);
-        let y1 = (cy + radius + 1).min(size[1]);
         let patch = [x1 - x0, y1 - y0];
         let row_bytes = pick_row_bytes(patch[0]);
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -962,10 +1052,12 @@ impl GpuRenderer {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
-        let points = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("openforge-pick-point-vertices"),
-            contents: bytemuck::cast_slice(&geometry.points),
-            usage: wgpu::BufferUsages::VERTEX,
+        let points = with_points.then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("openforge-pick-point-vertices"),
+                contents: bytemuck::cast_slice(&geometry.points),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
         });
 
         self.ensure_pick_target(device);
@@ -1002,9 +1094,11 @@ impl GpuRenderer {
                 pass.draw(0..geometry.triangles.len() as u32, 0..1);
             }
             // Points come last, so a vertex pixel wins over the face under it.
-            pass.set_pipeline(&self.pick_point_pipeline);
-            pass.set_vertex_buffer(0, points.slice(..));
-            pass.draw(0..geometry.points.len() as u32, 0..1);
+            if let Some(buffer) = &points {
+                pass.set_pipeline(&self.pick_point_pipeline);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..geometry.points.len() as u32, 0..1);
+            }
         }
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
@@ -1043,10 +1137,7 @@ impl GpuRenderer {
         drop(data);
         readback.unmap();
 
-        resolve_patch(&ids, patch[0], patch[1], [cx - x0, cy - y0])
-            .into_iter()
-            .filter_map(|hit| geometry.element(hit.id))
-            .collect()
+        Some((geometry, ids))
     }
 
     /// Make sure the ID pass's attachments match the current viewport size,
@@ -2289,6 +2380,130 @@ mod tests {
         assert!(
             hits.contains(&PickElement::Face { node: quad, face: 0 }),
             "the face behind the vertex should still resolve: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn a_face_rectangle_finds_what_the_frame_shows() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU rectangle test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let front = scene.create_mesh("front", unit_quad());
+        let back = scene.create_mesh("back", unit_quad());
+        scene.get_mut(front).unwrap().set_translation(Vec3::new(0.0, 0.0, 0.5));
+        scene.get_mut(back).unwrap().set_translation(Vec3::new(0.0, 0.0, -0.5));
+        let camera = front_camera();
+
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let all = [0, 0, TARGET, TARGET];
+
+        // Over the whole viewport the frame shows one of the two quads, so
+        // one face is all a rectangle may select.
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Face);
+        assert_eq!(hits, vec![PickElement::Face { node: front, face: 0 }]);
+
+        // A corner rectangle, clear of both quads, selects nothing.
+        let corner = [0, 0, 8, 8];
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, corner, SelectLevel::Face);
+        assert!(hits.is_empty(), "empty space selected {hits:?}");
+
+        // A rectangle of no width, or one inside out, never reaches the pass.
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, [4, 4, 4, 20], SelectLevel::Face);
+        assert!(hits.is_empty());
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, [20, 20, 4, 4], SelectLevel::Face);
+        assert!(hits.is_empty());
+
+        // Hiding the near node lets the rectangle see the far one instead.
+        scene.get_mut(front).unwrap().visible = false;
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Face);
+        assert_eq!(hits, vec![PickElement::Face { node: back, face: 0 }]);
+
+        // There is no edge pass, so an edge rectangle is empty by definition.
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn a_face_rectangle_is_not_punched_through_by_its_own_vertices() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU rectangle test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let quad = scene.create_mesh("quad", unit_quad());
+        let camera = front_camera();
+
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let size = renderer.size();
+
+        // A small rectangle around the quad's (-1,-1) corner. The vertex point
+        // pass draws one pixel there; a face rectangle must still find the
+        // face, not a one-pixel hole in it.
+        let corner = pixel_of(&camera, size, Vec3::new(-1.0, -1.0, 0.0));
+        let x = corner[0].floor().max(0.0) as u32;
+        let y = corner[1].floor().max(0.0) as u32;
+        let around = [x.saturating_sub(1), y.saturating_sub(1), x + 2, y + 2];
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, around, SelectLevel::Face);
+        assert_eq!(
+            hits,
+            vec![PickElement::Face { node: quad, face: 0 }],
+            "the vertex point must not punch a hole in the face"
+        );
+
+        // The same rectangle at vertex level finds the corner vertex, and
+        // answers with vertices alone: the face pixels are only there to hide
+        // the vertices the frame does not show.
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, around, SelectLevel::Vertex);
+        assert!(
+            hits.contains(&PickElement::Vertex { node: quad, vertex: 0 }),
+            "the corner vertex is not in {hits:?}"
+        );
+        assert!(
+            hits.iter().all(|e| matches!(e, PickElement::Vertex { .. })),
+            "a vertex rectangle must not answer with faces: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn a_vertex_rectangle_finds_only_the_vertices_the_frame_shows() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU rectangle test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let quad = scene.create_mesh("quad", unit_quad());
+        let loose = scene.create_mesh("loose", lone_vertex());
+        scene.get_mut(loose).unwrap().set_translation(Vec3::new(0.0, 0.0, -1.0));
+        let camera = front_camera();
+
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let all = [0, 0, TARGET, TARGET];
+
+        // The quad's four vertices are inside the rectangle; the loose one
+        // sits behind the quad's face, which the frame draws over it.
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
+        for vertex in 0..4 {
+            assert!(
+                hits.contains(&PickElement::Vertex { node: quad, vertex }),
+                "vertex {vertex} is missing from {hits:?}"
+            );
+        }
+        assert!(
+            hits.iter().all(|e| !matches!(e, PickElement::Vertex { node, .. } if *node == loose)),
+            "an occluded vertex was selected: {hits:?}"
+        );
+
+        // In front of the quad it is drawn, so it is inside the rectangle.
+        scene.get_mut(loose).unwrap().set_translation(Vec3::new(0.0, 0.0, 1.0));
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
+        assert!(
+            hits.contains(&PickElement::Vertex { node: loose, vertex: 0 }),
+            "a visible vertex must be selected: {hits:?}"
         );
     }
 }
