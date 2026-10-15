@@ -17,8 +17,8 @@ ENGINE
   UV math (project, unwrap, pack, edits)               █████████████████░░░  85%
 
 APPLICATION SURFACE
-  GPU viewport (depth, shading, grid, gizmo)           ████████████████░░░░  84%
-  Viewport editing UX (gizmos, wireframe, outlines, picking) ███████████████░░░░░  79%
+  GPU viewport (depth, shading, grid, gizmo)           █████████████████░░░  85%
+  Viewport editing UX (gizmos, wireframe, outlines, picking) █████████████████░░░  85%
   UV editor UI                                         ███████████░░░░░░░░░  58%
   Panels & dialogs (outliner, properties, toolbars)    ██████████░░░░░░░░░░  51%
   Import/export UX                                     ████████░░░░░░░░░░░░  40%
@@ -27,8 +27,8 @@ APPLICATION SURFACE
 
   OVERALL (unweighted mean of 16 areas)                ████████████░░░░░░░░  62%
 
-Measured from the repo: 12 crates · 486 test fns · 25761 lines of Rust
-Exact mean of the curated area scores: 62.4% (sum 999 over 16 areas)
+Measured from the repo: 12 crates · 509 test fns · 26875 lines of Rust
+Exact mean of the curated area scores: 62.8% (sum 1006 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

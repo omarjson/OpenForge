@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (486 `#[test]` fns; 488 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (509 `#[test]` fns; 511 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -50,14 +50,14 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
-| `openforge-render` | 91 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
+| `openforge-render` | 98 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking — a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 53 | Planar/cylindrical/spherical/box projections, unwrap, pack, **UV islands by continuity with per-island atlas packing** (`islands.rs`), plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 122 (bin) | eframe/egui GUI. `app.rs` (~4400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping) + `uv_editor.rs` (UV panel, texture background, island selection). |
+| `openforge-app` | 138 (bin) | eframe/egui GUI. `app.rs` (~4600 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -134,6 +134,18 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   occluded vertex stays unpicked and a back-culled face is gone. Ids are
   1-based (`0` is the clear value), a patch is clipped at the viewport edges,
   and its readback rows are padded to wgpu's 256-byte copy alignment. See §8.
+- **Rectangle selection is the Select tool's primary drag** (`app.rs`). The
+  tool's own work is click-driven, so a primary drag never reaches it: the app
+  keeps a live `marquee` rectangle in *absolute screen* positions, paints it
+  over whichever backend drew the frame (`paint_marquee`, beside the gizmo
+  overlay) and resolves it on release — the GPU's ID pass first
+  (`GpuRenderer::pick_rect`, which answers per level), the projection in
+  `viewport::marquee_elements` only on a machine without wgpu. A plain drag
+  replaces the selection and **Shift** extends it; a rectangle the pointer came
+  back from, with no area at all, is resolved as the click it ended as. It
+  starts at the pointer's **press origin**, because egui only calls a press a
+  drag after movement. Nothing here changes the scene, so nothing here is
+  undoable. See §8.
 - **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
   the canvas math and panel state, `app.rs` owns the wiring).
   `uv_editor::island_selection` grows a UV selection to whole islands through
@@ -585,9 +597,75 @@ progress report:
   and 7 in the app (6 `uv_editor::island_selection` cases and the Island
   button's selection path).
 
+- **Rectangle (marquee) selection, through the same ID pass** (work-stream
+  #13). In the **Select** tool a primary drag now draws a rectangle instead of
+  reaching the tool (whose own work is click-driven anyway): the app records the
+  drag's start from egui's **`press_origin`** — egui only calls a press a drag
+  once the pointer has moved, and the position that decided the drag is already
+  a few pixels in — paints the live rectangle over whichever backend drew the
+  frame and resolves it on release. A **plain** rectangle replaces the
+  selection, **Shift** extends it, and a rectangle the pointer came back from
+  (no area at all) is resolved as the click it ended as. Selection is not scene
+  state, so there is nothing to undo.
+
+  - `GpuRenderer::pick_rect(device, queue, scene, camera, rect_px, level)` is
+    the rectangle counterpart of `pick`: the same single-sampled `R32Uint` pass
+    with the same culling and depth test, but the whole half-open pixel
+    rectangle `[x0, y0, x1, y1]` is read back and **every distinct element**
+    inside it comes back — `pick.rs`'s new `PickGeometry::elements_in_patch`
+    takes each id once and answers in element-table order (ascending ids), with
+    `0` and ids past the table skipped and short or empty patches empty. Both
+    `pick` and `pick_rect` now share one `read_id_rect` driver, and the level
+    decides what the pass draws and what it answers: a **face** rectangle leaves
+    the vertex points out entirely — they are 1-px dots sitting on their own
+    face, and a pixel hole in the face at every vertex would be exactly the
+    disagreement the pass exists to prevent — while `Vertex` and `Object`
+    rectangles draw them and keep vertex hits alone (`Vertex`) or both kinds
+    (`Object`, whose caller only needs the node).
+  - The app asks the GPU first and **trusts its answer even when it is empty**:
+    a rectangle over empty space selects nothing, and one that covers no pixel
+    of the target covers no element either — falling back to a projection that
+    selects *through* geometry would contradict the picture the click path
+    obeys. Only a machine with no wgpu backend falls back to
+    `viewport::marquee_elements(scene, vp, size, rect, level)` (a subagent's
+    work, verified here): project each node's positions once and answer per
+    level — `Object` = every position inside, `Vertex` = every position index
+    inside, `Face` = every face with at least one corner inside, `Edge` =
+    nothing — skipping hidden and frozen nodes, inclusive on the rectangle's
+    edges, deterministic. It cannot tell occluded geometry from visible, which
+    is exactly why it is only the fallback.
+  - The status bar now reads out **elements** at sub-object levels
+    ("Select — 12 face(s) selected.") rather than always the node count.
+  - **One test failed honestly and was fixed**: the first multi-node rectangle
+    test assumed `Scene::iter()` yields nodes in insertion order, but
+    `Scene::nodes` is a `HashMap`, so `PickGeometry::build`'s ids follow hash
+    order — stable within a run, not across runs. It was rewritten to pin
+    ascending ids on a single node, where the table order is unambiguous. See
+    §8.
+
+- **23 new tests**: 4 in `openforge-render`'s `pick.rs` (a rectangle finds each
+  element once and in table order; clear values and unknown ids fall out; short
+  or empty patches resolve to nothing, an empty geometry too), 3 adapter-guarded
+  in `gpu.rs` (a face rectangle finds what the frame shows — the near quad, not
+  the one it hides, the far one once the near is hidden, and nothing over empty
+  space, a zero-width rectangle or an `Edge` level; a face rectangle is **not**
+  punched through by its own vertices while the same rectangle at vertex level
+  finds the corner vertex; a vertex rectangle finds only the vertices the frame
+  shows, a loose vertex behind a face excluded until it moves in front), 3 in
+  the app's `gpu_viewport` (`marquee_pixel_rect`: pixel coverage through
+  floor/ceil with the drag's direction normalised, clamping and bad scales,
+  `None` for a click, a NaN corner or a degenerate target), the **10 in
+  `viewport.rs`** the subagent wrote (per-level rules, n-gon faces, hidden and
+  frozen nodes, a position behind the camera, determinism, the edge level,
+  inclusive rectangle edges), and 3 in `app.rs` driving the real gesture with
+  synthetic pointer events: a drag paints its rectangle and selects the faces
+  inside it but not the ones outside, Shift extends while a plain rectangle
+  replaces, and an object-level rectangle takes exactly the node it holds (and
+  lets go of it over empty space).
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **488 pass, 0 failures**
+build too); `cargo test --workspace` → **511 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -602,7 +680,13 @@ show both hues, neither without the maps) rather than by eye. Sub-object
 picking is proven the same way: `pick.rs` resolves patches with no GPU at all,
 a headless readback witnesses a cube's front face while a vertex hidden behind
 it never appears in the patch, and the app's per-level rules (`chosen_hit`) are
-asserted directly.
+asserted directly. Rectangle selection is covered the same way: the pure
+resolution in `pick.rs`, the pass itself through adapter-guarded readbacks
+(including that a face rectangle is not punched through by its own vertex
+points and that a vertex rectangle excludes what a face hides), the pixel
+mapping and per-level filtering in `gpu_viewport`, and the gesture end to end
+in `app.rs` — press, drag, painted rectangle, release, selection — on the CPU
+path.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -613,10 +697,14 @@ off mid-drag), and the **textured look** (the checker preset on a sphere, the
 texture picker and its thumbnail, the UV editor's texture background and
 whether the two viewports agree on orientation), plus the **GPU pick** (click a
 vertex hidden behind a face: the face behind should take the click, never the
-hidden vertex; face clicks on a vertex must still take the face) and the
+hidden vertex; face clicks on a vertex must still take the face), the
 **Island / Pack Islands buttons** (Island should light up a whole island, Pack
-Islands should leave each island in its own cell with a gutter) — the agent has no display
-access, so a human should look at all of those once. (An earlier session did
+Islands should leave each island in its own cell with a gutter) and the
+**rectangle selection in the live app** (drag a box in the Select tool: the
+rectangle should follow the pointer, Shift should add to the selection rather
+than replace it, and the wgpu path's answer — which the headless tests can only
+prove through a readback — should match what the image shows) — the agent has no
+display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
 `rustfmt` is not installed for this toolchain, so formatting was matched by hand.
@@ -626,22 +714,23 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **62%**). The engine
+16 curated areas is **62.8%**, shown as 62%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
-gizmo snapping as of #10, textures sampling on both paths as of #11 and
-sub-object picking that matches the drawn frame (plus UV islands) as of #12.
+gizmo snapping as of #10, textures sampling on both paths as of #11,
+sub-object picking that matches the drawn frame (plus UV islands) as of #12 and
+rectangle selection through that same pass as of #13.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
-   material shading (#9), texture sampling (#11) and now occlusion-exact
-   sub-object picking through an ID pass (#12) are in. What remains of the
-   editor surface: **box/marquee selection** (drag a rectangle and select what
-   it covers — the per-pixel raycast cannot express it, the ID pass can) and
-   **edge-level picking** (line geometry in the ID pass, on top of a stable
-   per-node edge enumeration). Beyond that: shadowing / ambient occlusion and a
-   configurable shading mode.
+   material shading (#9), texture sampling (#11), occlusion-exact sub-object
+   picking (#12) and rectangle selection (#13) are in. What remains of the
+   editor surface: **edge-level picking** (line geometry in the ID pass, on top
+   of a stable per-node edge enumeration — the one level the pick pass still
+   cannot answer, and therefore the one the rectangle cannot select either) and
+   the selection *tools* around it (isolate/hide, select-through toggle).
+   Beyond that: shadowing / ambient occlusion and a configurable shading mode.
 2. **Extend the gizmo further** (`gizmo.rs`, all additive): plane and centre
    handles, and numeric entry for rotation/scale (translation already has
    DragValues in Properties). Snapping landed in #10 but is deliberately partial:
@@ -788,6 +877,37 @@ deltas and are many work-streams, not one push.
   silently do nothing (or nothing is undoable). Likewise reach `on_pointer_up`
   on `drag_stopped()` alone — gating it on `dragged_by(Primary)` never fires on
   the release frame.
+- **A drag's rectangle starts at the pointer's `press_origin`, not at the
+  position that started the drag.** egui only calls a press a drag once the
+  pointer has moved past `max_click_dist`, so on that frame `drag_started` is
+  true but the pointer is already several pixels from where the button went
+  down — a marquee built from it misses the corner the user drew. Read
+  `ui.input(|i| i.pointer.press_origin())` inside the `drag_started` branch
+  (falling back to the current position); it is `Some` for as long as a button
+  is down. And a rectangle only lives while the button does: drop it on the
+  first frame where no button is down and no `drag_stopped` arrived, or a lost
+  release leaves it painted forever.
+- **`Scene::nodes` is a `HashMap`, so `Scene::iter()` is not insertion order.**
+  Anything built by walking a scene (`PickGeometry::build`'s element ids, the
+  CPU painter's draw order) follows hash order, which is stable for the life of
+  the map but **differs between runs**. Never assert node order in a test
+  across two nodes; assert per-node order (ascending ids/indices) or compare
+  sets. A test that got this wrong failed one run in three.
+- **A face rectangle must not draw the vertex points.** The ID pass normally
+  draws 1-px point sprites for vertices on top of their faces (since a vertex
+  lies exactly on the surface, its pipeline uses `LessEqual`); a rectangle
+  asking for *faces* has to skip the point pass entirely, or every vertex
+  punches a one-pixel hole in its own face and a rectangle over that pixel
+  could miss the face the image plainly shows. `pick_rect` does that off the
+  `level`. The app also **trusts an empty GPU answer**: a rectangle over empty
+  space selects nothing, and falling back to the select-through CPU projection
+  there would contradict the picture.
+- **`Pos2 - Pos2` is a `Vec2` in emath 0.29, and `Rect - Vec2` is not a thing**
+  (the `Sub` impl on `Rect` takes a `Margin`, so it shrinks rather than moves).
+  To move a rect into viewport-local space, build both corners with `pos2(x -
+  offset.x, y - offset.y)`, and note that the CPU fallback wants *local* points
+  while the GPU path wants *offscreen pixels* — the scale and the viewport rect
+  are separate conversions (`marquee_pixel_rect`).
 - **`Stroke::color` is a `ColorMode`, not a `Color32`, in egui 0.29.** A test
   that inspects painted shapes must compare against
   `egui::epaint::ColorMode::Solid(colour)`.

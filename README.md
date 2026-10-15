@@ -20,7 +20,7 @@ The project is a Cargo workspace of twelve crates; these are the main layers:
 |-------|------|-------|
 | `openforge-core` | Scene graph, geometry, editing model | GUI- and renderer-agnostic. Nodes, meshes, selection, undo/redo, interactive tools, ray picking. |
 | `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL. Clean-room readers and writers. |
-| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per face, and an ID pass that resolves clicks against exactly what the frame drew. |
+| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per face, and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. |
 
@@ -121,6 +121,14 @@ A sample GitHub Actions matrix is shown below.
   picked: a vertex hidden behind a surface stays unpicked, and a face whose back
   is turned is skipped. The CPU raycast takes over when there is no GPU backend,
   or when nothing was under the cursor.
+- **Rectangle selection.** With the Select tool, dragging draws a rectangle
+  (the same overlay style as the gizmo) and on release everything inside it is
+  selected — through the same ID pass, so only what the frame shows there is
+  taken and occluded geometry is left out. A plain drag replaces the selection
+  and **Shift + drag** adds to it; the status bar reads out the element count at
+  Vertex and Face level. A rectangle dragged out and back with no area at all
+  counts as the click it ended as. Off the wgpu backend the fallback projects
+  the geometry instead — and, unlike the pass, it cannot tell what is hidden.
 - **Snapping** (toolbar **Snap:**, or **G** to cycle Off → Grid → Vertex): a
   gizmo drag then lands on grid values — where the grabbed point *ends up*, not
   how far it travelled — with rotations and scales stepping too; in **Vertex**
@@ -176,17 +184,18 @@ real files to disk and re-imports them for all four formats.
 This is a deliberately solid *foundation*, not a feature-complete clone of a
 mature commercial modeler. Sub-element editing, deformers, boolean CSG,
 skeletal skinning, materials, **texture mapping end to end**,
-**occlusion-exact sub-object picking** and a **depth-tested `wgpu` viewport** are
-in; what remains is mostly application surface. Natural next steps:
+**occlusion-exact sub-object picking and rectangle selection** and a
+**depth-tested `wgpu` viewport** are in; what remains is mostly application
+surface. Natural next steps:
 
 - Gizmo polish: plane and centre handles, and numeric entry for rotation and
   scale (translation already has fields). Snapping is in for the grid and for
   vertices; snapping to edges, faces and midpoints, and snapping during the
   free-form view-plane drag, are still to come.
-- A deeper GPU viewport: marquee selection and edge-level picking on top of the
-  ID pass that already resolves faces and vertices exactly as drawn, then the
-  materials node graph — normal/specular maps and mipmapped sampling on top of
-  the diffuse map that samples today.
+- A deeper GPU viewport: edge-level picking on top of the ID pass that already
+  resolves faces, vertices — and now rectangles of them — exactly as drawn,
+  then the materials node graph — normal/specular maps and mipmapped sampling
+  on top of the diffuse map that samples today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.
