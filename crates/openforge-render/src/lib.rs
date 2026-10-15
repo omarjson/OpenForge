@@ -23,7 +23,9 @@ pub mod gpu;
 
 pub use camera::OrbitCamera;
 pub use gpu_types::{FrameUniforms, GpuVertex};
-pub use mesh_upload::{build_scene, build_scene_with, MeshBuffers, NodeColors};
+pub use mesh_upload::{
+    build_scene, build_scene_materials, build_scene_with, MeshBuffers, NodeColors, NodeMaterials,
+};
 pub use pipeline::{
     color_format, default_pass, depth_format, fragment_shader_wgsl, vertex_shader_wgsl, CullMode,
     RenderPassDesc,

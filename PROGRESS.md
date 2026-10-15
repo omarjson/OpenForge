@@ -11,13 +11,13 @@ ENGINE
   Modeling ops (extrude, inset, bevel, mirror, weld, deformers) ████████████████░░░░  80%
   Boolean CSG                                          █████████████░░░░░░░  65%
   Generators & algorithms (primitives, Catmull-Clark, noise, L-systems) ████████████████░░░░  80%
-  Materials & textures                                 ███████████░░░░░░░░░  55%
+  Materials & textures                                 ████████████░░░░░░░░  60%
   Animation (tracks, clips, playback)                  ███████████░░░░░░░░░  55%
   Rigging & skinning                                   ████████████░░░░░░░░  60%
   UV math (project, unwrap, pack, edits)               ████████████████░░░░  80%
 
 APPLICATION SURFACE
-  GPU viewport (depth, shading, grid, gizmo)           █████████████░░░░░░░  68%
+  GPU viewport (depth, shading, grid, gizmo)           ██████████████░░░░░░  70%
   Viewport editing UX (gizmos, wireframe, outlines, picking) ██████████████░░░░░░  70%
   UV editor UI                                         ████████░░░░░░░░░░░░  40%
   Panels & dialogs (outliner, properties, toolbars)    █████████░░░░░░░░░░░  48%
@@ -27,7 +27,7 @@ APPLICATION SURFACE
 
   OVERALL (unweighted mean of 16 areas)                ███████████░░░░░░░░░  58%
 
-Measured from the repo: 12 crates · 383 test fns · 20930 lines of Rust
+Measured from the repo: 12 crates · 393 test fns · 21356 lines of Rust
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

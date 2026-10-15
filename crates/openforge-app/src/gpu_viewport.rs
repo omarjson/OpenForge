@@ -16,7 +16,7 @@ use openforge_render::gpu::{
     linear_from_srgb_u8, supported_samples, FrameStats, GpuRenderer, COLOR_FORMAT, KEY_LIGHT,
     PREFERRED_SAMPLES,
 };
-use openforge_render::{GpuVertex, NodeColors, OrbitCamera};
+use openforge_render::{GpuVertex, NodeMaterials, OrbitCamera};
 use wgpu::FilterMode;
 
 /// The wgpu viewport and the egui handle its image is drawn through.
@@ -57,7 +57,7 @@ impl GpuViewport {
         size: [f32; 2],
         scene: &mut Scene,
         selection: &Selection,
-        colors: &NodeColors,
+        materials: &NodeMaterials,
         camera: &OrbitCamera,
         time: f32,
         edges: &[GpuVertex],
@@ -78,7 +78,7 @@ impl GpuViewport {
             &state.queue,
             scene,
             selection,
-            colors,
+            materials,
             camera,
             time,
             edges,

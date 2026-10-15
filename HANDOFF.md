@@ -42,22 +42,22 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (383 `#[test]` fns; 385 tests run, all green)
+## 4. Repo layout — 12 crates (393 `#[test]` fns; 395 tests run, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 28 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. |
+| `openforge-core` | 31 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 27 | Phong/Lambert materials, colors. |
-| `openforge-render` | 55 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, frame stats. |
+| `openforge-render` | 60 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 83 (bin) | eframe/egui GUI. `app.rs` (~3600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-app` | 85 (bin) | eframe/egui GUI. `app.rs` (~3600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -88,6 +88,18 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   only format `egui_wgpu` accepts for native textures) and the shaders write
   *linear* colour. Anything authored as sRGB bytes must go through
   `openforge_render::gpu::linear_from_srgb_u8`; clear colours likewise.
+- **Materials are resolved by the app, never by the renderer.** A mesh carries a
+  slot list (`NodeKind::Mesh::material_slots`) and each face indexes it
+  (`Face::material`); `Node::face_material_slot(face)` is the one place that
+  resolves a face to a library slot (an out-of-range index falls back to slot 0).
+  Assign a whole node with `Node::assign_material`, named faces with
+  `Node::assign_material_to_faces` (it appends the slot to the node's list when
+  new and leaves other faces alone). The renderer only ever receives colours —
+  `NodeColors` (one per node) with `build_scene_with`, or `NodeMaterials` (one
+  per face) with `build_scene_materials`. Both viewport paths must resolve
+  identically: `viewport::collect_triangles` for the CPU painter, the app's
+  `node_materials()` for the GPU path, both through `viewport::material_base`
+  (which folds in the node- and face-selection tints).
 - **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
   the canvas math and panel state, `app.rs` owns the wiring). See §8 for its
   gotchas: canvas rect construction, the placeholder UV slot, and one undo entry
@@ -131,12 +143,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **385 tests pass**, CI green on all 3
-platforms. Eight work-streams are done — the **wgpu viewport** (#1), the
+workspace builds with **0 warnings**, **395 tests pass**, CI green on all 3
+platforms. Nine work-streams are done — the **wgpu viewport** (#1), the
 **interactive UV editor** (#2), the **transform gizmo** (#3), the **edge
 overlay** (#4), the **sub-object transforms** (#5), **materials** (#6), the
-**plugin host** (#7) and the **GPU edge overlay + MSAA** (#8) — plus a
-progress report:
+**plugin host** (#7), the **GPU edge overlay + MSAA** (#8) and **per-face
+materials** (#9) — plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -283,7 +295,10 @@ progress report:
   tints it towards the selection colours, so selection still reads on a meshed
   material. The **GPU path** gets a colour per node: `openforge-render` gained
   `NodeColors` and `build_scene_with`, because the renderer knows nothing about
-  materials — the app resolves them and passes linear colours in.
+  materials — the app resolves them and passes linear colours in. (Superseded by
+  work-stream #9 below: the GPU path now takes a colour *per face* through
+  `NodeMaterials`/`build_scene_materials`, and `NodeColors` remains for callers
+  that want one colour for a whole node.)
 - **The panels do more than report.** Rename (one undo step for the whole edit,
   snapshotted when the field takes focus, not one per keystroke), a visibility
   checkbox per outliner row, the material read-out in Properties, and **Ctrl+D**
@@ -319,9 +334,41 @@ progress report:
   case). The existing edge-overlay smoke test also asserts the new line pass: a
   warm line floats clear of the cube, `draws` goes to 4 and the pixels arrive.
 
+- **Materials shade per face on the GPU too, and faces can now be assigned
+  one.** Work-stream #6 could *resolve* a face's slot but nothing could ever
+  produce a multi-slot node, and the GPU path ignored the slot entirely (it
+  shaded the node with its first face's material). Both halves are closed:
+  - `MeshBuffers::build_with_face_colors(mesh, world, face_color)` resolves a
+    colour per face and puts it in the dedup key — corners shared by faces of
+    different colours become separate vertices, coincident corners of one colour
+    still collapse, so `build` (one colour) keeps its old output exactly.
+    `NodeMaterials` + `build_scene_materials` are the scene-level seam, mirroring
+    `NodeColors`/`build_scene_with`; both now share one private walk
+    (`build_scene_per_face`) that resolves a colour per (node, face) and falls
+    back to the selection tint / default grey. The app's
+    `node_materials()` mirrors `collect_triangles`: it resolves each face's slot,
+    node selection and **face selection** tint, and hands the renderer one linear
+    RGBA per face — so the GPU path now matches the CPU path face for face.
+  - `Node::assign_material_to_faces(faces, slot)` points *named* faces at a slot
+    and leaves the rest alone, appending the slot to the node's list when it is
+    new and reusing the entry when it is not; it returns whether anything moved
+    (out-of-range faces, empty lists and already-correct faces are all no-ops).
+    The app exposes it as **Assign to Faces** in the Materials panel, enabled
+    only at Face level with a face selection, as one undo entry ("Assign Material
+    to Faces") and none at all for a no-op.
+- **10 new tests**: 3 in `openforge-core` (per-face assignment leaves the other
+  faces alone and appends the slot once; the no-change cases — unassigned faces
+  on slot 0, an out-of-range face, an empty list; non-mesh nodes are no-ops),
+  5 in `openforge-render` (per-face colours reach the vertices while one colour
+  still dedups; `NodeMaterials` addressing; scene resolution per face; the
+  per-face and per-node fallbacks) and 2 in `openforge-app`
+  (`node_materials()` resolves per face with the slot's linear colour untouched
+  by selection, and a face override shows up as a second colour, survives undo;
+  the command refuses at Object level and pushes no undo for a no-op).
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **385 pass, 0 failures**
+build too); `cargo test --workspace` → **395 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels and now the plugin seam are all covered
 *without* a display: the `app.rs` test module runs the real
@@ -331,8 +378,10 @@ behind the UV canvas, the side panels and now the plugin seam are all covered
 painted, and on what the host did (import/export through a filter, a plugin's
 filter taking effect, a rejected plugin changing nothing).
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
-the new Plugins panel, and the GPU edge overlay by eye (its depth-tested look
-and the MSAA smoothing) — the agent has no display access, so a human should
+the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
+and the MSAA smoothing), and now the **per-face material shading on the GPU
+path** (assign one face a different material and confirm the two paths agree
+visually) — the agent has no display access, so a human should
 look at all of those once. (An earlier session did launch the app on the wgpu
 path and saw `eframe: ... Using wgpu.` with a Metal adapter, no `egui_wgpu`
 warnings and no panic over a 12 s run.)
@@ -342,18 +391,20 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 (`collapsible_if`, …): untouched here, and not part of CI.
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
-the per-area bars (`scripts/progress.sh --write` regenerates it). The engine
+the per-area bars (`scripts/progress.sh --write` regenerates it; the unweighted
+mean of the 16 curated areas is **58%**). The engine
 layer is essentially done, and the two largest application-surface gaps — the
-GPU viewport and the UV editor — now have real implementations. Prioritized
+GPU viewport and the UV editor — now have real implementations, with materials
+shading per face on both paths as of #9. Prioritized
 next steps:
 
-1. **Deepen the GPU viewport** (still the best next value). MSAA and the
-   depth-tested edge overlay are in; what remains of the editor surface is a
-   materials-driven shader (today the GPU path shades one colour per node — the
-   first face's material — while the CPU path resolves the slot per face) and
-   depth-buffer picking so sub-object picking matches exactly what is drawn
-   (an ID pass, or a depth read aligned with the CPU raycast). All additive to
-   `GpuRenderer`.
+1. **Deepen the GPU viewport** (still the best next value). MSAA, the
+   depth-tested edge overlay and **per-face material shading** (work-stream #9)
+   are in; what remains of the editor surface is **depth-buffer picking** so
+   sub-object picking matches exactly what is drawn (an ID pass, or a depth read
+   aligned with the CPU raycast). The shading itself is still flat colour +
+   Lambert with no texture sampling — that is the material node graph in item 6.
+   All additive to `GpuRenderer`.
 2. **Extend the gizmo** (`gizmo.rs`, all additive): plane and centre handles,
    snapping, and numeric entry. (Sub-object pivots are done: a vertex/face-level
    drag moves only its own geometry, via `gizmo::Targets` +
@@ -369,7 +420,10 @@ next steps:
    runtime is the real prize. That is the long road to true parity.
 5. **IO expansion.** Add COLLADA/DAE, OFF, or ASCII FBX (open subsets) to widen
    format coverage beyond the current 4.
-6. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
+6. **Materials node editor.** Replace basic Phong/Lambert with a node graph, and
+   sample textures in the shader (the library already has textures; neither
+   viewport samples them yet). Per-face material assignment — the reason slots
+   exist per face — landed in #9.
 
 **Honest gap to parity:** game-specific tooling (vehicles, LOD, dummies/TXD),
 the full panel/dialog surface, and exact format breadth remain the largest

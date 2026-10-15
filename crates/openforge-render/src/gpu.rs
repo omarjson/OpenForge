@@ -26,7 +26,7 @@
 
 use crate::camera::OrbitCamera;
 use crate::gpu_types::{FrameUniforms, GpuVertex};
-use crate::mesh_upload::{build_scene_with, MeshBuffers, NodeColors};
+use crate::mesh_upload::{build_scene_materials, MeshBuffers, NodeMaterials};
 use crate::pipeline::{self, CullMode};
 use glam::{Mat4, Vec3, Vec4};
 use openforge_core::scene::Scene;
@@ -583,12 +583,12 @@ impl GpuRenderer {
         queue: &wgpu::Queue,
         scene: &mut Scene,
         selection: &Selection,
-        colors: &NodeColors,
+        materials: &NodeMaterials,
         camera: &OrbitCamera,
         time: f32,
         edges: &[GpuVertex],
     ) -> FrameStats {
-        self.upload(device, queue, scene, selection, colors);
+        self.upload(device, queue, scene, selection, materials);
         self.upload_edges(device, queue, edges);
         self.write_uniforms(queue, camera, time);
 
@@ -610,9 +610,9 @@ impl GpuRenderer {
         queue: &wgpu::Queue,
         scene: &mut Scene,
         selection: &Selection,
-        colors: &NodeColors,
+        materials: &NodeMaterials,
     ) {
-        let (parts, _bounds) = build_scene_with(scene, selection, colors);
+        let (parts, _bounds) = build_scene_materials(scene, selection, materials);
         let mut merged = MeshBuffers::default();
         for part in &parts {
             merged.append(part);
@@ -1189,7 +1189,7 @@ mod tests {
         // 1. The cube renders: some pixels are lit geometry, the rest are the
         //    dark background (plus the grid, which never reaches this
         //    brightness).
-        let stats = renderer.render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0, &[]);
+        let stats = renderer.render(&device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
         assert!(stats.indices > 0 && stats.indices.is_multiple_of(3), "{stats:?}");
         assert_eq!(stats.draws, 3);
         let pixels = read_pixels(&device, &queue, &renderer);
@@ -1203,7 +1203,7 @@ mod tests {
         if let Ok(node) = scene.get_mut(cube) {
             node.visible = false;
         }
-        renderer.render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0, &[]);
+        renderer.render(&device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
         let hidden = read_pixels(&device, &queue, &renderer);
         assert_eq!(
             bright_neutral_pixels(&hidden, renderer.size()),
@@ -1219,7 +1219,7 @@ mod tests {
         let mut selection = Selection::new();
         selection.select_node(cube);
         renderer
-            .render(&device, &queue, &mut scene, &selection, &NodeColors::default(), &camera, 0.0, &[]);
+            .render(&device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
         let selected = read_pixels(&device, &queue, &renderer);
         assert!(
             orange_pixels(&selected, renderer.size()) > 0,
@@ -1231,7 +1231,7 @@ mod tests {
         //    floating clear of the cube shows up, and the stats count the
         //    extra draw.
         let unselected = Selection::new();
-        renderer.render(&device, &queue, &mut scene, &unselected, &NodeColors::default(), &camera, 0.0, &[]);
+        renderer.render(&device, &queue, &mut scene, &unselected, &NodeMaterials::default(), &camera, 0.0, &[]);
         let plain = read_pixels(&device, &queue, &renderer);
         assert_eq!(orange_pixels(&plain, renderer.size()), 0, "edge test baseline is tinted");
         // Below the cube and clear of its body from the default camera, so
@@ -1243,7 +1243,7 @@ mod tests {
             GpuVertex::new(Vec3::new(0.5, -1.5, 0.0), n, [0.0, 0.0], warm),
         ];
         let stats = renderer
-            .render(&device, &queue, &mut scene, &unselected, &NodeColors::default(), &camera, 0.0, &line);
+            .render(&device, &queue, &mut scene, &unselected, &NodeMaterials::default(), &camera, 0.0, &line);
         assert_eq!(stats.draws, 4, "the edge pass is its own draw");
         let edged = read_pixels(&device, &queue, &renderer);
         assert!(
@@ -1298,7 +1298,7 @@ mod tests {
             &queue,
             &mut scene,
             &Selection::new(),
-            &NodeColors::default(),
+            &NodeMaterials::default(),
             &camera,
             0.0,
             &[],

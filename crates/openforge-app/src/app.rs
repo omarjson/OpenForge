@@ -20,7 +20,7 @@ use openforge_core::NodeId;
 use openforge_ops::MeshOps;
 use openforge_materials::{Material, MaterialLibrary};
 use openforge_plugin::PluginHost;
-use openforge_render::{FrameStats, NodeColors};
+use openforge_render::{FrameStats, NodeMaterials};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
 use std::path::PathBuf;
@@ -735,28 +735,37 @@ impl OpenForgeApp {
         )
     }
 
-    /// Base colours for the GPU path, resolved from the material library.
+    /// One base colour per face for the GPU path, resolved from the material
+    /// library.
     ///
-    /// `openforge-render` knows nothing about materials, so the app hands it a
-    /// colour per node in linear space (the offscreen target is sRGB and the
-    /// shader works in linear). The GPU path colours per node, so a mesh using
-    /// several slots is drawn with its first face's material; the CPU path
-    /// resolves the slot per face.
-    fn node_colors(&self) -> NodeColors {
-        let mut colors = NodeColors::new();
+    /// `openforge-render` knows nothing about materials, so the app resolves
+    /// each face's slot (plus the node/face selection tint) into a linear RGB —
+    /// the offscreen target is sRGB and the shader works in linear — and hands
+    /// the renderer the whole list. The GPU path therefore shades per face
+    /// exactly like the CPU path, including meshes that mix several slots.
+    fn node_materials(&self) -> NodeMaterials {
+        let mut materials = NodeMaterials::new();
         for node in self.scene.iter().filter(|n| n.is_mesh()) {
             let selected = self.selection.is_node_selected(node.id);
-            let base = viewport::material_base(
-                self.materials.resolve(node.face_material_slot(0)),
-                selected,
-                false,
-            );
-            colors = colors.with(
-                node.id,
-                openforge_render::gpu::linear_from_srgb_u8([base[0], base[1], base[2]]),
-            );
+            let sel_faces = self.selection.selected_elements(node.id).cloned();
+            let Some(mesh) = node.mesh() else { continue };
+            let faces: Vec<[f32; 4]> = (0..mesh.faces.len())
+                .map(|face| {
+                    let face_selected = sel_faces
+                        .as_ref()
+                        .map(|s| s.contains(&(face as u32)))
+                        .unwrap_or(false);
+                    let base = viewport::material_base(
+                        self.materials.resolve(node.face_material_slot(face)),
+                        selected,
+                        face_selected,
+                    );
+                    openforge_render::gpu::linear_from_srgb_u8([base[0], base[1], base[2]])
+                })
+                .collect();
+            materials = materials.with_faces(node.id, faces);
         }
-        colors
+        materials
     }
 
     // --- Materials -----------------------------------------------------------------
@@ -781,6 +790,62 @@ impl OpenForgeApp {
         });
         let name = self.materials.resolve(slot).name.clone();
         self.status = format!("Assigned \"{name}\" to {} node(s).", self.selection.node_count());
+    }
+
+    /// Assign a library material to the selected faces of every mesh node,
+    /// leaving each node's other faces on the material they already had.
+    ///
+    /// This is the sub-object counterpart of
+    /// [`assign_material_to_selection`](Self::assign_material_to_selection): a
+    /// mesh can carry several materials at once, resolved per face by both
+    /// viewport paths.
+    fn assign_material_to_faces(&mut self, slot: u32) {
+        if self.selection.level != SelectLevel::Face || self.selection.total_element_count() == 0 {
+            self.status = "Switch to Face level and select faces.".into();
+            return;
+        }
+        // Only the faces that would actually change, so a no-op assignment
+        // does not push an undo entry.
+        let targets: Vec<(NodeId, Vec<u32>)> = self
+            .selection
+            .selected_nodes()
+            .filter_map(|id| {
+                let node = self.scene.get(id).ok()?;
+                let faces: Vec<u32> = self
+                    .selection
+                    .selected_elements(id)?
+                    .iter()
+                    .copied()
+                    .filter(|&f| node.face_material_slot(f as usize) != slot)
+                    .collect();
+                if faces.is_empty() {
+                    None
+                } else {
+                    Some((id, faces))
+                }
+            })
+            .collect();
+        if targets.is_empty() {
+            self.status = "Those faces already use that material.".into();
+            return;
+        }
+        let name = self.materials.resolve(slot).name.clone();
+        let mut changed = 0;
+        self.with_edit("Assign Material to Faces", |app| {
+            for (id, faces) in &targets {
+                if let Ok(node) = app.scene.get_mut(*id) {
+                    if node.assign_material_to_faces(faces, slot) {
+                        changed += 1;
+                    }
+                }
+            }
+        });
+        let faces = targets.iter().map(|(_, f)| f.len()).sum::<usize>();
+        if changed == 0 {
+            self.status = "Select a mesh node to assign a material to.".into();
+        } else {
+            self.status = format!("Assigned \"{name}\" to {faces} face(s).");
+        }
     }
 
     /// Whether any mesh node in the scene uses `slot`.
@@ -1775,6 +1840,18 @@ impl OpenForgeApp {
             {
                 self.assign_material_to_selection(self.current_material as u32);
             }
+            let face_level = self.selection.level == SelectLevel::Face
+                && self.selection.total_element_count() > 0;
+            if ui
+                .add_enabled(face_level, egui::Button::new("Assign to Faces"))
+                .on_hover_text(
+                    "Assign the selected material to the selected faces, keeping the \
+                     rest of the mesh on its current material",
+                )
+                .clicked()
+            {
+                self.assign_material_to_faces(self.current_material as u32);
+            }
             if ui
                 .button("New")
                 .on_hover_text("Duplicate the selected material")
@@ -1920,11 +1997,11 @@ impl OpenForgeApp {
                 // fall back to the CPU painter when it is not. Both paths show
                 // the same scene through the same camera state, so the only
                 // difference is shading quality and depth correctness.
-                // The per-node colours have to be resolved before `gpu` is
+                // The per-face colours have to be resolved before `gpu` is
                 // borrowed mutably, and only the GPU path needs them.
                 let colors = match (render_state, self.gpu.is_some()) {
-                    (Some(_), true) => self.node_colors(),
-                    _ => NodeColors::new(),
+                    (Some(_), true) => self.node_materials(),
+                    _ => NodeMaterials::new(),
                 };
                 let rendered = match (render_state, self.gpu.as_mut()) {
                     (Some(state), Some(gpu)) => {
@@ -3339,12 +3416,78 @@ mod tests {
         app.assign_material_to_selection(2);
         let srgba = viewport::material_base(app.materials.resolve(2), true, false);
         let expected = openforge_render::gpu::linear_from_srgb_u8([srgba[0], srgba[1], srgba[2]]);
-        let colors = app.node_colors();
-        assert_eq!(colors.len(), 1, "one entry per mesh node");
-        let got = colors.get(id).expect("the node's colour");
-        for (a, b) in got.iter().zip(&expected) {
-            assert!((a - b).abs() < 1e-6, "{got:?} vs {expected:?}");
+        let materials = app.node_materials();
+        assert_eq!(materials.len(), 1, "one entry per mesh node");
+        let got = materials.faces(id).expect("the node's colours");
+        assert!(!got.is_empty(), "one colour per face");
+        for color in got {
+            for (a, b) in color.iter().zip(&expected) {
+                assert!((a - b).abs() < 1e-6, "{color:?} vs {expected:?}");
+            }
         }
+    }
+
+    /// The GPU path's linear colour for a library slot, untinted.
+    fn slot_linear(app: &OpenForgeApp, slot: u32) -> [f32; 4] {
+        let srgb = viewport::material_base(app.materials.resolve(slot), false, false);
+        openforge_render::gpu::linear_from_srgb_u8([srgb[0], srgb[1], srgb[2]])
+    }
+
+    #[test]
+    fn per_face_materials_reach_the_gpu_path_per_face() {
+        let (mut app, id) = app_ready_to_move();
+        let face_count = app.scene.get(id).unwrap().mesh().unwrap().faces.len();
+        assert!(face_count >= 2, "the seed mesh has several faces");
+        // A whole-node assignment, then one face overridden with another slot.
+        app.selection.select_node(id);
+        app.assign_material_to_selection(1);
+        app.selection.level = SelectLevel::Face;
+        app.selection.select_elements(id, [1u32]);
+        app.assign_material_to_faces(3);
+        // Drop the selection so the colours below are the plain materials (a
+        // selected node is tinted towards the blue highlight).
+        app.selection.deselect_node(id);
+
+        let clay = slot_linear(&app, 1);
+        let steel = slot_linear(&app, 3);
+        assert_ne!(clay, steel, "the two slots must be visibly different");
+
+        let materials = app.node_materials();
+        let colors = materials.faces(id).expect("the node's colours");
+        assert_eq!(colors.len(), face_count);
+        assert_eq!(colors[0], clay);
+        assert_eq!(colors[1], steel);
+        assert_eq!(colors[2], clay);
+        // The override left a per-face slot on the node, not a whole-node one.
+        assert_eq!(app.scene.get(id).unwrap().face_material_slot(0), 1);
+        assert_eq!(app.scene.get(id).unwrap().face_material_slot(1), 3);
+
+        // Undo puts the node back on the single slot.
+        app.undo_edit();
+        assert_eq!(app.scene.get(id).unwrap().face_material_slot(1), 1);
+        assert_eq!(app.node_materials().faces(id).unwrap()[1], clay);
+    }
+
+    #[test]
+    fn assigning_a_face_material_needs_faces_and_skips_no_ops() {
+        let (mut app, id) = app_ready_to_move();
+        app.selection.select_node(id);
+        app.assign_material_to_selection(2);
+        let undo_len = app.undo.len();
+
+        // Object level: the element indices are vertices, not faces, so refuse.
+        app.selection.level = SelectLevel::Object;
+        app.selection.select_elements(id, [0u32]);
+        app.assign_material_to_faces(4);
+        assert_eq!(app.scene.get(id).unwrap().face_material_slot(0), 2);
+        assert!(app.status.contains("Face level"), "{}", app.status);
+
+        // Face level, but the faces already carry that material: no undo entry.
+        app.selection.level = SelectLevel::Face;
+        app.assign_material_to_faces(2);
+        assert_eq!(app.undo.len(), undo_len, "a no-op must not push undo");
+        assert_eq!(app.undo.undo_label(), Some("Assign Material"));
+        assert!(app.status.contains("already use"), "{}", app.status);
     }
 
     #[test]

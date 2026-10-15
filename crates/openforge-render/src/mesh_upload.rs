@@ -56,13 +56,27 @@ impl MeshBuffers {
     /// `world` and colored with `base_color`.
     ///
     /// Faces are fan-triangulated; vertices are deduplicated by their
-    /// (position, normal, uv) corner triple, so a quad authored with shared
-    /// corners stays four vertices. Authored normals are transformed by the
-    /// inverse-transpose of `world` (correct under non-uniform scale); faces
-    /// without usable normals get flat per-face normals computed from the
+    /// (position, normal, uv, colour) corner quadruple, so a quad authored with
+    /// shared corners stays four vertices. Authored normals are transformed by
+    /// the inverse-transpose of `world` (correct under non-uniform scale);
+    /// faces without usable normals get flat per-face normals computed from the
     /// transformed positions. Invalid faces (out-of-range indices, fewer
     /// than three corners) are skipped rather than panicking.
     pub fn build(mesh: &Mesh, world: Mat4, base_color: [f32; 4]) -> MeshBuffers {
+        Self::build_with_face_colors(mesh, world, |_| base_color)
+    }
+
+    /// [`MeshBuffers::build`] with the colour resolved per face: `face_color(i)`
+    /// returns the RGBA for face `i`.
+    ///
+    /// The colour joins the dedup key, so corners shared by faces of different
+    /// colours become separate vertices and each face keeps its shade, while
+    /// coincident corners of the same colour still collapse.
+    pub fn build_with_face_colors(
+        mesh: &Mesh,
+        world: Mat4,
+        mut face_color: impl FnMut(usize) -> [f32; 4],
+    ) -> MeshBuffers {
         if mesh.is_empty() {
             return MeshBuffers::default();
         }
@@ -75,9 +89,9 @@ impl MeshBuffers {
         };
 
         let mut out = MeshBuffers::default();
-        let mut corner_map: HashMap<(u32, u32, u32), u32> = HashMap::new();
+        let mut corner_map: HashMap<(u32, u32, u32, [u32; 4]), u32> = HashMap::new();
 
-        for face in &mesh.faces {
+        for (face_idx, face) in mesh.faces.iter().enumerate() {
             let cs = &face.corners;
             if cs.len() < 3 {
                 continue;
@@ -85,6 +99,13 @@ impl MeshBuffers {
             if cs.iter().any(|c| c.position as usize >= mesh.positions.len()) {
                 continue;
             }
+            let color = face_color(face_idx);
+            let color_key = [
+                color[0].to_bits(),
+                color[1].to_bits(),
+                color[2].to_bits(),
+                color[3].to_bits(),
+            ];
             // Flat fallback: Newell normal over the face's transformed corners.
             let mut flat = Vec3::ZERO;
             for i in 0..cs.len() {
@@ -97,7 +118,7 @@ impl MeshBuffers {
 
             for i in 1..cs.len() - 1 {
                 for &c in &[cs[0], cs[i], cs[i + 1]] {
-                    let key = (c.position, c.normal, c.uv);
+                    let key = (c.position, c.normal, c.uv, color_key);
                     let idx = *corner_map.entry(key).or_insert_with(|| {
                         let position = world.transform_point3(mesh.positions[c.position as usize]);
                         let normal = match mesh.normals.get(c.normal as usize) {
@@ -105,7 +126,7 @@ impl MeshBuffers {
                             None => flat,
                         };
                         let uv = mesh.uvs.get(c.uv as usize).copied().unwrap_or(Vec2::ZERO);
-                        out.vertices.push(GpuVertex::new(position, normal, uv.to_array(), base_color));
+                        out.vertices.push(GpuVertex::new(position, normal, uv.to_array(), color));
                         (out.vertices.len() - 1) as u32
                     });
                     out.indices.push(idx);
@@ -151,6 +172,50 @@ impl NodeColors {
     }
 }
 
+/// Per-node, per-face colours for [`build_scene_materials`]: the resolved RGBA
+/// of each face, in face order.
+///
+/// Like [`NodeColors`] the renderer stays material-agnostic — a caller that has
+/// a material library resolves each face (its material slot plus any selection
+/// tint) and hands the list in. Nodes with no entry, and faces past the end of
+/// an entry, keep the selection/default colours.
+#[derive(Clone, Debug, Default)]
+pub struct NodeMaterials {
+    faces: HashMap<NodeId, Vec<[f32; 4]>>,
+}
+
+impl NodeMaterials {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set (or replace) a node's per-face colours, returning `self` for
+    /// chaining.
+    #[must_use]
+    pub fn with_faces(mut self, id: NodeId, colors: Vec<[f32; 4]>) -> Self {
+        self.faces.insert(id, colors);
+        self
+    }
+
+    /// The colour of one face, when the node has an entry that reaches it.
+    pub fn face_color(&self, id: NodeId, face: usize) -> Option<[f32; 4]> {
+        self.faces.get(&id).and_then(|v| v.get(face)).copied()
+    }
+
+    /// A node's whole per-face list, when it has one.
+    pub fn faces(&self, id: NodeId) -> Option<&[[f32; 4]]> {
+        self.faces.get(&id).map(Vec::as_slice)
+    }
+
+    pub fn len(&self) -> usize {
+        self.faces.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.faces.is_empty()
+    }
+}
+
 /// Build buffers for every visible mesh node in `scene`, tinting selected
 /// nodes with [`SELECTION_COLOR`] and everything else with
 /// [`DEFAULT_BASE_COLOR`]. Returns the buffers plus the combined world-space
@@ -167,6 +232,29 @@ pub fn build_scene_with(
     selection: &Selection,
     colors: &NodeColors,
 ) -> (Vec<MeshBuffers>, Aabb) {
+    build_scene_per_face(scene, selection, |id, _face| colors.get(id))
+}
+
+/// [`build_scene`] with a caller-supplied colour per face (e.g. each face's
+/// material slot resolved through a library). A face missing from `materials`
+/// falls back to the selection tint when its node is selected and
+/// [`DEFAULT_BASE_COLOR`] otherwise.
+pub fn build_scene_materials(
+    scene: &mut Scene,
+    selection: &Selection,
+    materials: &NodeMaterials,
+) -> (Vec<MeshBuffers>, Aabb) {
+    build_scene_per_face(scene, selection, |id, face| materials.face_color(id, face))
+}
+
+/// Walk `scene`'s visible mesh nodes and build one [`MeshBuffers`] each,
+/// resolving a colour per (node, face). A `None` falls back to the selection
+/// tint for selected nodes and [`DEFAULT_BASE_COLOR`] otherwise.
+fn build_scene_per_face(
+    scene: &mut Scene,
+    selection: &Selection,
+    mut color_of: impl FnMut(NodeId, usize) -> Option<[f32; 4]>,
+) -> (Vec<MeshBuffers>, Aabb) {
     let ids: Vec<NodeId> = scene
         .iter()
         .filter(|n| n.is_mesh() && n.visible)
@@ -178,12 +266,15 @@ pub fn build_scene_with(
         let Ok(world) = scene.world_matrix(id) else { continue };
         let Ok(node) = scene.get(id) else { continue };
         let Some(mesh) = node.mesh() else { continue };
-        let color = colors.get(id).unwrap_or(if selection.is_node_selected(id) {
+        let fallback = if selection.is_node_selected(id) {
             SELECTION_COLOR
         } else {
             DEFAULT_BASE_COLOR
-        });
-        let buf = MeshBuffers::build(mesh, world, color);
+        };
+        let colors: Vec<[f32; 4]> = (0..mesh.faces.len())
+            .map(|face| color_of(id, face).unwrap_or(fallback))
+            .collect();
+        let buf = MeshBuffers::build_with_face_colors(mesh, world, |face| colors[face]);
         bounds.merge(&buf.bounds());
         buffers.push(buf);
     }
@@ -455,5 +546,101 @@ mod tests {
         assert_eq!(buffers.len(), 1);
         assert!(buffers[0].is_empty());
         assert!(bounds.is_empty());
+    }
+
+    /// A quad plus a triangle that reuses its first three corners, so the two
+    /// faces share every corner of the triangle.
+    fn quad_and_triangle() -> Mesh {
+        let mut m = unit_quad();
+        m.add_face(&[0, 1, 2]);
+        m
+    }
+
+    const RED: [f32; 4] = [1.0, 0.0, 0.0, 1.0];
+    const BLUE: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
+    #[test]
+    fn face_colors_reach_each_face() {
+        let mesh = quad_and_triangle();
+        let buf = MeshBuffers::build_with_face_colors(&mesh, Mat4::IDENTITY, |face| {
+            if face == 0 {
+                RED
+            } else {
+                BLUE
+            }
+        });
+        // Faces of different colours may not share vertices, so the quad's four
+        // corners come first and the triangle's three follow.
+        assert_eq!(buf.vertices.len(), 7);
+        assert_eq!(buf.indices.len(), 9);
+        assert!(buf.vertices[..4].iter().all(|v| v.color == RED));
+        assert!(buf.vertices[4..].iter().all(|v| v.color == BLUE));
+    }
+
+    #[test]
+    fn one_face_color_still_deduplicates_shared_corners() {
+        let mesh = quad_and_triangle();
+        let buf = MeshBuffers::build_with_face_colors(&mesh, Mat4::IDENTITY, |_| SELECTION_COLOR);
+        assert_eq!(buf.vertices.len(), 4, "one colour: shared corners collapse");
+        assert_eq!(buf.indices.len(), 9);
+    }
+
+    #[test]
+    fn node_materials_are_addressable_and_chain() {
+        let mut mats = NodeMaterials::new();
+        assert!(mats.is_empty());
+        mats = mats
+            .with_faces(NodeId(1), vec![RED, BLUE])
+            .with_faces(NodeId(2), vec![BLUE]);
+        assert_eq!(mats.len(), 2);
+        assert!(!mats.is_empty());
+        assert_eq!(mats.face_color(NodeId(1), 1), Some(BLUE));
+        assert_eq!(mats.face_color(NodeId(1), 2), None, "past the end");
+        assert_eq!(mats.face_color(NodeId(3), 0), None, "unknown node");
+        assert_eq!(mats.faces(NodeId(2)), Some(&[BLUE][..]));
+        // Overwriting keeps one entry per node.
+        let mats = mats.with_faces(NodeId(1), vec![BLUE]);
+        assert_eq!(mats.len(), 2);
+        assert_eq!(mats.face_color(NodeId(1), 0), Some(BLUE));
+        assert_eq!(mats.face_color(NodeId(1), 1), None);
+    }
+
+    #[test]
+    fn build_scene_materials_resolves_each_face() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("two", quad_and_triangle());
+        let (buffers, bounds) = build_scene_materials(
+            &mut scene,
+            &Selection::new(),
+            &NodeMaterials::new().with_faces(id, vec![RED, BLUE]),
+        );
+        let colors: Vec<[f32; 4]> = buffers[0].vertices.iter().map(|v| v.color).collect();
+        assert_eq!(colors.iter().filter(|c| **c == RED).count(), 4, "the quad");
+        assert_eq!(colors.iter().filter(|c| **c == BLUE).count(), 3, "the triangle");
+        assert!(!bounds.is_empty());
+    }
+
+    #[test]
+    fn build_scene_materials_falls_back_per_face_and_per_node() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("two", quad_and_triangle());
+        // Only face 0 is in the table: face 1 keeps the default colour.
+        let (buffers, _) = build_scene_materials(
+            &mut scene,
+            &Selection::new(),
+            &NodeMaterials::new().with_faces(id, vec![RED]),
+        );
+        let colors: Vec<[f32; 4]> = buffers[0].vertices.iter().map(|v| v.color).collect();
+        assert_eq!(colors.iter().filter(|c| **c == RED).count(), 4);
+        assert_eq!(
+            colors.iter().filter(|c| **c == DEFAULT_BASE_COLOR).count(),
+            3
+        );
+
+        // A selected node with no entry at all keeps the selection tint.
+        let mut selection = Selection::new();
+        selection.select_node(id);
+        let (buffers, _) = build_scene_materials(&mut scene, &selection, &NodeMaterials::new());
+        assert!(buffers[0].vertices.iter().all(|v| v.color == SELECTION_COLOR));
     }
 }
