@@ -1252,6 +1252,77 @@ mod tests {
         );
     }
 
+    /// Pixels dominated by a two-channel hue: both `high` channels bright
+    /// against the `low` one. Only a face coloured with a saturated material can
+    /// produce them — the background, the grid's axis lines and the corner gizmo
+    /// are all single-channel (red/green/blue).
+    fn hue_pixels(pixels: &[u8], size: [u32; 2], high: (usize, usize), low: usize) -> usize {
+        (0..(size[0] * size[1]) as usize)
+            .filter(|&i| {
+                let p = &pixels[i * 4..i * 4 + 4];
+                p[3] == 255
+                    && p[high.0] > p[low].saturating_add(40)
+                    && p[high.1] > p[low].saturating_add(40)
+            })
+            .count()
+    }
+
+    #[test]
+    fn per_face_material_colours_reach_the_gpu_per_face() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU per-face material test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let cube = scene.create_mesh("Cube", unit_cube());
+        let selection = Selection::new();
+        let camera = OrbitCamera::default();
+        let mut renderer = GpuRenderer::new(&device, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let size = renderer.size();
+
+        let magenta = linear_from_srgb_u8([255, 20, 255]);
+        let yellow = linear_from_srgb_u8([255, 255, 20]);
+        // Magenta on the ±Z and ±Y faces, yellow on the ±X pair: a cube shows one
+        // face per axis pair however it is viewed, so both colours are in view
+        // from any angle. Neither hue exists anywhere else in the frame, so an
+        // implementation that shaded the whole node with one colour could paint
+        // one of them and never both.
+        let mut faces = vec![magenta; 6];
+        faces[4] = yellow;
+        faces[5] = yellow;
+        renderer.render(
+            &device,
+            &queue,
+            &mut scene,
+            &selection,
+            &NodeMaterials::new().with_faces(cube, faces),
+            &camera,
+            0.0,
+            &[],
+        );
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert!(
+            hue_pixels(&pixels, size, (0, 2), 1) > 0,
+            "no magenta face reached the target"
+        );
+        assert!(
+            hue_pixels(&pixels, size, (0, 1), 2) > 0,
+            "no yellow face reached the target: the node was shaded with one colour"
+        );
+
+        // Control: one colour for the whole node paints no yellow at all, which
+        // is what makes the assertion above about the per-face colours.
+        let all_magenta = NodeMaterials::new().with_faces(cube, vec![magenta; 6]);
+        renderer.render(&device, &queue, &mut scene, &selection, &all_magenta, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert_eq!(
+            hue_pixels(&pixels, size, (0, 1), 2),
+            0,
+            "yellow came from somewhere other than the per-face colours"
+        );
+    }
+
     #[test]
     fn resize_is_clamped_and_a_no_op_when_unchanged() {
         let Some((_adapter, device, _queue)) = headless_device() else {

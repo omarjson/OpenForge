@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (393 `#[test]` fns; 395 tests run, all green)
+## 4. Repo layout — 12 crates (394 `#[test]` fns; 396 tests run, all green)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -50,7 +50,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 27 | Phong/Lambert materials, colors. |
-| `openforge-render` | 60 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, frame stats. |
+| `openforge-render` | 61 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
@@ -143,7 +143,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **395 tests pass**, CI green on all 3
+workspace builds with **0 warnings**, **396 tests pass**, CI green on all 3
 platforms. Nine work-streams are done — the **wgpu viewport** (#1), the
 **interactive UV editor** (#2), the **transform gizmo** (#3), the **edge
 overlay** (#4), the **sub-object transforms** (#5), **materials** (#6), the
@@ -356,19 +356,24 @@ materials** (#9) — plus a progress report:
     The app exposes it as **Assign to Faces** in the Materials panel, enabled
     only at Face level with a face selection, as one undo entry ("Assign Material
     to Faces") and none at all for a no-op.
-- **10 new tests**: 3 in `openforge-core` (per-face assignment leaves the other
+- **11 new tests**: 3 in `openforge-core` (per-face assignment leaves the other
   faces alone and appends the slot once; the no-change cases — unassigned faces
   on slot 0, an out-of-range face, an empty list; non-mesh nodes are no-ops),
-  5 in `openforge-render` (per-face colours reach the vertices while one colour
+  6 in `openforge-render` (per-face colours reach the vertices while one colour
   still dedups; `NodeMaterials` addressing; scene resolution per face; the
-  per-face and per-node fallbacks) and 2 in `openforge-app`
-  (`node_materials()` resolves per face with the slot's linear colour untouched
-  by selection, and a face override shows up as a second colour, survives undo;
-  the command refuses at Object level and pushes no undo for a no-op).
+  per-face and per-node fallbacks; and an **adapter-guarded GPU test** that
+  renders a cube with two saturated hues per face — magenta on the ±Z/±Y pairs,
+  yellow on ±X, so every viewing angle shows both — and asserts both hues reach
+  the target pixels while a single-colour control paints exactly one, which is
+  the regression test for the old "first face's material" shading) and 2 in
+  `openforge-app` (`node_materials()` resolves per face with the slot's linear
+  colour untouched by selection, and a face override shows up as a second
+  colour, survives undo; the command refuses at Object level and pushes no undo
+  for a no-op).
 
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **395 pass, 0 failures**
+build too); `cargo test --workspace` → **396 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels and now the plugin seam are all covered
 *without* a display: the `app.rs` test module runs the real
