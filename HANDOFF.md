@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (439 `#[test]` fns; 441 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (486 `#[test]` fns; 488 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -50,14 +50,14 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
-| `openforge-render` | 70 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, frame stats. |
+| `openforge-render` | 91 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
-| `openforge-uv` | 37 | Planar/cylindrical/spherical/box projections, unwrap, pack, plus per-selection affine edits for the UV editor. |
+| `openforge-uv` | 53 | Planar/cylindrical/spherical/box projections, unwrap, pack, **UV islands by continuity with per-island atlas packing** (`islands.rs`), plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 112 (bin) | eframe/egui GUI. `app.rs` (~4400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel + texture background). |
+| `openforge-app` | 122 (bin) | eframe/egui GUI. `app.rs` (~4400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping) + `uv_editor.rs` (UV panel, texture background, island selection). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -122,10 +122,26 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   (0,0) is the image's top-left, which is `Texture` row 0, which is `v = 0` —
   the same convention wgpu samples. Only the **UV editor** flips (`v = 0` at the
   *bottom* of the tile), because it draws the UV space v-up.
+- **Sub-object picking is a GPU ID pass first, the CPU raycast second.** A
+  face/vertex-level click in the wgpu viewport goes through `GpuRenderer::pick`
+  (`pick.rs` owns the geometry, the element table and the patch maths — no wgpu
+  types, so all of it is headless-testable; the pass itself lives in `gpu.rs`)
+  and only falls back to `viewport::pick_face` / `viewport::pick_vertex` when
+  there is no wgpu backend or the patch holds nothing the current level can use
+  (`gpu_viewport::chosen_hit`). The pass draws the frame's own geometry with the
+  frame's culling and depth test into a separate, single-sampled `R32Uint`
+  target, so a click can never land on something the image does not show — an
+  occluded vertex stays unpicked and a back-culled face is gone. Ids are
+  1-based (`0` is the clear value), a patch is clipped at the viewport edges,
+  and its readback rows are padded to wgpu's 256-byte copy alignment. See §8.
 - **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
-  the canvas math and panel state, `app.rs` owns the wiring). See §8 for its
-  gotchas: canvas rect construction, the placeholder UV slot, and one undo entry
-  per drag.
+  the canvas math and panel state, `app.rs` owns the wiring).
+  `uv_editor::island_selection` grows a UV selection to whole islands through
+  the uv crate's partition, and the **Pack Islands** button calls
+  `uv_pack_islands` (islands by UV *continuity*) while **Pack** is the older
+  `uv_repack` (groups by coincident *positions*): the two group faces
+  differently and are deliberately both offered. See §8 for its gotchas: canvas
+  rect construction, the placeholder UV slot, and one undo entry per drag.
 - **The transform gizmo is screen-space geometry** (`gizmo.rs`): the frame is
   projected through the same `Camera` as the viewport, so handles are a constant
   pixel length and picking is a 2D distance test. The layout is computed once by
@@ -496,9 +512,82 @@ progress report:
   `textured_triangle`'s mesh, and the UV editor's background quad with its v
   orientation.
 
+- **Sub-object picking goes through a GPU ID pass, and UVs have islands**
+  (work-stream #12). Two halves:
+
+  - `openforge-render/src/pick.rs` (no wgpu types anywhere, so it is fully
+    testable headless): `PickVertex` (a world position plus the u32 element id
+    its fragments report — 16 bytes, `Pod`, layout matched by the pick shader's
+    two `@location`s), `PickElement::{Face, Vertex}` (a node plus the mesh-local
+    face/vertex index), `PickGeometry::build(scene)` — visible, unfrozen mesh
+    nodes only; faces fan-triangulated exactly like the visible pass with
+    invalid ones skipped; every mesh position also emitted as a point; one
+    shared 1-based element table, so `0` stays the clear value — and
+    `resolve_patch(patch, width, height, centre)`, which turns a read-back
+    integer patch into nearest-first, de-duplicated `PickHit`s (squared pixel
+    distance, ties broken by id, centre given *inside* the patch because a patch
+    clipped at the viewport edge is not centred).
+  - `GpuRenderer::pick(device, queue, scene, camera, cursor, radius)` draws that
+    geometry into its own `R32Uint` target (`PICK_FORMAT`) with a
+    **single-sampled** depth buffer and its own pipelines, shader
+    (`pipeline::pick_shader_wgsl`, flat `u32` varying, integer fragment output —
+    validated by the same naga test as the other two) and uniform buffer, so a
+    pick never disturbs a rendered frame and works whatever MSAA the frame runs
+    at. Faces are drawn with the frame's culling and `Less` depth test; mesh
+    vertices follow as 1-px `PointList`s with `LessEqual`, so a vertex pixel wins
+    over the face it lies on but never over a face genuinely in front of it. The
+    patch around the cursor (radius clamped to 64 px, clipped at the viewport
+    edges) is copied out at the alignment wgpu demands (256-byte row pitch),
+    mapped and polled synchronously — this is a click path, not a frame path.
+  - The app asks the GPU first: `gpu_viewport::pick` maps a pointer position
+    onto the OFFSCREEN pixel (`pick_pixel`: offset from the viewport rect ×
+    `pixels_per_point`, floored, clamped) and `gpu_viewport::chosen_hit` picks
+    the first hit the current level can use — a face click must skip a nearer
+    vertex (the point pass draws vertices on top of their faces) and a vertex
+    click must skip the covering face. When there is no wgpu backend, or the
+    patch holds nothing usable, the CPU raycast runs exactly as before.
+    Object-level clicks still go through `SelectTool`: the raycast there is
+    occlusion-correct already.
+  - `openforge-uv/src/islands.rs` (via a subagent, verified here):
+    `uv_face_islands(mesh, tolerance)` welds two faces sharing a mesh edge into
+    one island only when the UVs they assign at **both** shared endpoints match
+    within the tolerance, then orders islands by smallest face with every face
+    in exactly one island; `uv_island_of_face` and `uv_island_uv_indices`
+    (sorted, de-duplicated, out-of-range indices dropped) sit beside it; and
+    `uv_pack_islands(mesh, grid, margin)` packs each island into its own cell of
+    a `grid × grid` atlas at one uniform scale (aspect preserved) in two phases
+    (measure every island, then apply) so the result never depends on the order,
+    treats an entry shared by several islands as the first island's, clamps the
+    margin into `[0, 0.5)`, and returns the island count. The crate's own
+    `UnionFind`/`Pack` were widened to `pub(crate)` for the reuse, nothing else.
+  - One honest finding from that work: `uv_project_box` gives **numerically
+    identical** UVs to faces that meet at a cube corner across two different
+    axes, so a box-projected cube welds into **2** islands (three sides each),
+    not six. The rule is UV continuity and those faces genuinely carry matching
+    UVs at their shared edges; six islands would need a different projection.
+  - The UV editor gets both operations as buttons: **Island** (grow the UV
+    selection to every entry of the islands it touches —
+    `uv_editor::island_selection`, one partition per call,
+    `ISLAND_TOLERANCE = 1e-4`) and **Pack Islands** next to the existing
+    position-welding **Pack**.
+
+- **47 new tests**, essentially all runnable without a display: 16 in
+  `openforge-uv` (`islands.rs`: welding across a shared edge, island order and
+  determinism, tolerance edges, packing bounds/grid/margin and an entry shared
+  by two islands, `u32::MAX` guards, empty meshes), 15 in `openforge-render`
+  (14 pure in `pick.rs` — fan triangulation, 1-based ids and the element table,
+  world transforms, hidden/frozen exclusion, invalid faces, patch resolution
+  with ties/dedup/edge clipping — plus the naga validation of the pick shader),
+  6 more in `gpu.rs` behind the adapter guard (the pick pass resolves what the
+  frame shows; a vertex is picked at its pixel unless occluded; layout/format/
+  radius/copy-pitch invariants), 3 in the app's `gpu_viewport`
+  (`pick_pixel` cursor mapping and clamping, `chosen_hit`'s per-level rules),
+  and 7 in the app (6 `uv_editor::island_selection` cases and the Island
+  button's selection path).
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **441 pass, 0 failures**
+build too); `cargo test --workspace` → **488 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -509,7 +598,11 @@ display: the `app.rs` test module runs the real
 painted, and on what the host did (import/export through a filter, a plugin's
 filter taking effect, a rejected plugin changing nothing). The texture sampling
 itself is proven by a headless GPU readback (red and green layers on a cube
-show both hues, neither without the maps) rather than by eye.
+show both hues, neither without the maps) rather than by eye. Sub-object
+picking is proven the same way: `pick.rs` resolves patches with no GPU at all,
+a headless readback witnesses a cube's front face while a vertex hidden behind
+it never appears in the patch, and the app's per-level rules (`chosen_hit`) are
+asserted directly.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -518,7 +611,11 @@ visually), the **snapping feedback** (the gold marker on the vertex a drag
 is about to land on, the live status readout, and Ctrl switching snapping on and
 off mid-drag), and the **textured look** (the checker preset on a sphere, the
 texture picker and its thumbnail, the UV editor's texture background and
-whether the two viewports agree on orientation) — the agent has no display
+whether the two viewports agree on orientation), plus the **GPU pick** (click a
+vertex hidden behind a face: the face behind should take the click, never the
+hidden vertex; face clicks on a vertex must still take the face) and the
+**Island / Pack Islands buttons** (Island should light up a whole island, Pack
+Islands should leave each island in its own cell with a gutter) — the agent has no display
 access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -529,18 +626,22 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **61.0%**, which the overall bar shows as 61%). The engine
+16 curated areas is **62%**). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
-gizmo snapping as of #10 and textures sampling on both paths as of #11.
+gizmo snapping as of #10, textures sampling on both paths as of #11 and
+sub-object picking that matches the drawn frame (plus UV islands) as of #12.
 Prioritized next steps:
 
-1. **Deepen the GPU viewport** (still the best next value). MSAA, the
-   depth-tested edge overlay, per-face material shading (#9) and texture
-   sampling (#11) are in; what remains of the editor surface is **depth-buffer
-   picking** so sub-object picking matches exactly what is drawn (an ID pass, or
-   a depth read aligned with the CPU raycast).
+1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
+   material shading (#9), texture sampling (#11) and now occlusion-exact
+   sub-object picking through an ID pass (#12) are in. What remains of the
+   editor surface: **box/marquee selection** (drag a rectangle and select what
+   it covers — the per-pixel raycast cannot express it, the ID pass can) and
+   **edge-level picking** (line geometry in the ID pass, on top of a stable
+   per-node edge enumeration). Beyond that: shadowing / ambient occlusion and a
+   configurable shading mode.
 2. **Extend the gizmo further** (`gizmo.rs`, all additive): plane and centre
    handles, and numeric entry for rotation/scale (translation already has
    DragValues in Properties). Snapping landed in #10 but is deliberately partial:
@@ -550,10 +651,10 @@ Prioritized next steps:
    during free drags too. (Sub-object pivots are done: a vertex/face-level drag
    moves only its own geometry, via `gizmo::Targets` +
    `viewport::element_centroid`.)
-3. **Deepen the UV editor.** The texture background landed in #11; still
-   missing: island-level ops (weld/split/mirror), snapping, per-face map
-   assignment from the canvas, and the 3D face selection staying in sync with
-   the UV selection rather than being pushed on demand.
+3. **Deepen the UV editor.** The texture background (#11) and island selection
+   plus per-island packing (#12) landed; still missing: island weld/split/mirror,
+   snapping, per-face map assignment from the canvas, and the 3D face selection
+   staying in sync with the UV selection rather than being pushed on demand.
 4. **Deepen the plugin host.** The host is in and the app goes through it, but
    three pieces are still hard-wired: tools are chosen through the app's
    `ActiveTool` enum rather than by walking `host.tool_entries()`, a `Service`
@@ -596,6 +697,16 @@ deltas and are many work-streams, not one push.
   count as a parameter: the app asks
   `supported_samples(adapter, COLOR_FORMAT, PREFERRED_SAMPLES)` rather than
   assuming 4x (no silent downgrade — a device that cannot do it reports 1).
+- **The ID ("pick") pass is single-sampled on purpose, and its ids must stay
+  integers.** It has its own `R32Uint` target, its own *single-sampled* depth
+  buffer and 1-sample pipelines even when the frame runs MSAA — a resolve would
+  average ids into nonsense. Three more traps: the vertex-point pipeline needs
+  `LessEqual` (a point lies exactly on the surface it belongs to, so `Less`
+  would drop every vertex on its own face) while the face pipeline keeps the
+  frame's `Less` and culling (so a face genuinely in front still hides a vertex
+  behind it); the readback patch must be at least 256 bytes per row, so
+  `resolve_patch` is fed row by row with the padding stripped; and ids are
+  1-based because the target clears to `0`.
 - **The GPU edge overlay replaces the egui one, it does not stack with it.**
   When the GPU backend is active the edges are line geometry inside the frame
   (depth-tested, `LessEqual`, no depth write); `paint_gpu_viewport` therefore
@@ -615,6 +726,16 @@ deltas and are many work-streams, not one push.
   background follows the selected mesh's material, falling back to the material
   the Materials panel is editing, and `draw_canvas` takes it as an
   `Option<egui::TextureId>` — a canvas without one paints the plain dark tile.
+- **UV islands weld on UV *continuity*, and packing never splits entries.**
+  Two faces sharing a mesh edge join one island only when the UVs they assign
+  at **both** shared endpoints match within the tolerance; `uv_pack_islands`
+  then moves only the entries an island *owns* (an entry shared by several
+  islands follows the first island that uses it in island order), so it never
+  creates or re-points a uv index — a UV-editor selection survives a pack.
+  `uv_repack` is a different grouping (coincident *positions*) and the two
+  disagree on any mesh with a seam. A box-projected cube is **2** islands under
+  the continuity rule, not 6: `uv_project_box` hands numerically identical UVs
+  to faces that meet at a corner across axes.
 - **A texture array's layers share one size, and its sampler needs a level.**
   Three things bite when wiring textures into the GPU pass: (a) array layers
   must all be the same dimensions, so the app resamples through

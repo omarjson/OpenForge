@@ -14,21 +14,21 @@ ENGINE
   Materials & textures                                 ██████████████░░░░░░  72%
   Animation (tracks, clips, playback)                  ███████████░░░░░░░░░  55%
   Rigging & skinning                                   ████████████░░░░░░░░  60%
-  UV math (project, unwrap, pack, edits)               ████████████████░░░░  80%
+  UV math (project, unwrap, pack, edits)               █████████████████░░░  85%
 
 APPLICATION SURFACE
-  GPU viewport (depth, shading, grid, gizmo)           ███████████████░░░░░  78%
-  Viewport editing UX (gizmos, wireframe, outlines, picking) ███████████████░░░░░  75%
-  UV editor UI                                         ██████████░░░░░░░░░░  50%
+  GPU viewport (depth, shading, grid, gizmo)           ████████████████░░░░  84%
+  Viewport editing UX (gizmos, wireframe, outlines, picking) ███████████████░░░░░  79%
+  UV editor UI                                         ███████████░░░░░░░░░  58%
   Panels & dialogs (outliner, properties, toolbars)    ██████████░░░░░░░░░░  51%
   Import/export UX                                     ████████░░░░░░░░░░░░  40%
   Plugin / service host                                ███████░░░░░░░░░░░░░  35%
   Game tooling (LOD, dummies/TXD, vehicles)            █░░░░░░░░░░░░░░░░░░░   5%
 
-  OVERALL (unweighted mean of 16 areas)                ████████████░░░░░░░░  61%
+  OVERALL (unweighted mean of 16 areas)                ████████████░░░░░░░░  62%
 
-Measured from the repo: 12 crates · 439 test fns · 23747 lines of Rust
-Exact mean of the curated area scores: 61.0% (sum 976 over 16 areas)
+Measured from the repo: 12 crates · 486 test fns · 25761 lines of Rust
+Exact mean of the curated area scores: 62.4% (sum 999 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 
