@@ -8,6 +8,8 @@
 //!   and per-selection transforms for an interactive editor).
 //! * [`unwrap`] — seam detection by dihedral angle and a simple grid atlas
 //!   repack for UV islands.
+//! * [`islands`] — UV-island detection by UV continuity and per-island
+//!   packing into a grid atlas.
 //!
 //! All operations are defensive: empty meshes, out-of-range indices and
 //! degenerate geometry never panic, and after any mutating call every face
@@ -29,6 +31,7 @@
 //! ```
 
 mod edit;
+mod islands;
 mod project;
 mod unwrap;
 
@@ -128,6 +131,41 @@ pub trait UvOps {
     /// non-finite threshold.
     fn uv_seams_from_angle(&self, angle_deg: f32) -> Vec<(u32, u32)>;
 
+    /// Partition face indices into UV islands: two faces belong to the same
+    /// island when they share a mesh edge and assign matching UVs at both
+    /// shared endpoints, welded transitively. The tolerance is a UV distance
+    /// (clamped to `>= 0`; a NaN tolerance reads as `0`).
+    ///
+    /// Every face index appears in exactly one island; islands are ordered by
+    /// their smallest face index and hold ascending face indices.
+    /// Unconnectable faces become singleton islands and an empty mesh yields
+    /// an empty vector.
+    fn uv_face_islands(&self, tolerance: f32) -> Vec<Vec<u32>>;
+
+    /// The island of [`UvOps::uv_face_islands`] that contains `face`, or
+    /// `None` when `face` is out of range.
+    fn uv_island_of_face(&self, tolerance: f32, face: u32) -> Option<Vec<u32>>;
+
+    /// Sorted, de-duplicated indices of the UV entries used by the corners of
+    /// `faces`. Out-of-range face indices are skipped and only indices that
+    /// resolve into `uvs` are reported.
+    fn uv_island_uv_indices(&self, faces: &[u32]) -> Vec<u32>;
+
+    /// Pack every UV island (partitioned by UV continuity at a fixed `1e-5`
+    /// tolerance) into its own cell of a `grid x grid` atlas, preserving each
+    /// island's internal layout with a uniform scale.
+    ///
+    /// `margin` is a UV distance kept free on every side of a cell (clamped
+    /// into `[0.0, 0.5)`; a NaN margin reads as `0.0`). A UV entry used by
+    /// several islands moves with the first island that uses it. Only `uvs`
+    /// values change: no uv index is created or removed and `positions` and
+    /// `faces` are untouched. Islands beyond `grid * grid` wrap around to
+    /// earlier cells.
+    ///
+    /// Returns the number of islands; `grid == 0` and meshes without faces
+    /// change nothing and return `0`.
+    fn uv_pack_islands(&mut self, grid: u32, margin: f32) -> usize;
+
     /// Bounding box of all UV entries, or `None` when there are no finite
     /// entries (e.g. an empty mesh).
     fn uv_bounds(&self) -> Option<UvBounds>;
@@ -203,6 +241,22 @@ impl UvOps for Mesh {
 
     fn uv_seams_from_angle(&self, angle_deg: f32) -> Vec<(u32, u32)> {
         unwrap::uv_seams_from_angle(self, angle_deg)
+    }
+
+    fn uv_face_islands(&self, tolerance: f32) -> Vec<Vec<u32>> {
+        islands::uv_face_islands(self, tolerance)
+    }
+
+    fn uv_island_of_face(&self, tolerance: f32, face: u32) -> Option<Vec<u32>> {
+        islands::uv_island_of_face(self, tolerance, face)
+    }
+
+    fn uv_island_uv_indices(&self, faces: &[u32]) -> Vec<u32> {
+        islands::uv_island_uv_indices(self, faces)
+    }
+
+    fn uv_pack_islands(&mut self, grid: u32, margin: f32) -> usize {
+        islands::uv_pack_islands(self, grid, margin)
     }
 
     fn uv_bounds(&self) -> Option<UvBounds> {

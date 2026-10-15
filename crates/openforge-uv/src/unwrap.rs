@@ -12,13 +12,13 @@ use openforge_core::mesh::Mesh;
 use crate::{face_normal_opt, uv_at};
 
 /// Minimal disjoint-set (union-find) forest over position indices.
-struct UnionFind {
+pub(crate) struct UnionFind {
     parent: Vec<u32>,
     size: Vec<u32>,
 }
 
 impl UnionFind {
-    fn new(n: usize) -> Self {
+    pub(crate) fn new(n: usize) -> Self {
         Self {
             parent: (0..n as u32).collect(),
             size: vec![1; n],
@@ -27,7 +27,7 @@ impl UnionFind {
 
     /// Find the representative of `x`, compressing the path.
     /// Returns `u32::MAX` when `x` is out of range.
-    fn find(&mut self, x: u32) -> u32 {
+    pub(crate) fn find(&mut self, x: u32) -> u32 {
         let mut i = x as usize;
         if i >= self.parent.len() {
             return u32::MAX;
@@ -45,7 +45,7 @@ impl UnionFind {
     }
 
     /// Merge the sets containing `a` and `b` (union by size).
-    fn union(&mut self, a: u32, b: u32) {
+    pub(crate) fn union(&mut self, a: u32, b: u32) {
         let (ra, rb) = (self.find(a), self.find(b));
         if ra == rb || ra == u32::MAX || rb == u32::MAX {
             return;
@@ -62,13 +62,13 @@ impl UnionFind {
 
 /// Per-island precomputed placement inside one atlas cell.
 #[derive(Clone, Copy)]
-struct Pack {
+pub(crate) struct Pack {
     /// Center of the island's current UV bounds.
-    center: Vec2,
+    pub(crate) center: Vec2,
     /// Uniform scale fitting the island into the cell (aspect preserved).
-    scale: f32,
+    pub(crate) scale: f32,
     /// Center of the destination atlas cell.
-    cell_center: Vec2,
+    pub(crate) cell_center: Vec2,
 }
 
 /// Detect seam edges: boundary edges, edges whose adjacent face-normal angle
