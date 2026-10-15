@@ -7,9 +7,9 @@
 //! outlines. A production build would swap this for a wgpu pipeline while
 //! reusing the same camera math.
 
-use glam::{Mat4, Vec3, Vec4};
+use glam::{Mat4, Vec2, Vec3, Vec4};
 use openforge_core::math::Ray;
-use openforge_materials::Material;
+use openforge_materials::{Material, MaterialLibrary};
 use std::collections::HashMap;
 use openforge_core::mesh::Mesh;
 use openforge_core::scene::Scene;
@@ -108,6 +108,8 @@ pub fn project(vp: Mat4, p: Vec3, size: [f32; 2]) -> Option<(f32, f32, f32)> {
 pub struct Vx {
     pub pos: Vec3,
     pub normal: Vec3,
+    /// This corner's texture coordinates.
+    pub uv: Vec2,
 }
 
 /// A triangle in world space with a shading normal.
@@ -157,6 +159,18 @@ pub fn material_base(material: &Material, selected: bool, face_selected: bool) -
     }
 }
 
+/// The library texture a face's material samples, if any.
+///
+/// A material names its diffuse map by index; a map whose texture the library
+/// no longer holds is ignored, so a face can never sample past the end of the
+/// texture list. Both viewports resolve through this one function — the CPU
+/// painter takes the index as its texture array handle, the GPU path as the
+/// vertex's layer — so they cannot disagree about which faces are textured.
+pub fn face_texture(library: &MaterialLibrary, material_slot: u32) -> Option<usize> {
+    let map = library.resolve(material_slot).diffuse_map;
+    map.filter(|index| library.textures.get(*index).is_some())
+}
+
 /// Collect all visible mesh triangles from the scene in world space.
 pub fn collect_triangles(
     scene: &mut Scene,
@@ -180,17 +194,22 @@ pub fn collect_triangles(
             let material = node.face_material_slot(face_idx);
             let cs = &face.corners;
             for i in 1..cs.len().saturating_sub(1) {
-                let tri = [cs[0].position, cs[i].position, cs[i + 1].position];
-                let p = |pi: u32| world.transform_point3(mesh.positions[pi as usize]);
+                let tri = [cs[0], cs[i], cs[i + 1]];
+                let p = |corner: openforge_core::mesh::Corner| {
+                    world.transform_point3(mesh.positions[corner.position as usize])
+                };
                 let a = p(tri[0]);
                 let b = p(tri[1]);
                 let c = p(tri[2]);
                 let n = (b - a).cross(c - a).normalize_or_zero();
+                let uv = |corner: openforge_core::mesh::Corner| {
+                    mesh.uvs.get(corner.uv as usize).copied().unwrap_or(Vec2::ZERO)
+                };
                 out.push(Tri {
                     v: [
-                        Vx { pos: a, normal: n },
-                        Vx { pos: b, normal: n },
-                        Vx { pos: c, normal: n },
+                        Vx { pos: a, normal: n, uv: uv(tri[0]) },
+                        Vx { pos: b, normal: n, uv: uv(tri[1]) },
+                        Vx { pos: c, normal: n, uv: uv(tri[2]) },
                     ],
                     selected,
                     face_selected: face_is_sel,
@@ -637,6 +656,7 @@ mod tests {
     use super::*;
     use openforge_core::mesh::Mesh;
     use openforge_core::selection::SelectLevel;
+    use openforge_materials::Texture;
 
     /// A quad in the XY plane, wound counter-clockwise seen from `+Z`.
     fn quad(z: f32) -> Mesh {
@@ -1104,6 +1124,56 @@ mod tests {
         // Just an arm's length from the tie: still resolved the same way.
         let hit = nearest_candidate(&candidates, [105.0, 100.0], 14.0).expect("both are in reach");
         assert_eq!(hit.node, NodeId(9));
+    }
+
+    #[test]
+    fn face_texture_resolves_the_materials_map_and_ignores_missing_ones() {
+        let mut library = MaterialLibrary::new();
+        let texture = library.add_texture(Texture::solid("tiny", 1, 1, [1, 2, 3, 4]));
+        let mut mapped = Material::new("mapped");
+        mapped.diffuse_map = Some(texture);
+        let slot = library.add_material(mapped) as u32;
+        // A map index the library cannot resolve is ignored rather than sampled.
+        let mut orphan = Material::new("orphan");
+        orphan.diffuse_map = Some(9);
+        let orphan_slot = library.add_material(orphan) as u32;
+
+        assert_eq!(face_texture(&library, slot), Some(texture));
+        assert_eq!(face_texture(&library, 0), None, "the default material is untextured");
+        assert_eq!(face_texture(&library, orphan_slot), None, "a dangling map is ignored");
+        assert_eq!(
+            face_texture(&library, 99),
+            None,
+            "an out-of-range slot falls back to the default material"
+        );
+    }
+
+    #[test]
+    fn triangles_carry_each_corners_uv() {
+        let mut mesh = Mesh::new();
+        for p in [Vec3::ZERO, Vec3::X, Vec3::Y, Vec3::new(1.0, 1.0, 0.0)] {
+            mesh.add_vertex(p);
+        }
+        mesh.uvs = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
+        mesh.add_face(&[0, 1, 2, 3]);
+        for (corner, uv) in mesh.faces[0].corners.iter_mut().zip(0..4) {
+            corner.uv = uv;
+        }
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", mesh);
+
+        let tris = collect_triangles(&mut scene, &Selection::new());
+        assert_eq!(tris.len(), 2, "a quad fan-triangulates");
+        assert_eq!(tris[0].v[0].uv, Vec2::new(0.0, 0.0));
+        assert_eq!(tris[0].v[1].uv, Vec2::new(1.0, 0.0));
+        assert_eq!(tris[0].v[2].uv, Vec2::new(1.0, 1.0));
+        assert_eq!(tris[1].v[0].uv, Vec2::new(0.0, 0.0));
+        assert_eq!(tris[1].v[2].uv, Vec2::new(0.0, 1.0));
     }
 }
 

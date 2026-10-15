@@ -22,14 +22,15 @@ pub mod pipeline;
 pub mod gpu;
 
 pub use camera::OrbitCamera;
-pub use gpu_types::{FrameUniforms, GpuVertex};
+pub use gpu_types::{texture_layer_index, FrameUniforms, GpuVertex, TextureLayer, WHITE_LAYER};
 pub use mesh_upload::{
-    build_scene, build_scene_materials, build_scene_with, MeshBuffers, NodeColors, NodeMaterials,
+    build_scene, build_scene_materials, build_scene_with, FaceShading, MeshBuffers, NodeColors,
+    NodeMaterials,
 };
 pub use pipeline::{
-    color_format, default_pass, depth_format, fragment_shader_wgsl, vertex_shader_wgsl, CullMode,
-    RenderPassDesc,
+    color_format, default_pass, depth_format, fragment_shader_wgsl, texture_format,
+    vertex_shader_wgsl, CullMode, RenderPassDesc,
 };
 
 #[cfg(feature = "gpu")]
-pub use gpu::{FrameStats, GpuRenderer};
+pub use gpu::{FrameStats, GpuRenderer, MAX_TEXTURE_LAYERS};

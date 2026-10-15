@@ -25,7 +25,7 @@
 //! half of the crate keeps building and testing without wgpu in the graph.
 
 use crate::camera::OrbitCamera;
-use crate::gpu_types::{FrameUniforms, GpuVertex};
+use crate::gpu_types::{FrameUniforms, GpuVertex, TextureLayer};
 use crate::mesh_upload::{build_scene_materials, MeshBuffers, NodeMaterials};
 use crate::pipeline::{self, CullMode};
 use glam::{Mat4, Vec3, Vec4};
@@ -45,6 +45,12 @@ pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 /// [`egui_wgpu::Renderer::register_native_texture`]:
 ///     https://docs.rs/egui-wgpu/0.29/egui_wgpu/struct.Renderer.html
 pub const COLOR_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Format of the material texture array, matching [`pipeline::texture_format`].
+pub const TEXTURE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
+/// Most texture layers one scene pass uploads (layer 0 is the white layer).
+pub const MAX_TEXTURE_LAYERS: u32 = 64;
 
 /// The multi-sample count [`GpuRenderer`] prefers when the adapter supports it.
 pub const PREFERRED_SAMPLES: u32 = 4;
@@ -238,11 +244,12 @@ pub struct FrameStats {
 // --- Vertex layout ---------------------------------------------------------------
 
 /// Attribute layout matching [`GpuVertex`]'s `@location`s and byte offsets.
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 4] = [
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 24, shader_location: 2 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 3 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 48, shader_location: 4 },
 ];
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -276,10 +283,16 @@ pub struct GpuRenderer {
     color_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     msaa_view: Option<wgpu::TextureView>,
+    bind_group_layout: wgpu::BindGroupLayout,
     frame_uniforms: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
     gizmo_uniforms: wgpu::Buffer,
     gizmo_bind_group: wgpu::BindGroup,
+    face_texture: wgpu::Texture,
+    face_texture_view: wgpu::TextureView,
+    face_sampler: wgpu::Sampler,
+    texture_size: [u32; 2],
+    layer_count: u32,
     scene_pipeline: wgpu::RenderPipeline,
     grid_pipeline: wgpu::RenderPipeline,
     edge_pipeline: wgpu::RenderPipeline,
@@ -304,9 +317,12 @@ impl GpuRenderer {
     /// for a `samples`-sampled target (`samples` is clamped to at least 1; use
     /// [`supported_samples`] to pick a value the adapter supports).
     ///
-    /// The offscreen target starts at 1x1; call [`resize`](Self::resize) with
-    /// the real viewport size before the first frame.
-    pub fn new(device: &wgpu::Device, samples: u32) -> Self {
+    /// The material texture array starts as a single white layer, so a scene
+    /// rendered before [`set_textures`](Self::set_textures) looks untextured
+    /// rather than black. The offscreen target starts at 1x1; call
+    /// [`resize`](Self::resize) with the real viewport size before the first
+    /// frame.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, samples: u32) -> Self {
         let samples = samples.max(1);
         let vertex_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("openforge-scene-vertex"),
@@ -322,18 +338,38 @@ impl GpuRenderer {
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("openforge-frame-layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: wgpu::BufferSize::new(
-                        std::mem::size_of::<FrameUniforms>() as u64
-                    ),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<FrameUniforms>() as u64
+                        ),
+                    },
+                    count: None,
                 },
-                count: None,
-            }],
+                // The material texture array: one layer per caller texture,
+                // with layer 0 reserved for white (see `WHITE_LAYER`).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("openforge-pipeline-layout"),
@@ -354,21 +390,49 @@ impl GpuRenderer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
         };
-        let bind_group = |label: &str, buffer: &wgpu::Buffer| {
-            device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some(label),
-                layout: &bind_group_layout,
-                entries: &[wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: buffer.as_entire_binding(),
-                }],
-            })
+        let bind_group = |label: &str,
+                          buffer: &wgpu::Buffer,
+                          texture: &wgpu::TextureView,
+                          sampler: &wgpu::Sampler| {
+            face_bind_group(device, &bind_group_layout, label, buffer, texture, sampler)
         };
 
+        // Repeat addressing matches how a `Texture`'s UVs wrap; linear
+        // filtering matches the CPU painter's sampler.
+        let face_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("openforge-face-sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            address_mode_w: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let face_texture =
+            create_face_texture(device, MIN_TARGET_DIM, MIN_TARGET_DIM, 1);
+        write_face_layer(
+            queue,
+            &face_texture,
+            [MIN_TARGET_DIM, MIN_TARGET_DIM],
+            0,
+            &[255, 255, 255, 255],
+        );
+        let face_texture_view = face_array_view(&face_texture);
+
         let frame_uniforms = uniform_buffer("openforge-frame-uniforms");
-        let frame_bind_group = bind_group("openforge-frame-bind-group", &frame_uniforms);
+        let frame_bind_group = bind_group(
+            "openforge-frame-bind-group",
+            &frame_uniforms,
+            &face_texture_view,
+            &face_sampler,
+        );
         let gizmo_uniforms = uniform_buffer("openforge-gizmo-uniforms");
-        let gizmo_bind_group = bind_group("openforge-gizmo-bind-group", &gizmo_uniforms);
+        let gizmo_bind_group = bind_group(
+            "openforge-gizmo-bind-group",
+            &gizmo_uniforms,
+            &face_texture_view,
+            &face_sampler,
+        );
 
         let build_pipeline = |label: &str,
                               topology: wgpu::PrimitiveTopology,
@@ -503,10 +567,16 @@ impl GpuRenderer {
             color_view,
             depth_view,
             msaa_view,
+            bind_group_layout,
             frame_uniforms,
             frame_bind_group,
             gizmo_uniforms,
             gizmo_bind_group,
+            face_texture,
+            face_texture_view,
+            face_sampler,
+            texture_size: [MIN_TARGET_DIM, MIN_TARGET_DIM],
+            layer_count: 1,
             scene_pipeline,
             grid_pipeline,
             edge_pipeline,
@@ -530,6 +600,83 @@ impl GpuRenderer {
     /// Current offscreen size in pixels.
     pub fn size(&self) -> [u32; 2] {
         self.size
+    }
+
+    /// Size of the uploaded material texture array, in texels.
+    pub fn texture_size(&self) -> [u32; 2] {
+        self.texture_size
+    }
+
+    /// Layer count of the material texture array: the reserved white layer
+    /// plus the textures last handed to [`set_textures`](Self::set_textures).
+    pub fn texture_layers(&self) -> u32 {
+        self.layer_count
+    }
+
+    /// Upload the caller's textures as the scene pass's texture array,
+    /// replacing any previous set.
+    ///
+    /// Layer order is the slice order offset by one: array layer 0 stays the
+    /// reserved white layer an untextured vertex names (see
+    /// [`WHITE_LAYER`]). Every layer is written through as white before the
+    /// caller's pixels go in, so a layer whose buffer is missing or the wrong
+    /// size shades like an untextured face instead of reading leftovers, and
+    /// every layer of one array shares the first layer's dimensions. Layers
+    /// past [`MAX_TEXTURE_LAYERS`] are ignored; an empty slice leaves a single
+    /// white layer.
+    pub fn set_textures(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        layers: &[TextureLayer],
+    ) {
+        let layers = &layers[..layers.len().min(MAX_TEXTURE_LAYERS as usize)];
+        let (width, height) = match layers.first() {
+            Some(l) => (l.width.max(1), l.height.max(1)),
+            None => (MIN_TARGET_DIM, MIN_TARGET_DIM),
+        };
+        let layer_count = 1 + layers.len() as u32;
+
+        if [width, height] != self.texture_size || layer_count != self.layer_count {
+            self.face_texture = create_face_texture(device, width, height, layer_count);
+            self.face_texture_view = face_array_view(&self.face_texture);
+            self.texture_size = [width, height];
+            self.layer_count = layer_count;
+            // Both bind groups hold the texture view, so they are rebuilt
+            // whenever the array itself changes.
+            self.frame_bind_group = face_bind_group(
+                device,
+                &self.bind_group_layout,
+                "openforge-frame-bind-group",
+                &self.frame_uniforms,
+                &self.face_texture_view,
+                &self.face_sampler,
+            );
+            self.gizmo_bind_group = face_bind_group(
+                device,
+                &self.bind_group_layout,
+                "openforge-gizmo-bind-group",
+                &self.gizmo_uniforms,
+                &self.face_texture_view,
+                &self.face_sampler,
+            );
+        }
+
+        let white = vec![255u8; (width as usize) * (height as usize) * 4];
+        for layer in 0..layer_count {
+            write_face_layer(queue, &self.face_texture, self.texture_size, layer, &white);
+        }
+        for (i, layer) in layers.iter().enumerate() {
+            if layer.width == width && layer.height == height && layer.is_complete() {
+                write_face_layer(
+                    queue,
+                    &self.face_texture,
+                    self.texture_size,
+                    i as u32 + 1,
+                    &layer.rgba,
+                );
+            }
+        }
     }
 
     /// The target's multi-sample count (1 when single-sampled).
@@ -752,6 +899,98 @@ impl GpuRenderer {
     }
 }
 
+/// Create the material texture array: `layer_count` layers of `width` x
+/// `height`, in the shader's texture format.
+fn create_face_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    layer_count: u32,
+) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("openforge-face-textures"),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: layer_count.max(1),
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TEXTURE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    })
+}
+
+/// A 2D-array view over the whole material texture array.
+fn face_array_view(texture: &wgpu::Texture) -> wgpu::TextureView {
+    texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("openforge-face-view"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..Default::default()
+    })
+}
+
+/// The bind group every pass uses: the frame uniform plus the texture array
+/// and its sampler.
+fn face_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    label: &str,
+    uniforms: &wgpu::Buffer,
+    texture: &wgpu::TextureView,
+    sampler: &wgpu::Sampler,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(label),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniforms.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(texture),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+        ],
+    })
+}
+
+/// Write one whole array layer of RGBA8 texels.
+fn write_face_layer(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    size: [u32; 2],
+    layer: u32,
+    rgba: &[u8],
+) {
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: layer },
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(4 * size[0]),
+            rows_per_image: Some(size[1]),
+        },
+        wgpu::Extent3d {
+            width: size[0],
+            height: size[1],
+            depth_or_array_layers: 1,
+        },
+    );
+}
+
 /// Create the offscreen target for a `width` x `height` viewport: the
 /// single-sampled color texture (also the MSAA resolve target), a depth
 /// texture, and — when `samples > 1` — the multi-sampled color view the passes
@@ -853,6 +1092,7 @@ fn write_dynamic(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mesh_upload::FaceShading;
 
     const EPS: f32 = 1e-4;
 
@@ -1011,9 +1251,14 @@ mod tests {
     fn vertex_layout_matches_gpu_vertex_size() {
         let layout = vertex_layout();
         assert_eq!(layout.array_stride, std::mem::size_of::<GpuVertex>() as u64);
-        assert_eq!(layout.attributes.len(), 4);
+        assert_eq!(layout.attributes.len(), 5);
         assert_eq!(layout.attributes[0].shader_location, 0);
-        assert_eq!(layout.attributes[3].offset + 16, layout.array_stride);
+        assert_eq!(layout.attributes[3].offset + 16, layout.attributes[4].offset);
+        assert_eq!(layout.attributes[4].shader_location, 4);
+        assert_eq!(layout.attributes[4].format, wgpu::VertexFormat::Float32);
+        // The last attribute lands exactly at the end of the stride: no gaps a
+        // shader could read garbage from.
+        assert_eq!(layout.attributes[4].offset + 4, layout.array_stride);
     }
 
     #[test]
@@ -1182,7 +1427,7 @@ mod tests {
         let selection = Selection::new();
         let camera = OrbitCamera::default();
 
-        let mut renderer = GpuRenderer::new(&device, 1);
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
         renderer.resize(&device, [TARGET, TARGET]);
         assert_eq!(renderer.size(), [TARGET, TARGET]);
 
@@ -1267,6 +1512,24 @@ mod tests {
             .count()
     }
 
+    /// Pixels a single channel owns outright: `channel` lit, the other two
+    /// within a texel of black. Only a face sampling a saturated texel can
+    /// produce them — the grid's axis lines and the corner gizmo keep their
+    /// off-channels above 70.
+    fn pure_channel_pixels(pixels: &[u8], size: [u32; 2], channel: usize) -> usize {
+        (0..(size[0] * size[1]) as usize)
+            .filter(|&i| {
+                let p = &pixels[i * 4..i * 4 + 4];
+                let others = (0..3)
+                    .filter(|c| *c != channel)
+                    .map(|c| p[c])
+                    .max()
+                    .unwrap_or(0);
+                p[3] == 255 && p[channel] > 40 && others <= 8
+            })
+            .count()
+    }
+
     #[test]
     fn per_face_material_colours_reach_the_gpu_per_face() {
         let Some((_adapter, device, queue)) = headless_device() else {
@@ -1277,7 +1540,7 @@ mod tests {
         let cube = scene.create_mesh("Cube", unit_cube());
         let selection = Selection::new();
         let camera = OrbitCamera::default();
-        let mut renderer = GpuRenderer::new(&device, 1);
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
         renderer.resize(&device, [TARGET, TARGET]);
         let size = renderer.size();
 
@@ -1288,9 +1551,9 @@ mod tests {
         // from any angle. Neither hue exists anywhere else in the frame, so an
         // implementation that shaded the whole node with one colour could paint
         // one of them and never both.
-        let mut faces = vec![magenta; 6];
-        faces[4] = yellow;
-        faces[5] = yellow;
+        let mut faces: Vec<crate::mesh_upload::FaceShading> = vec![magenta.into(); 6];
+        faces[4] = yellow.into();
+        faces[5] = yellow.into();
         renderer.render(
             &device,
             &queue,
@@ -1313,7 +1576,7 @@ mod tests {
 
         // Control: one colour for the whole node paints no yellow at all, which
         // is what makes the assertion above about the per-face colours.
-        let all_magenta = NodeMaterials::new().with_faces(cube, vec![magenta; 6]);
+        let all_magenta = NodeMaterials::new().with_faces(cube, vec![magenta.into(); 6]);
         renderer.render(&device, &queue, &mut scene, &selection, &all_magenta, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert_eq!(
@@ -1324,12 +1587,118 @@ mod tests {
     }
 
     #[test]
+    fn a_faces_texture_layer_reaches_the_sampler() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU texture test: no wgpu adapter available");
+            return;
+        };
+
+        let mut scene = Scene::new();
+        let cube = scene.create_mesh("Cube", unit_cube());
+        let selection = Selection::new();
+        let camera = OrbitCamera::default();
+        let size = [TARGET, TARGET];
+
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, size);
+        // Two 1x1 textures: layer 1 is pure red, layer 2 pure green. With four
+        // texels the test would be at the sampler's mercy; one texel per layer
+        // is the whole layer however it is filtered.
+        renderer.set_textures(
+            &device,
+            &queue,
+            &[
+                TextureLayer::solid(1, 1, [255, 0, 0, 255]),
+                TextureLayer::solid(1, 1, [0, 255, 0, 255]),
+            ],
+        );
+        assert_eq!(renderer.texture_size(), [1, 1]);
+        assert_eq!(renderer.texture_layers(), 3, "white + two textures");
+
+        // White material colours, so every hue in the frame comes from a texel.
+        // The two faces of the Y axis pair carry the green texture: one of them
+        // faces the camera from any orbit, so both hues are always in view.
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let mut faces = vec![FaceShading::textured(white, 0); 6];
+        faces[4] = FaceShading::textured(white, 1);
+        faces[5] = FaceShading::textured(white, 1);
+        let textured = NodeMaterials::new().with_faces(cube, faces);
+        renderer.render(&device, &queue, &mut scene, &selection, &textured, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert!(
+            pure_channel_pixels(&pixels, size, 0) > 0,
+            "no red texel reached the target: texture 0 was not sampled"
+        );
+        assert!(
+            pure_channel_pixels(&pixels, size, 1) > 0,
+            "no green texel reached the target: the per-face layer was ignored"
+        );
+
+        // Control: the same colours with the texture off paint only neutral
+        // pixels, so the hues really came from sampling.
+        let flat = NodeMaterials::new().with_faces(cube, vec![white.into(); 6]);
+        renderer.render(&device, &queue, &mut scene, &selection, &flat, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert_eq!(pure_channel_pixels(&pixels, size, 0), 0, "red without a texture");
+        assert_eq!(pure_channel_pixels(&pixels, size, 1), 0, "green without a texture");
+        assert!(
+            bright_neutral_pixels(&pixels, size) > 0,
+            "the untextured cube should still render"
+        );
+    }
+
+    #[test]
+    fn set_textures_rebuilds_the_array_and_falls_back_to_white() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU texture test: no wgpu adapter available");
+            return;
+        };
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+
+        // A green layer whose pixel buffer is far too short: the renderer fills
+        // it white rather than leaving the layer as it was.
+        let mut scene = Scene::new();
+        let cube = scene.create_mesh("Cube", unit_cube());
+        let selection = Selection::new();
+        let camera = OrbitCamera::default();
+        renderer.set_textures(
+            &device,
+            &queue,
+            &[TextureLayer::solid(4, 4, [255, 0, 0, 255]), TextureLayer::new(4, 4, vec![0, 255, 0, 255])],
+        );
+        assert_eq!(renderer.texture_size(), [4, 4]);
+        assert_eq!(renderer.texture_layers(), 3);
+
+        let white = [1.0, 1.0, 1.0, 1.0];
+        let materials =
+            NodeMaterials::new().with_faces(cube, vec![FaceShading::textured(white, 1); 6]);
+        renderer.render(&device, &queue, &mut scene, &selection, &materials, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert_eq!(
+            pure_channel_pixels(&pixels, [TARGET, TARGET], 1),
+            0,
+            "the short green layer should have been filled with white"
+        );
+        assert!(bright_neutral_pixels(&pixels, [TARGET, TARGET]) > 0);
+
+        // An empty set goes back to a single white layer, and the bind groups
+        // that hold the old array are rebuilt with it.
+        renderer.set_textures(&device, &queue, &[]);
+        assert_eq!(renderer.texture_size(), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
+        assert_eq!(renderer.texture_layers(), 1);
+        renderer.render(&device, &queue, &mut scene, &selection, &materials, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert!(bright_neutral_pixels(&pixels, [TARGET, TARGET]) > 0);
+    }
+
+    #[test]
     fn resize_is_clamped_and_a_no_op_when_unchanged() {
-        let Some((_adapter, device, _queue)) = headless_device() else {
+        let Some((_adapter, device, queue)) = headless_device() else {
             eprintln!("skipping GPU resize test: no wgpu adapter available");
             return;
         };
-        let mut renderer = GpuRenderer::new(&device, 1);
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
         assert_eq!(renderer.size(), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
         renderer.resize(&device, [0, 0]);
         assert_eq!(renderer.size(), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
@@ -1359,7 +1728,7 @@ mod tests {
         let mut scene = Scene::new();
         scene.create_mesh("Cube", unit_cube());
         let camera = OrbitCamera::default();
-        let mut renderer = GpuRenderer::new(&device, samples);
+        let mut renderer = GpuRenderer::new(&device, &queue, samples);
         assert_eq!(renderer.samples(), samples);
         renderer.resize(&device, [TARGET, TARGET]);
         assert_eq!(renderer.size(), [TARGET, TARGET]);

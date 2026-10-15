@@ -77,6 +77,19 @@ impl MeshBuffers {
         world: Mat4,
         mut face_color: impl FnMut(usize) -> [f32; 4],
     ) -> MeshBuffers {
+        Self::build_with_face_shading(mesh, world, |face| FaceShading::flat(face_color(face)))
+    }
+
+    /// [`MeshBuffers::build`] with the colour *and* texture resolved per face.
+    ///
+    /// Both join the dedup key: corners shared by faces that differ in either
+    /// become separate vertices, so a textured and an untextured face meeting
+    /// at a corner keep their own sampling.
+    pub fn build_with_face_shading(
+        mesh: &Mesh,
+        world: Mat4,
+        mut face_shading: impl FnMut(usize) -> FaceShading,
+    ) -> MeshBuffers {
         if mesh.is_empty() {
             return MeshBuffers::default();
         }
@@ -89,7 +102,7 @@ impl MeshBuffers {
         };
 
         let mut out = MeshBuffers::default();
-        let mut corner_map: HashMap<(u32, u32, u32, [u32; 4]), u32> = HashMap::new();
+        let mut corner_map: HashMap<(u32, u32, u32, [u32; 4], u32), u32> = HashMap::new();
 
         for (face_idx, face) in mesh.faces.iter().enumerate() {
             let cs = &face.corners;
@@ -99,13 +112,20 @@ impl MeshBuffers {
             if cs.iter().any(|c| c.position as usize >= mesh.positions.len()) {
                 continue;
             }
-            let color = face_color(face_idx);
+            let shading = face_shading(face_idx);
+            let color = shading.color;
             let color_key = [
                 color[0].to_bits(),
                 color[1].to_bits(),
                 color[2].to_bits(),
                 color[3].to_bits(),
             ];
+            // Plain indices; the white layer is layer 0, so `+ 1` keeps
+            // "untextured" distinct from "texture 0".
+            let layer_key = match shading.layer {
+                Some(layer) => layer as u32 + 1,
+                None => 0,
+            };
             // Flat fallback: Newell normal over the face's transformed corners.
             let mut flat = Vec3::ZERO;
             for i in 0..cs.len() {
@@ -118,7 +138,7 @@ impl MeshBuffers {
 
             for i in 1..cs.len() - 1 {
                 for &c in &[cs[0], cs[i], cs[i + 1]] {
-                    let key = (c.position, c.normal, c.uv, color_key);
+                    let key = (c.position, c.normal, c.uv, color_key, layer_key);
                     let idx = *corner_map.entry(key).or_insert_with(|| {
                         let position = world.transform_point3(mesh.positions[c.position as usize]);
                         let normal = match mesh.normals.get(c.normal as usize) {
@@ -126,7 +146,12 @@ impl MeshBuffers {
                             None => flat,
                         };
                         let uv = mesh.uvs.get(c.uv as usize).copied().unwrap_or(Vec2::ZERO);
-                        out.vertices.push(GpuVertex::new(position, normal, uv.to_array(), color));
+                        let vertex = GpuVertex::new(position, normal, uv.to_array(), color);
+                        let vertex = match shading.layer {
+                            Some(layer) => vertex.with_texture_layer(layer),
+                            None => vertex,
+                        };
+                        out.vertices.push(vertex);
                         (out.vertices.len() - 1) as u32
                     });
                     out.indices.push(idx);
@@ -134,6 +159,40 @@ impl MeshBuffers {
             }
         }
         out
+    }
+}
+
+/// What the renderer shades one face with: its linear colour plus, for a
+/// textured face, which of the caller's textures to sample.
+///
+/// The renderer knows nothing about materials — a caller that has a material
+/// library resolves each face's slot into a colour and a texture index and
+/// hands the result in. `layer` counts the caller's textures from zero (the
+/// renderer reserves array layer 0 for white), and `None` means "shade with
+/// the colour alone".
+#[derive(Clone, Copy, PartialEq, Debug, Default)]
+pub struct FaceShading {
+    /// Linear-space RGBA the face is shaded with (multiplied by the texel).
+    pub color: [f32; 4],
+    /// The caller's texture index to sample, or `None` for a flat face.
+    pub layer: Option<usize>,
+}
+
+impl FaceShading {
+    /// A face shaded with a colour alone.
+    pub fn flat(color: [f32; 4]) -> Self {
+        Self { color, layer: None }
+    }
+
+    /// A face shaded with a colour and the caller's texture `layer`.
+    pub fn textured(color: [f32; 4], layer: usize) -> Self {
+        Self { color, layer: Some(layer) }
+    }
+}
+
+impl From<[f32; 4]> for FaceShading {
+    fn from(color: [f32; 4]) -> Self {
+        Self::flat(color)
     }
 }
 
@@ -172,8 +231,8 @@ impl NodeColors {
     }
 }
 
-/// Per-node, per-face colours for [`build_scene_materials`]: the resolved RGBA
-/// of each face, in face order.
+/// Per-node, per-face shading for [`build_scene_materials`]: the resolved
+/// colour and texture of each face, in face order.
 ///
 /// Like [`NodeColors`] the renderer stays material-agnostic — a caller that has
 /// a material library resolves each face (its material slot plus any selection
@@ -181,7 +240,7 @@ impl NodeColors {
 /// an entry, keep the selection/default colours.
 #[derive(Clone, Debug, Default)]
 pub struct NodeMaterials {
-    faces: HashMap<NodeId, Vec<[f32; 4]>>,
+    faces: HashMap<NodeId, Vec<FaceShading>>,
 }
 
 impl NodeMaterials {
@@ -189,21 +248,27 @@ impl NodeMaterials {
         Self::default()
     }
 
-    /// Set (or replace) a node's per-face colours, returning `self` for
+    /// Set (or replace) a node's per-face shading, returning `self` for
     /// chaining.
     #[must_use]
-    pub fn with_faces(mut self, id: NodeId, colors: Vec<[f32; 4]>) -> Self {
-        self.faces.insert(id, colors);
+    pub fn with_faces(mut self, id: NodeId, faces: Vec<FaceShading>) -> Self {
+        self.faces.insert(id, faces);
         self
     }
 
-    /// The colour of one face, when the node has an entry that reaches it.
-    pub fn face_color(&self, id: NodeId, face: usize) -> Option<[f32; 4]> {
+    /// The shading of one face, when the node has an entry that reaches it.
+    pub fn face_shading(&self, id: NodeId, face: usize) -> Option<FaceShading> {
         self.faces.get(&id).and_then(|v| v.get(face)).copied()
     }
 
+    /// The colour of one face; [`NodeMaterials::face_shading`] without the
+    /// texture.
+    pub fn face_color(&self, id: NodeId, face: usize) -> Option<[f32; 4]> {
+        self.face_shading(id, face).map(|s| s.color)
+    }
+
     /// A node's whole per-face list, when it has one.
-    pub fn faces(&self, id: NodeId) -> Option<&[[f32; 4]]> {
+    pub fn faces(&self, id: NodeId) -> Option<&[FaceShading]> {
         self.faces.get(&id).map(Vec::as_slice)
     }
 
@@ -232,28 +297,30 @@ pub fn build_scene_with(
     selection: &Selection,
     colors: &NodeColors,
 ) -> (Vec<MeshBuffers>, Aabb) {
-    build_scene_per_face(scene, selection, |id, _face| colors.get(id))
+    build_scene_per_face(scene, selection, |id, _face| {
+        colors.get(id).map(FaceShading::flat)
+    })
 }
 
-/// [`build_scene`] with a caller-supplied colour per face (e.g. each face's
-/// material slot resolved through a library). A face missing from `materials`
-/// falls back to the selection tint when its node is selected and
-/// [`DEFAULT_BASE_COLOR`] otherwise.
+/// [`build_scene_with`] with a caller-supplied colour *and* texture per face
+/// (e.g. each face's material slot resolved through a library). A face missing
+/// from `materials` falls back to the selection tint when its node is selected
+/// and [`DEFAULT_BASE_COLOR`] otherwise.
 pub fn build_scene_materials(
     scene: &mut Scene,
     selection: &Selection,
     materials: &NodeMaterials,
 ) -> (Vec<MeshBuffers>, Aabb) {
-    build_scene_per_face(scene, selection, |id, face| materials.face_color(id, face))
+    build_scene_per_face(scene, selection, |id, face| materials.face_shading(id, face))
 }
 
 /// Walk `scene`'s visible mesh nodes and build one [`MeshBuffers`] each,
-/// resolving a colour per (node, face). A `None` falls back to the selection
+/// resolving shading per (node, face). A `None` falls back to the selection
 /// tint for selected nodes and [`DEFAULT_BASE_COLOR`] otherwise.
 fn build_scene_per_face(
     scene: &mut Scene,
     selection: &Selection,
-    mut color_of: impl FnMut(NodeId, usize) -> Option<[f32; 4]>,
+    mut shading_of: impl FnMut(NodeId, usize) -> Option<FaceShading>,
 ) -> (Vec<MeshBuffers>, Aabb) {
     let ids: Vec<NodeId> = scene
         .iter()
@@ -266,15 +333,15 @@ fn build_scene_per_face(
         let Ok(world) = scene.world_matrix(id) else { continue };
         let Ok(node) = scene.get(id) else { continue };
         let Some(mesh) = node.mesh() else { continue };
-        let fallback = if selection.is_node_selected(id) {
+        let fallback = FaceShading::flat(if selection.is_node_selected(id) {
             SELECTION_COLOR
         } else {
             DEFAULT_BASE_COLOR
-        };
-        let colors: Vec<[f32; 4]> = (0..mesh.faces.len())
-            .map(|face| color_of(id, face).unwrap_or(fallback))
+        });
+        let faces: Vec<FaceShading> = (0..mesh.faces.len())
+            .map(|face| shading_of(id, face).unwrap_or(fallback))
             .collect();
-        let buf = MeshBuffers::build_with_face_colors(mesh, world, |face| colors[face]);
+        let buf = MeshBuffers::build_with_face_shading(mesh, world, |face| faces[face]);
         bounds.merge(&buf.bounds());
         buffers.push(buf);
     }
@@ -284,6 +351,7 @@ fn build_scene_per_face(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu_types::WHITE_LAYER;
     use openforge_core::mesh::{Corner, Face};
 
     /// A unit quad in the XY plane (facing +Z) with shared corners.
@@ -586,20 +654,59 @@ mod tests {
     }
 
     #[test]
+    fn face_shading_carries_the_texture_layer() {
+        let mesh = quad_and_triangle();
+        // Both faces keep the same colour, so only the texture separates them.
+        let buf = MeshBuffers::build_with_face_shading(&mesh, Mat4::IDENTITY, |face| {
+            FaceShading::textured(RED, face)
+        });
+        // Corners of faces on different textures may not be shared.
+        assert_eq!(buf.vertices.len(), 7);
+        assert_eq!(buf.indices.len(), 9);
+        assert!(buf.vertices[..4].iter().all(|v| v.tex_layer == 1.0), "texture 0");
+        assert!(buf.vertices[4..].iter().all(|v| v.tex_layer == 2.0), "texture 1");
+    }
+
+    #[test]
+    fn an_untextured_face_samples_the_white_layer() {
+        let mesh = quad_and_triangle();
+        let buf = MeshBuffers::build_with_face_shading(&mesh, Mat4::IDENTITY, |face| {
+            if face == 0 {
+                FaceShading::flat(RED)
+            } else {
+                FaceShading::textured(RED, 0)
+            }
+        });
+        assert_eq!(buf.vertices.len(), 7, "flat and textured faces stay apart");
+        assert!(buf.vertices[..4].iter().all(|v| v.tex_layer == WHITE_LAYER));
+        assert!(buf.vertices[4..].iter().all(|v| v.tex_layer == 1.0));
+    }
+
+    #[test]
+    fn the_same_texture_still_deduplicates_shared_corners() {
+        let mesh = quad_and_triangle();
+        let buf = MeshBuffers::build_with_face_shading(&mesh, Mat4::IDENTITY, |_| {
+            FaceShading::textured(RED, 3)
+        });
+        assert_eq!(buf.vertices.len(), 4);
+        assert!(buf.vertices.iter().all(|v| v.tex_layer == 4.0));
+    }
+
+    #[test]
     fn node_materials_are_addressable_and_chain() {
         let mut mats = NodeMaterials::new();
         assert!(mats.is_empty());
         mats = mats
-            .with_faces(NodeId(1), vec![RED, BLUE])
-            .with_faces(NodeId(2), vec![BLUE]);
+            .with_faces(NodeId(1), vec![RED.into(), BLUE.into()])
+            .with_faces(NodeId(2), vec![BLUE.into()]);
         assert_eq!(mats.len(), 2);
         assert!(!mats.is_empty());
         assert_eq!(mats.face_color(NodeId(1), 1), Some(BLUE));
         assert_eq!(mats.face_color(NodeId(1), 2), None, "past the end");
         assert_eq!(mats.face_color(NodeId(3), 0), None, "unknown node");
-        assert_eq!(mats.faces(NodeId(2)), Some(&[BLUE][..]));
+        assert_eq!(mats.faces(NodeId(2)), Some(&[FaceShading::flat(BLUE)][..]));
         // Overwriting keeps one entry per node.
-        let mats = mats.with_faces(NodeId(1), vec![BLUE]);
+        let mats = mats.with_faces(NodeId(1), vec![BLUE.into()]);
         assert_eq!(mats.len(), 2);
         assert_eq!(mats.face_color(NodeId(1), 0), Some(BLUE));
         assert_eq!(mats.face_color(NodeId(1), 1), None);
@@ -612,12 +719,33 @@ mod tests {
         let (buffers, bounds) = build_scene_materials(
             &mut scene,
             &Selection::new(),
-            &NodeMaterials::new().with_faces(id, vec![RED, BLUE]),
+            &NodeMaterials::new().with_faces(id, vec![RED.into(), BLUE.into()]),
         );
         let colors: Vec<[f32; 4]> = buffers[0].vertices.iter().map(|v| v.color).collect();
         assert_eq!(colors.iter().filter(|c| **c == RED).count(), 4, "the quad");
         assert_eq!(colors.iter().filter(|c| **c == BLUE).count(), 3, "the triangle");
         assert!(!bounds.is_empty());
+    }
+
+    #[test]
+    fn build_scene_materials_resolves_each_face_texture() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("two", quad_and_triangle());
+        let (buffers, _) = build_scene_materials(
+            &mut scene,
+            &Selection::new(),
+            &NodeMaterials::new().with_faces(
+                id,
+                vec![FaceShading::textured(RED, 2), FaceShading::flat(BLUE)],
+            ),
+        );
+        let layers: Vec<f32> = buffers[0].vertices.iter().map(|v| v.tex_layer).collect();
+        assert_eq!(layers.iter().filter(|l| **l == 3.0).count(), 4, "the quad");
+        assert_eq!(
+            layers.iter().filter(|l| **l == WHITE_LAYER).count(),
+            3,
+            "the untextured triangle"
+        );
     }
 
     #[test]
@@ -628,7 +756,7 @@ mod tests {
         let (buffers, _) = build_scene_materials(
             &mut scene,
             &Selection::new(),
-            &NodeMaterials::new().with_faces(id, vec![RED]),
+            &NodeMaterials::new().with_faces(id, vec![RED.into()]),
         );
         let colors: Vec<[f32; 4]> = buffers[0].vertices.iter().map(|v| v.color).collect();
         assert_eq!(colors.iter().filter(|c| **c == RED).count(), 4);

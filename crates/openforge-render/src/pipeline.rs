@@ -47,6 +47,9 @@ pub fn default_pass() -> RenderPassDesc {
 /// `@group(0) @binding(0)`, matching [`crate::gpu_types::FrameUniforms`] and
 /// [`crate::gpu_types::GpuVertex`] byte-for-byte.
 ///
+/// The fragment stage also samples the texture array at `@binding(1)` through
+/// the sampler at `@binding(2)`; see [`fragment_shader_wgsl`].
+///
 /// [`FrameUniforms`]: crate::gpu_types::FrameUniforms
 pub fn vertex_shader_wgsl() -> &'static str {
     r#"
@@ -65,12 +68,15 @@ struct VsIn {
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
+    @location(4) layer: f32,
 };
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_normal: vec3<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) layer: f32,
 };
 
 @vertex
@@ -79,14 +85,22 @@ fn vs_main(in: VsIn) -> VsOut {
     out.clip_pos = frame.view_proj * vec4<f32>(in.position, 1.0);
     out.world_normal = in.normal;
     out.color = in.color;
+    out.uv = in.uv;
+    out.layer = in.layer;
     return out;
 }
 "#
 }
 
 /// Fragment stage: N·L Lambert diffuse plus a small ambient term, modulated
-/// by the interpolated vertex color. `frame.light_dir` points from the scene
-/// toward the light.
+/// by the interpolated vertex color and the face's texel. `frame.light_dir`
+/// points from the scene toward the light.
+///
+/// Array layer 0 is a white texel (the [`WHITE_LAYER`] the backend reserves),
+/// so untextured faces sample it and come out as the vertex color alone —
+/// no branch, and no derivative non-uniformity for the array index.
+///
+/// [`WHITE_LAYER`]: crate::gpu_types::WHITE_LAYER
 pub fn fragment_shader_wgsl() -> &'static str {
     r#"
 struct FrameUniforms {
@@ -98,11 +112,15 @@ struct FrameUniforms {
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
+@group(0) @binding(1) var face_texture: texture_2d_array<f32>;
+@group(0) @binding(2) var face_sampler: sampler;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
     @location(0) world_normal: vec3<f32>,
     @location(1) color: vec4<f32>,
+    @location(2) uv: vec2<f32>,
+    @location(3) layer: f32,
 };
 
 @fragment
@@ -112,7 +130,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let diffuse = max(dot(n, l), 0.0);
     let ambient = 0.18;
     let lit = ambient + (1.0 - ambient) * diffuse;
-    return vec4<f32>(in.color.rgb * lit, in.color.a);
+    // `textureSampleLevel` rather than `textureSample`: the layer varies per
+    // face, and an explicit level keeps the fetch legal in any control flow.
+    let texel = textureSampleLevel(face_texture, face_sampler, in.uv, i32(in.layer + 0.5), 0.0);
+    return vec4<f32>(in.color.rgb * texel.rgb * lit, in.color.a * texel.a);
 }
 "#
 }
@@ -125,6 +146,14 @@ pub fn depth_format() -> &'static str {
 /// Texture format for the color attachment, as a wgpu format name. Shaders
 /// output linear color; the `_Srgb` suffix makes the hardware convert.
 pub fn color_format() -> &'static str {
+    "Rgba8UnormSrgb"
+}
+
+/// Texture format for the material texture array, as a wgpu format name.
+///
+/// The same `_Srgb` encoding as the color target, so sampled texels and
+/// vertex colors are both linear by the time the shader multiplies them.
+pub fn texture_format() -> &'static str {
     "Rgba8UnormSrgb"
 }
 
@@ -157,6 +186,11 @@ mod tests {
         assert!(src.contains("@group(0) @binding(0)"));
         assert!(src.contains("@location(0) position"));
         assert!(src.contains("@location(3) color"));
+        // The texture layer rides through the vertex stage untouched.
+        assert!(src.contains("@location(4) layer: f32"));
+        assert!(src.contains("@location(3) layer: f32"));
+        assert!(src.contains("out.layer = in.layer;"));
+        assert!(src.contains("out.uv = in.uv;"));
     }
 
     #[test]
@@ -167,6 +201,12 @@ mod tests {
         assert!(src.contains("@location(0) vec4<f32>"));
         assert!(src.contains("dot(")); // N·L diffuse
         assert!(src.contains("ambient"));
+        // The face's texel modulates the vertex color.
+        assert!(src.contains("@group(0) @binding(1) var face_texture: texture_2d_array<f32>;"));
+        assert!(src.contains("@group(0) @binding(2) var face_sampler: sampler;"));
+        assert!(src.contains("textureSampleLevel("));
+        assert!(!src.contains("textureSample("), "a level keeps the fetch legal in any control flow");
+        assert!(src.contains("in.color.rgb * texel.rgb * lit"));
     }
 
     #[test]
@@ -182,8 +222,26 @@ mod tests {
     }
 
     #[test]
+    fn both_stages_agree_on_the_varying_locations() {
+        // The fragment stage reads what the vertex stage wrote; a location
+        // mismatch would silently drop the texture.
+        let vs = vertex_shader_wgsl();
+        let fs = fragment_shader_wgsl();
+        for location in [
+            "@location(0) world_normal: vec3<f32>",
+            "@location(1) color: vec4<f32>",
+            "@location(2) uv: vec2<f32>",
+            "@location(3) layer: f32",
+        ] {
+            assert!(vs.contains(location), "vertex stage lost {location}");
+            assert!(fs.contains(location), "fragment stage lost {location}");
+        }
+    }
+
+    #[test]
     fn format_constants_are_wgpu_names() {
         assert_eq!(depth_format(), "Depth32Float");
         assert_eq!(color_format(), "Rgba8UnormSrgb");
+        assert_eq!(texture_format(), "Rgba8UnormSrgb");
     }
 }

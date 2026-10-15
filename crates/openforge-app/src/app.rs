@@ -19,9 +19,9 @@ use openforge_core::tool::{
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
-use openforge_materials::{Material, MaterialLibrary};
+use openforge_materials::{Material, MaterialLibrary, Texture};
 use openforge_plugin::PluginHost;
-use openforge_render::{FrameStats, NodeMaterials};
+use openforge_render::{FaceShading, FrameStats, NodeMaterials, TextureLayer};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
 use std::path::PathBuf;
@@ -29,7 +29,9 @@ use std::path::PathBuf;
 /// The material library a new scene starts with: the crate's default grey at
 /// slot 0 plus a few presets, so the materials panel is not empty on first run.
 ///
-/// Slot `0` must stay the default: it is what every unassigned face resolves to.
+/// Slot `0` must stay the default (and untextured): it is what every
+/// unassigned face resolves to. One preset carries a procedural checkerboard,
+/// so texturing can be seen without importing an image first.
 fn default_materials() -> MaterialLibrary {
     let mut library = MaterialLibrary::new();
     for (name, rgb, shininess, specular) in [
@@ -44,7 +46,44 @@ fn default_materials() -> MaterialLibrary {
         material.specular = Vec3::splat(specular);
         library.add_material(material);
     }
+    let checker = library.add_texture(Texture::checkerboard(
+        "Checker",
+        256,
+        32,
+        [236, 236, 236, 255],
+        [64, 84, 116, 255],
+    ));
+    let mut textured = Material::new("Checker Test");
+    textured.diffuse = Vec4::ONE;
+    textured.shininess = 24.0;
+    textured.specular = Vec3::splat(0.1);
+    textured.diffuse_map = Some(checker);
+    library.add_material(textured);
     library
+}
+
+/// One textured triangle as an egui mesh shape.
+///
+/// A mesh multiplies its texture by the vertex colour, so a caller passes the
+/// face's *shaded* material colour. UVs address the texture directly: this
+/// painter and the GPU both sample row 0 at `v = 0`, so neither flips.
+fn textured_triangle(
+    pts: [egui::Pos2; 3],
+    uv: [Vec2; 3],
+    color: egui::Color32,
+    id: egui::TextureId,
+) -> egui::Shape {
+    let mut mesh = egui::Mesh::default();
+    mesh.texture_id = id;
+    for i in 0..3 {
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: pts[i],
+            uv: egui::pos2(uv[i].x, uv[i].y),
+            color,
+        });
+        mesh.indices.push(i as u32);
+    }
+    egui::Shape::mesh(mesh)
 }
 
 /// Which tool is active.
@@ -100,6 +139,18 @@ pub struct OpenForgeApp {
     wireframe: viewport::Wireframe,
     /// The project's materials and textures.
     materials: MaterialLibrary,
+    /// Bumped whenever the texture list changes, so both viewports know when
+    /// their uploaded copies of it are stale.
+    texture_epoch: u64,
+    /// The texture list's epoch as the CPU painter last loaded it.
+    cpu_texture_epoch: u64,
+    /// One egui texture per library texture (lazily uploaded, `None` while
+    /// unloaded), for the CPU painter and the UV editor's background.
+    cpu_textures: Vec<Option<egui::TextureHandle>>,
+    /// The texture list's epoch as the GPU viewport last uploaded it.
+    gpu_texture_epoch: u64,
+    /// Whether the UV editor paints the material's texture behind the UVs.
+    uv_texture_background: bool,
     /// Loaded plugins: services, tools and format filters.
     plugins: PluginHost,
     /// The library entry the materials panel is editing.
@@ -162,6 +213,11 @@ impl OpenForgeApp {
             snap_marker: None,
             wireframe: viewport::Wireframe::default(),
             materials: default_materials(),
+            texture_epoch: 0,
+            cpu_texture_epoch: 0,
+            cpu_textures: Vec::new(),
+            gpu_texture_epoch: u64::MAX,
+            uv_texture_background: true,
             plugins: openforge_plugin::builtin_host(),
             current_material: 0,
             rename_before: None,
@@ -743,32 +799,36 @@ impl OpenForgeApp {
         )
     }
 
-    /// One base colour per face for the GPU path, resolved from the material
-    /// library.
+    /// Per-face shading for the GPU path, resolved from the material library.
     ///
     /// `openforge-render` knows nothing about materials, so the app resolves
-    /// each face's slot (plus the node/face selection tint) into a linear RGB —
-    /// the offscreen target is sRGB and the shader works in linear — and hands
-    /// the renderer the whole list. The GPU path therefore shades per face
-    /// exactly like the CPU path, including meshes that mix several slots.
+    /// each face's slot (plus the node/face selection tint and its texture)
+    /// into a linear RGB — the offscreen target is sRGB and the shader works
+    /// in linear — and hands the renderer the whole list. The GPU path
+    /// therefore shades per face exactly like the CPU path, including meshes
+    /// that mix several slots and textured faces.
     fn node_materials(&self) -> NodeMaterials {
         let mut materials = NodeMaterials::new();
         for node in self.scene.iter().filter(|n| n.is_mesh()) {
             let selected = self.selection.is_node_selected(node.id);
             let sel_faces = self.selection.selected_elements(node.id).cloned();
             let Some(mesh) = node.mesh() else { continue };
-            let faces: Vec<[f32; 4]> = (0..mesh.faces.len())
+            let faces: Vec<FaceShading> = (0..mesh.faces.len())
                 .map(|face| {
                     let face_selected = sel_faces
                         .as_ref()
                         .map(|s| s.contains(&(face as u32)))
                         .unwrap_or(false);
+                    let slot = node.face_material_slot(face);
                     let base = viewport::material_base(
-                        self.materials.resolve(node.face_material_slot(face)),
+                        self.materials.resolve(slot),
                         selected,
                         face_selected,
                     );
-                    openforge_render::gpu::linear_from_srgb_u8([base[0], base[1], base[2]])
+                    FaceShading {
+                        color: openforge_render::gpu::linear_from_srgb_u8([base[0], base[1], base[2]]),
+                        layer: viewport::face_texture(&self.materials, slot),
+                    }
                 })
                 .collect();
             materials = materials.with_faces(node.id, faces);
@@ -777,6 +837,135 @@ impl OpenForgeApp {
     }
 
     // --- Materials -----------------------------------------------------------------
+
+    /// The library's textures, resampled to the size the GPU's texture array
+    /// uses and packed as its layers.
+    ///
+    /// Every layer of a texture array shares one size, and a `Texture` can be
+    /// any size (a 4x4 procedural checker, a 2048px import), so the GPU copies
+    /// are resampled to [`gpu_viewport::TEXTURE_LAYER_SIZE`]. Layer order is
+    /// the library's texture order.
+    fn texture_layers(&self) -> Vec<TextureLayer> {
+        let size = gpu_viewport::TEXTURE_LAYER_SIZE;
+        self.materials
+            .textures
+            .iter()
+            .map(|texture| {
+                let resized = texture.resized(size, size);
+                TextureLayer::new(resized.width, resized.height, resized.pixels)
+            })
+            .collect()
+    }
+
+    /// Hand the library's textures to the GPU viewport, when it has not seen
+    /// this revision of the library yet.
+    fn sync_gpu_textures(&mut self, state: &RenderState) {
+        if self.gpu_texture_epoch == self.texture_epoch {
+            return;
+        }
+        let layers = self.texture_layers();
+        if let Some(gpu) = self.gpu.as_mut() {
+            gpu.set_textures(state, &layers);
+        }
+        self.gpu_texture_epoch = self.texture_epoch;
+    }
+
+    /// The egui texture for library texture `index`, uploaded on first use.
+    ///
+    /// The CPU painter and the UV editor's background both sample through
+    /// these; a library edit (see [`Self::texture_epoch`]) drops the cache and
+    /// the next frame re-uploads.
+    fn cpu_texture(&mut self, ctx: &egui::Context, index: usize) -> Option<egui::TextureId> {
+        if self.cpu_texture_epoch != self.texture_epoch {
+            self.cpu_textures.clear();
+            self.cpu_texture_epoch = self.texture_epoch;
+        }
+        self.cpu_textures.resize(self.materials.texture_count(), None);
+        let slot = self.cpu_textures.get_mut(index)?;
+        if slot.is_none() {
+            let texture = self.materials.textures.get(index)?;
+            if texture.is_empty() {
+                return None;
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [texture.width as usize, texture.height as usize],
+                &texture.pixels,
+            );
+            // Linear filtering and repeat addressing mirror the GPU sampler.
+            let options = egui::TextureOptions {
+                magnification: egui::TextureFilter::Linear,
+                minification: egui::TextureFilter::Linear,
+                wrap_mode: egui::TextureWrapMode::Repeat,
+                ..Default::default()
+            };
+            *slot = Some(ctx.load_texture(texture.name.clone(), image, options));
+        }
+        slot.as_ref().map(|handle| handle.id())
+    }
+
+    /// Every library texture's egui handle, for a frame that draws several.
+    fn cpu_texture_ids(&mut self, ctx: &egui::Context) -> Vec<Option<egui::TextureId>> {
+        (0..self.materials.texture_count())
+            .map(|index| self.cpu_texture(ctx, index))
+            .collect()
+    }
+
+    /// Add a procedural checkerboard to the library and return its index.
+    fn add_checker_texture(&mut self) -> usize {
+        let name = format!("Checker {}", self.materials.texture_count() + 1);
+        let index = self.materials.add_texture(Texture::checkerboard(
+            name,
+            256,
+            32,
+            [236, 236, 236, 255],
+            [176, 96, 48, 255],
+        ));
+        self.texture_epoch += 1;
+        self.dirty = true;
+        index
+    }
+
+    /// Load a PNG or JPEG into the library, reporting the outcome.
+    fn load_texture(&mut self, path: &std::path::Path) -> Option<usize> {
+        match self.materials.try_load_texture_from_file(path) {
+            Ok(index) => {
+                self.texture_epoch += 1;
+                self.dirty = true;
+                let name = self.materials.textures[index].name.clone();
+                self.status = format!("Loaded texture \"{name}\" ({} x {}).", self.materials.textures[index].width, self.materials.textures[index].height);
+                Some(index)
+            }
+            Err(e) => {
+                self.status = format!("Could not load {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
+    /// Point the material the panel is editing at a library texture.
+    fn map_texture_to_current(&mut self, texture: usize) {
+        let name = self.materials.textures.get(texture).map(|t| t.name.clone());
+        if let Some(material) = self.materials.materials.get_mut(self.current_material) {
+            material.diffuse_map = Some(texture);
+            self.dirty = true;
+            if let Some(name) = name {
+                self.status = format!("Mapped \"{name}\" onto \"{}\".", material.name);
+            }
+        }
+    }
+
+    /// The texture the UV editor paints behind the UVs: the selected mesh's
+    /// first face's material map, falling back to the material the panel is
+    /// editing so a preset can be inspected before it is assigned.
+    fn uv_background_texture(&self) -> Option<usize> {
+        let slot = self
+            .selection
+            .selected_nodes()
+            .next()
+            .and_then(|id| self.scene.get(id).ok().map(|n| n.face_material_slot(0)))
+            .unwrap_or(self.current_material as u32);
+        viewport::face_texture(&self.materials, slot)
+    }
 
     /// Assign a library material to every selected mesh node.
     fn assign_material_to_selection(&mut self, slot: u32) {
@@ -1253,6 +1442,9 @@ impl OpenForgeApp {
         order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         let light = Vec3::new(0.4, 0.8, 0.5).normalize();
+        // Library textures as egui handles; loaded before the loop because the
+        // loop holds `self.tris` borrowed.
+        let texture_ids = self.cpu_texture_ids(ui.ctx());
         for (_, i) in order {
             let t = &self.tris[i];
             let mut pts: Vec<egui::Pos2> = Vec::with_capacity(3);
@@ -1282,7 +1474,25 @@ impl OpenForgeApp {
             let [r, g, b, _] =
                 openforge_materials::shade_phong(t.v[0].normal, light, view_dir, 24.0, base);
             let color = egui::Color32::from_rgb(r, g, b);
-            let shape = egui::Shape::convex_polygon(pts, color, egui::Stroke::new(0.5_f32, color.gamma_multiply(0.6)));
+            // A textured face paints its texels through an egui mesh, which
+            // multiplies them by the vertex colour (the shaded material colour
+            // above) exactly like the GPU path's `color * texel * lit`. The
+            // untextured faces keep the painter's polygon, which is cheaper.
+            let texture = viewport::face_texture(&self.materials, t.material)
+                .and_then(|index| texture_ids.get(index).copied().flatten());
+            let shape = match texture {
+                Some(id) => textured_triangle(
+                    [pts[0], pts[1], pts[2]],
+                    [t.v[0].uv, t.v[1].uv, t.v[2].uv],
+                    color,
+                    id,
+                ),
+                None => egui::Shape::convex_polygon(
+                    pts,
+                    color,
+                    egui::Stroke::new(0.5_f32, color.gamma_multiply(0.6)),
+                ),
+            };
             painter.add(shape);
         }
 
@@ -2024,6 +2234,11 @@ impl OpenForgeApp {
         });
 
         let index = self.current_material;
+        // Read the texture list (and upload any missing egui handles) before
+        // borrowing the material itself.
+        let texture_names: Vec<String> =
+            self.materials.textures.iter().map(|t| t.name.clone()).collect();
+        let texture_ids = self.cpu_texture_ids(ui.ctx());
         let Some(material) = self.materials.materials.get_mut(index) else { return };
         ui.separator();
         ui.label(format!("slot {index}"));
@@ -2031,6 +2246,36 @@ impl OpenForgeApp {
             ui.label("Name");
             if ui.text_edit_singleline(&mut material.name).changed() {
                 self.dirty = true;
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Texture");
+            let mut map = material.diffuse_map;
+            let selected = match map.and_then(|i| texture_names.get(i)) {
+                Some(name) => name.clone(),
+                None => "None".to_owned(),
+            };
+            egui::ComboBox::from_id_salt("material-texture")
+                .selected_text(selected)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut map, None, "None");
+                    for (i, name) in texture_names.iter().enumerate() {
+                        ui.selectable_value(&mut map, Some(i), name);
+                    }
+                });
+            if map != material.diffuse_map {
+                material.diffuse_map = map;
+                self.dirty = true;
+            }
+            // A thumbnail of what the map looks like, when there is one.
+            if let Some(id) = map.and_then(|i| texture_ids.get(i).copied().flatten()) {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    id,
+                    egui::vec2(20.0, 20.0),
+                )));
+            }
+            if texture_names.is_empty() {
+                ui.label("(no textures yet)");
             }
         });
         let mut rgba = egui::Color32::from_rgba_unmultiplied(
@@ -2060,6 +2305,34 @@ impl OpenForgeApp {
         {
             self.dirty = true;
         }
+        ui.horizontal(|ui| {
+            if ui
+                .button("Load Texture…")
+                .on_hover_text("Import a PNG or JPEG into the library and map it onto this material")
+                .clicked()
+            {
+                if let Some(path) = rfd_pick_texture() {
+                    if let Some(texture) = self.load_texture(&path) {
+                        self.map_texture_to_current(texture);
+                    }
+                }
+            }
+            if ui
+                .button("Checker")
+                .on_hover_text("Add a procedural checkerboard and map it onto this material")
+                .clicked()
+            {
+                let texture = self.add_checker_texture();
+                self.map_texture_to_current(texture);
+            }
+            if ui
+                .checkbox(&mut self.uv_texture_background, "UV background")
+                .on_hover_text("Paint this texture behind the UVs in the UV editor")
+                .changed()
+            {
+                self.dirty = true;
+            }
+        });
     }
 
     fn properties_panel(&mut self, ui: &mut egui::Ui) {
@@ -2147,6 +2420,10 @@ impl OpenForgeApp {
                 // difference is shading quality and depth correctness.
                 // The per-face colours have to be resolved before `gpu` is
                 // borrowed mutably, and only the GPU path needs them.
+                // Textures upload on the library's revision, not per frame.
+                if let Some(state) = render_state {
+                    self.sync_gpu_textures(state);
+                }
                 let colors = match (render_state, self.gpu.is_some()) {
                     (Some(_), true) => self.node_materials(),
                     _ => NodeMaterials::new(),
@@ -2624,9 +2901,15 @@ impl OpenForgeApp {
             (Some(pos), Some(mesh)) => uv_editor::pick_uv(mesh, pos, rect),
             _ => None,
         };
+        let background = if self.uv_texture_background {
+            self.uv_background_texture()
+                .and_then(|index| self.cpu_texture(ui.ctx(), index))
+        } else {
+            None
+        };
         if let Ok(node) = self.scene.get(id) {
             if let Some(mesh) = node.mesh() {
-                uv_editor::draw_canvas(&painter, rect, mesh, &self.uv, hovered);
+                uv_editor::draw_canvas(&painter, rect, mesh, &self.uv, hovered, background);
             }
         }
 
@@ -2969,6 +3252,12 @@ fn rfd_save_file() -> Option<PathBuf> {
         .add_filter("3D models", &["obj", "glb", "ply", "stl"])
         .set_file_name("export.obj")
         .save_file()
+}
+
+fn rfd_pick_texture() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Images", &["png", "jpg", "jpeg"])
+        .pick_file()
 }
 
 #[cfg(test)]
@@ -3694,12 +3983,169 @@ mod tests {
     #[test]
     fn the_material_library_starts_with_the_default_and_the_presets() {
         let library = default_materials();
-        assert_eq!(library.material_count(), 5);
+        assert_eq!(library.material_count(), 6);
         // Slot 0 stays the default: it is what an unassigned face resolves to.
         assert_eq!(library.resolve(0).name, "Default");
         assert_eq!(library.resolve(2).name, "Painted Red");
         assert_eq!(library.resolve(4).name, "Gold");
         assert!(library.resolve(99).name == "Default", "out of range falls back");
+        // One preset carries a procedural checkerboard, so texturing can be
+        // seen without importing anything.
+        assert_eq!(library.texture_count(), 1);
+        assert_eq!(library.resolve_texture(Some(0)).unwrap().name, "Checker");
+        assert_eq!(library.resolve(5).name, "Checker Test");
+        assert_eq!(library.resolve(5).diffuse_map, Some(0));
+        // The default material stays untextured.
+        assert_eq!(library.resolve(0).diffuse_map, None);
+    }
+
+    /// Every mesh shape a frame painted, in paint order.
+    fn painted_meshes(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Mesh> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Mesh>) {
+            match shape {
+                egui::Shape::Mesh(mesh) => out.push(mesh.clone()),
+                egui::Shape::Vec(inner) => {
+                    for s in inner {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn a_textured_material_reaches_the_cpu_and_gpu_paths() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        app.selection.clear();
+
+        // Untextured: the painter draws shaded polygons, no textured meshes.
+        let shapes = paint_once(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        assert!(painted_meshes(&shapes).is_empty(), "nothing is textured yet");
+        assert!(!painted_fills(&shapes).is_empty(), "the mesh still shades");
+
+        // Assign the checker preset, and deselect so the tints stay out of it.
+        app.selection.select_node(id);
+        app.assign_material_to_selection(5);
+        app.selection.deselect_node(id);
+
+        // The GPU path names the library texture per face.
+        let layers: Vec<Option<usize>> = app
+            .node_materials()
+            .faces(id)
+            .expect("the node's faces")
+            .iter()
+            .map(|shading| shading.layer)
+            .collect();
+        assert!(!layers.is_empty());
+        assert!(layers.iter().all(|layer| *layer == Some(0)), "{layers:?}");
+
+        // The CPU path paints each textured face as a mesh over the library
+        // texture, with the mesh's own UVs.
+        let shapes = paint_once(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None));
+        let meshes = painted_meshes(&shapes);
+        assert!(!meshes.is_empty(), "no textured triangle was painted");
+        let texture = app.cpu_texture(&ctx, 0).expect("the checker is in the library");
+        assert!(meshes.iter().all(|m| m.texture_id == texture));
+        assert!(meshes.iter().all(|m| m.vertices.len() == 3 && m.indices == [0, 1, 2]));
+        assert!(
+            meshes
+                .iter()
+                .any(|m| m.vertices.iter().any(|v| v.uv != egui::pos2(0.0, 0.0))),
+            "the UVs never left the mesh"
+        );
+    }
+
+    #[test]
+    fn adding_textures_bumps_the_epoch_and_keeps_the_gpu_layers_uniform() {
+        let (mut app, _id) = app_ready_to_move();
+        assert_eq!(app.texture_epoch, 0, "the seeded library is the first revision");
+        assert_eq!(app.materials.texture_count(), 1);
+
+        let index = app.add_checker_texture();
+        assert_eq!(index, 1, "it lands after the seeded checker");
+        assert_eq!(app.texture_epoch, 1);
+
+        // A small texture still reaches the GPU at the array's one size.
+        app.materials.add_texture(Texture::checkerboard("tiny", 8, 2, [255, 0, 0, 255], [0, 0, 255, 255]));
+        app.texture_epoch += 1;
+        let layers = app.texture_layers();
+        assert_eq!(layers.len(), 3);
+        assert!(layers.iter().all(|layer| {
+            layer.width == gpu_viewport::TEXTURE_LAYER_SIZE
+                && layer.height == gpu_viewport::TEXTURE_LAYER_SIZE
+                && layer.is_complete()
+        }));
+        // The resample kept the pattern: both of the tiny checker's colours are
+        // in the resized layer.
+        let tiny = &layers[2];
+        let has = |rgb: [u8; 3]| {
+            tiny.rgba
+                .chunks_exact(4)
+                .any(|t| t[0] == rgb[0] && t[1] == rgb[1] && t[2] == rgb[2])
+        };
+        assert!(has([255, 0, 0]) && has([0, 0, 255]), "the resize lost the checker");
+    }
+
+    #[test]
+    fn a_failed_texture_load_is_reported_and_changes_nothing() {
+        let (mut app, _id) = app_ready_to_move();
+        assert!(app.load_texture(std::path::Path::new("/no/such/texture.png")).is_none());
+        assert!(app.status.contains("Could not load"), "status: {}", app.status);
+        assert_eq!(app.materials.texture_count(), 1);
+        assert_eq!(app.texture_epoch, 0, "a failed load is not a new revision");
+    }
+
+    #[test]
+    fn mapping_a_texture_onto_a_material_feeds_the_uv_editor() {
+        let (mut app, id) = app_ready_to_move();
+        app.current_material = 1;
+        assert_eq!(app.uv_background_texture(), None, "clay has no map");
+
+        let index = app.add_checker_texture();
+        app.map_texture_to_current(index);
+        assert_eq!(app.materials.resolve(1).diffuse_map, Some(index));
+        assert!(app.status.contains("Mapped"), "status: {}", app.status);
+
+        // The UV editor follows the selected mesh's material when there is one.
+        app.selection.select_node(id);
+        assert_eq!(app.uv_background_texture(), None, "the node is on the default slot");
+        app.assign_material_to_selection(1);
+        assert_eq!(app.uv_background_texture(), Some(index));
+        // With nothing selected it falls back to the material the panel edits.
+        app.selection.clear();
+        assert_eq!(app.uv_background_texture(), Some(index));
+    }
+
+    #[test]
+    fn a_textured_triangle_maps_uvs_to_the_texture_and_keeps_the_colour() {
+        let color = egui::Color32::from_rgb(10, 20, 30);
+        let id = egui::TextureId::Managed(7);
+        let shape = textured_triangle(
+            [egui::pos2(1.0, 2.0), egui::pos2(3.0, 4.0), egui::pos2(5.0, 6.0)],
+            [
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.5),
+                Vec2::new(0.25, 1.0),
+            ],
+            color,
+            id,
+        );
+        let egui::Shape::Mesh(mesh) = shape else {
+            panic!("a textured triangle is a mesh shape");
+        };
+        assert_eq!(mesh.texture_id, id);
+        assert_eq!(mesh.indices, vec![0, 1, 2]);
+        assert_eq!(mesh.vertices[0].pos, egui::pos2(1.0, 2.0));
+        assert_eq!(mesh.vertices[1].uv, egui::pos2(1.0, 0.5));
+        assert_eq!(mesh.vertices[2].uv, egui::pos2(0.25, 1.0));
+        assert!(mesh.vertices.iter().all(|v| v.color == color));
     }
 
     #[test]
@@ -3742,9 +4188,9 @@ mod tests {
         assert_eq!(materials.len(), 1, "one entry per mesh node");
         let got = materials.faces(id).expect("the node's colours");
         assert!(!got.is_empty(), "one colour per face");
-        for color in got {
-            for (a, b) in color.iter().zip(&expected) {
-                assert!((a - b).abs() < 1e-6, "{color:?} vs {expected:?}");
+        for shading in got {
+            for (a, b) in shading.color.iter().zip(&expected) {
+                assert!((a - b).abs() < 1e-6, "{shading:?} vs {expected:?}");
             }
         }
     }
@@ -3775,7 +4221,12 @@ mod tests {
         assert_ne!(clay, steel, "the two slots must be visibly different");
 
         let materials = app.node_materials();
-        let colors = materials.faces(id).expect("the node's colours");
+        let colors: Vec<[f32; 4]> = materials
+            .faces(id)
+            .expect("the node's colours")
+            .iter()
+            .map(|shading| shading.color)
+            .collect();
         assert_eq!(colors.len(), face_count);
         assert_eq!(colors[0], clay);
         assert_eq!(colors[1], steel);
@@ -3787,7 +4238,7 @@ mod tests {
         // Undo puts the node back on the single slot.
         app.undo_edit();
         assert_eq!(app.scene.get(id).unwrap().face_material_slot(1), 1);
-        assert_eq!(app.node_materials().faces(id).unwrap()[1], clay);
+        assert_eq!(app.node_materials().faces(id).unwrap()[1].color, clay);
     }
 
     #[test]
@@ -3816,19 +4267,19 @@ mod tests {
     fn a_material_that_is_in_use_cannot_be_removed() {
         let (mut app, id) = app_ready_to_move();
         app.selection.select_node(id);
-        app.assign_material_to_selection(4);
-        assert!(app.material_in_use(4));
+        app.assign_material_to_selection(5);
+        assert!(app.material_in_use(5));
         assert!(!app.material_in_use(3));
 
-        app.current_material = 4;
+        app.current_material = 5;
         app.delete_current_material();
-        assert_eq!(app.materials.material_count(), 5, "refused while assigned");
+        assert_eq!(app.materials.material_count(), 6, "refused while assigned");
 
         // Unassign it and the last entry can go.
         app.assign_material_to_selection(0);
-        app.current_material = 4;
+        app.current_material = 5;
         app.delete_current_material();
-        assert_eq!(app.materials.material_count(), 4);
+        assert_eq!(app.materials.material_count(), 5);
         assert_eq!(app.current_material, 0, "the selection falls back to the default");
     }
 
@@ -3837,7 +4288,7 @@ mod tests {
         let (mut app, _id) = app_ready_to_move();
         app.current_material = 2;
         app.delete_current_material();
-        assert_eq!(app.materials.material_count(), 5, "removing it would renumber slots");
+        assert_eq!(app.materials.material_count(), 6, "removing it would renumber slots");
         assert!(app.status.contains("last material"), "status: {}", app.status);
     }
 

@@ -16,8 +16,15 @@ use openforge_render::gpu::{
     linear_from_srgb_u8, supported_samples, FrameStats, GpuRenderer, COLOR_FORMAT, KEY_LIGHT,
     PREFERRED_SAMPLES,
 };
-use openforge_render::{GpuVertex, NodeMaterials, OrbitCamera};
+use openforge_render::{GpuVertex, NodeMaterials, OrbitCamera, TextureLayer};
 use wgpu::FilterMode;
+
+/// Edge length, in texels, of every layer of the GPU texture array.
+///
+/// A texture array's layers share one size, so the app resamples each library
+/// texture to this before handing it over. 256 keeps a library of a dozen
+/// textures under a few megabytes while staying sharp at viewport sizes.
+pub const TEXTURE_LAYER_SIZE: u32 = 256;
 
 /// The wgpu viewport and the egui handle its image is drawn through.
 pub struct GpuViewport {
@@ -33,13 +40,23 @@ impl GpuViewport {
     /// the preferred count for the color format egui requires.
     pub fn new(state: &RenderState) -> Self {
         let samples = supported_samples(&state.adapter, COLOR_FORMAT, PREFERRED_SAMPLES);
-        let renderer = GpuRenderer::new(&state.device, samples);
+        let renderer = GpuRenderer::new(&state.device, &state.queue, samples);
         let texture_id = state.renderer.write().register_native_texture(
             &state.device,
             renderer.color_view(),
             FilterMode::Linear,
         );
         Self { renderer, texture_id }
+    }
+
+    /// Upload the library's textures as the scene pass's texture array.
+    ///
+    /// Layers are taken in order from array layer 1; layer 0 stays the white
+    /// layer untextured faces sample (see
+    /// [`openforge_render::WHITE_LAYER`]), which is why a face's texture index
+    /// is its layer minus one.
+    pub fn set_textures(&mut self, state: &RenderState, layers: &[TextureLayer]) {
+        self.renderer.set_textures(&state.device, &state.queue, layers);
     }
 
     /// Render one frame of `scene` at `size` in physical pixels, returning the

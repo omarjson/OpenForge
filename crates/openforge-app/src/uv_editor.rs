@@ -206,21 +206,43 @@ impl UvEditor {
     }
 }
 
-/// Draw the UV canvas: the tile, a quarter grid, every face outline and a dot
-/// per UV entry (selected entries highlighted, `hovered` ringed).
+/// Draw the UV canvas: the tile (with the material's texture behind it when
+/// `background` names one), a quarter grid, every face outline and a dot per
+/// UV entry (selected entries highlighted, `hovered` ringed).
 pub fn draw_canvas(
     painter: &egui::Painter,
     canvas: egui::Rect,
     mesh: &Mesh,
     editor: &UvEditor,
     hovered: Option<u32>,
+    background: Option<egui::TextureId>,
 ) {
     let tile = tile_rect(canvas);
     // Dim the out-of-tile area so the 0..1 region reads as the UV space proper.
     painter.rect_filled(canvas, 0.0, egui::Color32::from_gray(20));
-    painter.rect_filled(tile, 0.0, egui::Color32::from_rgb(38, 40, 46));
+    match background {
+        // The image's last row lands at the tile's top: UV `v = 0` is the
+        // texture's row 0, which sits at the *bottom* of the UV space.
+        Some(id) => {
+            painter.image(
+                id,
+                tile,
+                egui::Rect::from_min_max(egui::pos2(0.0, 1.0), egui::pos2(1.0, 0.0)),
+                egui::Color32::WHITE,
+            );
+        }
+        None => {
+            painter.rect_filled(tile, 0.0, egui::Color32::from_rgb(38, 40, 46));
+        }
+    }
 
-    let grid_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_gray(58));
+    let grid_stroke = if background.is_some() {
+        // Over a texture the dark grid disappears; a light veil keeps the
+        // quarter divisions readable without hiding the texels.
+        egui::Stroke::new(1.0_f32, egui::Color32::from_white_alpha(48))
+    } else {
+        egui::Stroke::new(1.0_f32, egui::Color32::from_gray(58))
+    };
     for i in 1..4 {
         let t = i as f32 / 4.0;
         let x = tile.left() + t * tile.width();
@@ -438,5 +460,64 @@ mod tests {
         // Re-selecting replaces rather than merging.
         e.select_only([7]);
         assert_eq!(e.indices(), vec![7]);
+    }
+
+    /// Paint one canvas frame and return the shapes it produced.
+    fn painted(
+        mesh: &Mesh,
+        editor: &UvEditor,
+        background: Option<egui::TextureId>,
+    ) -> Vec<egui::Shape> {
+        let ctx = egui::Context::default();
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            let painter =
+                ctx.layer_painter(egui::LayerId::new(egui::Order::Middle, egui::Id::new("uv")));
+            draw_canvas(&painter, canvas(), mesh, editor, None, background);
+        });
+        output.shapes.into_iter().map(|clipped| clipped.shape).collect()
+    }
+
+    #[test]
+    fn a_texture_background_paints_the_tile_behind_the_uvs() {
+        let mesh = mesh_with_uvs(&[Vec2::new(0.1, 0.2), Vec2::new(0.9, 0.8)]);
+        let editor = UvEditor::default();
+        let id = egui::TextureId::Managed(2);
+        let image = |shapes: &[egui::Shape]| {
+            shapes.iter().find_map(|s| match s {
+                egui::Shape::Mesh(m) if m.texture_id == id => Some(m.clone()),
+                _ => None,
+            })
+        };
+
+        // Without a background the tile is a plain fill, not an image.
+        assert!(image(&painted(&mesh, &editor, None)).is_none());
+
+        // With one, a textured quad covers the tile.
+        let shapes = painted(&mesh, &editor, Some(id));
+        let quad = image(&shapes).expect("the background texture is painted");
+        assert_eq!(quad.vertices.len(), 4);
+        let tile = tile_rect(canvas());
+        assert!(quad.vertices.iter().all(|v| tile.contains(v.pos)));
+        let xs: Vec<f32> = quad.vertices.iter().map(|v| v.pos.x).collect();
+        let ys: Vec<f32> = quad.vertices.iter().map(|v| v.pos.y).collect();
+        assert!((xs.iter().cloned().fold(f32::INFINITY, f32::min) - tile.left()).abs() < 1e-3);
+        assert!((xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max) - tile.right()).abs() < 1e-3);
+        assert!((ys.iter().cloned().fold(f32::INFINITY, f32::min) - tile.top()).abs() < 1e-3);
+        assert!((ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max) - tile.bottom()).abs() < 1e-3);
+
+        // The texel rows follow the UV space: row 0 (v = 0) is the tile's
+        // *bottom*, because the editor draws v upwards.
+        let top = quad
+            .vertices
+            .iter()
+            .min_by(|a, b| a.pos.y.total_cmp(&b.pos.y))
+            .expect("four vertices");
+        let bottom = quad
+            .vertices
+            .iter()
+            .max_by(|a, b| a.pos.y.total_cmp(&b.pos.y))
+            .expect("four vertices");
+        assert_eq!(top.uv.y, 1.0, "the texture's last row is the UV space's top");
+        assert_eq!(bottom.uv.y, 0.0, "row 0 is v = 0, at the bottom");
     }
 }
