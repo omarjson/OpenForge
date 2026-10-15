@@ -227,7 +227,13 @@ impl Mesh {
     }
 }
 
-/// Build a UV-sphere mesh. Useful as both a primitive and a test fixture.
+/// Build a UV-sphere mesh, with spherical UVs. Useful as both a primitive and
+/// a test fixture.
+///
+/// The vertex grid is one point per latitude/longitude pair — the seam column
+/// is duplicated, so `u` runs a full 0..1 — and every corner's UV index is its
+/// position index, so mapping the sphere is a no-op and the UV editor shows a
+/// real unwrap instead of every entry stacked at the origin.
 pub fn uv_sphere(radius: f32, segments: u32, rings: u32) -> Mesh {
     let mut m = Mesh::new();
     let segments = segments.max(3);
@@ -242,6 +248,7 @@ pub fn uv_sphere(radius: f32, segments: u32, rings: u32) -> Mesh {
             let y = phi.cos();
             let z = phi.sin() * theta.sin();
             m.add_vertex(Vec3::new(x, y, z) * radius);
+            m.uvs.push(Vec2::new(u, v));
         }
     }
     let stride = segments + 1;
@@ -257,6 +264,11 @@ pub fn uv_sphere(radius: f32, segments: u32, rings: u32) -> Mesh {
             if r != rings - 1 {
                 m.add_face(&[b, c, d]);
             }
+        }
+    }
+    for face in m.faces.iter_mut() {
+        for corner in face.corners.iter_mut() {
+            corner.uv = corner.position;
         }
     }
     m.compute_smooth_normals();
@@ -306,5 +318,22 @@ mod tests {
         assert!((b.max.y - 1.0).abs() < 1e-4);
         assert!((b.max.z - 1.0).abs() < 1e-4);
         assert!((b.min.x + 1.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn sphere_carries_spherical_uvs() {
+        let s = uv_sphere(1.0, 8, 6);
+        assert_eq!(s.uvs.len(), s.positions.len(), "one uv per grid point");
+        // The seam column is duplicated, so u spans the full range.
+        assert!(s.uvs.iter().any(|uv| uv.x == 0.0));
+        assert!(s.uvs.iter().any(|uv| uv.x == 1.0));
+        assert!(s.uvs.iter().any(|uv| uv.y == 0.0), "the north pole row");
+        assert!(s.uvs.iter().any(|uv| uv.y == 1.0), "the south pole row");
+        // Every corner samples its own grid point's uv.
+        for face in &s.faces {
+            for c in &face.corners {
+                assert_eq!(c.uv, c.position);
+            }
+        }
     }
 }

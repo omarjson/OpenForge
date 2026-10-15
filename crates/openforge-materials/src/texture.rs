@@ -73,6 +73,56 @@ impl Texture {
         Texture { name: name.into(), width: size, height: size, pixels }
     }
 
+    /// Resample the texture to the given size with bilinear filtering.
+    ///
+    /// Destination texel centers map to source texel centers
+    /// (`(x + 0.5) * src_w / dst_w - 0.5`), and samples outside the source are
+    /// clamped to its edge texels — the resample does not wrap, so the result
+    /// has no seam. A resize to the same size copies the pixels exactly, and a
+    /// zero width or height yields an empty texture of the requested size. The
+    /// name is preserved.
+    pub fn resized(&self, width: u32, height: u32) -> Texture {
+        let name = self.name.clone();
+        if width == self.width && height == self.height {
+            return Texture { name, width, height, pixels: self.pixels.clone() };
+        }
+        let pixels = match texel_bytes(width, height) {
+            Some(n) if n > 0 && !self.is_empty() => {
+                // Clamp a float source coordinate to a valid texel index; the
+                // saturating cast maps NaN to 0 and infinities to the ends.
+                let clamp = |v: f32, max: i64| (v as i64).clamp(0, max) as u32;
+                let (max_x, max_y) = ((self.width - 1) as i64, (self.height - 1) as i64);
+                let mut pixels = Vec::with_capacity(n);
+                for y in 0..height {
+                    let sy = (y as f32 + 0.5) * self.height as f32 / height as f32 - 0.5;
+                    let y0 = sy.floor();
+                    let fy = sy - y0;
+                    for x in 0..width {
+                        let sx = (x as f32 + 0.5) * self.width as f32 / width as f32 - 0.5;
+                        let x0 = sx.floor();
+                        let fx = sx - x0;
+                        let c00 = self.pixel_at(clamp(x0, max_x), clamp(y0, max_y));
+                        let c10 = self.pixel_at(clamp(x0 + 1.0, max_x), clamp(y0, max_y));
+                        let c01 = self.pixel_at(clamp(x0, max_x), clamp(y0 + 1.0, max_y));
+                        let c11 = self.pixel_at(clamp(x0 + 1.0, max_x), clamp(y0 + 1.0, max_y));
+                        let mut texel = [0u8; 4];
+                        for c in 0..4 {
+                            let v = c00[c] as f32 * (1.0 - fx) * (1.0 - fy)
+                                + c10[c] as f32 * fx * (1.0 - fy)
+                                + c01[c] as f32 * (1.0 - fx) * fy
+                                + c11[c] as f32 * fx * fy;
+                            texel[c] = (v + 0.5) as u8;
+                        }
+                        pixels.extend_from_slice(&texel);
+                    }
+                }
+                pixels
+            }
+            _ => Vec::new(),
+        };
+        Texture { name, width, height, pixels }
+    }
+
     /// Decode encoded image bytes (PNG or JPEG) into an RGBA8 texture.
     ///
     /// `source` labels the origin (typically a file path) in error messages.
@@ -259,5 +309,107 @@ mod tests {
     fn from_encoded_rejects_garbage_bytes() {
         let err = Texture::from_encoded("bogus", &[1, 2, 3, 4]).unwrap_err();
         assert!(matches!(err, MaterialError::Decode { .. }));
+    }
+
+    #[test]
+    fn resized_upscale_keeps_corners_and_palette() {
+        // Four distinct corner texels; every destination corner samples the
+        // matching source corner exactly.
+        let mut t = Texture::solid("quad", 2, 2, RED);
+        t.pixels[4..8].copy_from_slice(&GREEN);
+        t.pixels[8..12].copy_from_slice(&BLUE);
+        t.pixels[12..16].copy_from_slice(&[9, 9, 9, 9]);
+        let r = t.resized(4, 4);
+        assert_eq!(r.width, 4);
+        assert_eq!(r.height, 4);
+        assert_eq!(r.pixel_at(0, 0), RED);
+        assert_eq!(r.pixel_at(3, 0), GREEN);
+        assert_eq!(r.pixel_at(0, 3), BLUE);
+        assert_eq!(r.pixel_at(3, 3), [9, 9, 9, 9]);
+        // Filtered texels blend the palette rather than falling off it.
+        assert!(r.pixels.chunks_exact(4).all(|p| p != MISSING_TEXEL));
+    }
+
+    #[test]
+    fn resized_same_size_copies_pixels_exactly() {
+        let t = Texture::checkerboard("check", 4, 2, RED, BLUE);
+        let r = t.resized(4, 4);
+        assert_eq!(r.width, 4);
+        assert_eq!(r.height, 4);
+        assert_eq!(r.pixels, t.pixels);
+    }
+
+    #[test]
+    fn resized_downscale_blends_checkerboard() {
+        // Cell size 1 puts both colors inside every 2x2 destination footprint.
+        let t = Texture::checkerboard("check", 4, 1, RED, BLUE);
+        let r = t.resized(2, 2);
+        let mid = r.pixel_at(0, 0);
+        // Dropping a texel would stay pure RED or BLUE; blending lands between.
+        assert!(mid[0] > BLUE[0] && mid[0] < RED[0]);
+        assert!(mid[2] > RED[2] && mid[2] < BLUE[2]);
+        // Alpha is interpolated too (no premultiply): between BLUE.a and RED.a.
+        assert!(mid[3] > BLUE[3] && mid[3] < RED[3]);
+    }
+
+    #[test]
+    fn resized_stretch_keeps_edges_and_interpolates() {
+        let mut t = Texture::solid("gradient", 2, 1, RED);
+        t.pixels[4..8].copy_from_slice(&GREEN);
+        let r = t.resized(4, 1);
+        assert_eq!(r.width, 4);
+        assert_eq!(r.height, 1);
+        // Edge texel centers clamp to the source edge texels, so they stay exact.
+        assert_eq!(r.pixel_at(0, 0), RED);
+        assert_eq!(r.pixel_at(3, 0), GREEN);
+        // The two interior texels sample between the source colors.
+        let left = r.pixel_at(1, 0);
+        let right = r.pixel_at(2, 0);
+        assert!(left[0] > GREEN[0] && left[0] < RED[0]);
+        assert!(left[1] > RED[1] && left[1] < GREEN[1]);
+        assert!(right[0] > GREEN[0] && right[0] < RED[0]);
+        assert!(right[1] > RED[1] && right[1] < GREEN[1]);
+    }
+
+    #[test]
+    fn resized_solid_stays_solid() {
+        let t = Texture::solid("dot", 1, 1, BLUE);
+        let r = t.resized(5, 3);
+        assert_eq!(r.width, 5);
+        assert_eq!(r.height, 3);
+        assert!(r.pixels.chunks_exact(4).all(|p| p == BLUE));
+    }
+
+    #[test]
+    fn resized_zero_size_is_empty() {
+        let t = Texture::solid("s", 4, 4, RED);
+        let r = t.resized(0, 8);
+        assert!(r.is_empty());
+        assert_eq!(r.width, 0);
+        assert_eq!(r.height, 8);
+        let r = t.resized(4, 0);
+        assert!(r.is_empty());
+        assert_eq!(r.width, 4);
+        assert_eq!(r.height, 0);
+        assert!(r.pixels.is_empty());
+    }
+
+    #[test]
+    fn resized_empty_source_stays_empty() {
+        let t = Texture::solid("empty", 0, 4, RED);
+        assert!(t.is_empty());
+        let r = t.resized(4, 4);
+        assert!(r.is_empty());
+        assert_eq!(r.width, 4);
+        assert_eq!(r.height, 4);
+        // Empty in, empty out: not a MISSING_TEXEL fill.
+        assert!(r.pixels.is_empty());
+    }
+
+    #[test]
+    fn resized_preserves_name() {
+        let t = Texture::solid("brick.png", 2, 2, RED);
+        assert_eq!(t.resized(5, 5).name, "brick.png");
+        assert_eq!(t.resized(2, 2).name, "brick.png");
     }
 }
