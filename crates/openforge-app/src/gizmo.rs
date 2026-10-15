@@ -383,6 +383,28 @@ pub enum Targets {
     Vertices(Vec<VertexTarget>),
 }
 
+impl Targets {
+    /// What snapping must ignore, so a drag can never snap to the geometry it
+    /// is carrying: the nodes whose vertices all move, and the individual
+    /// vertices that move (which may be a subset of their node).
+    ///
+    /// A whole node is excluded at object level because its own pivot sits on
+    /// its geometry: without that, the nearest vertex under the cursor would be
+    /// the one the drag started on and the node could never move at all.
+    pub fn moving(&self) -> (Vec<NodeId>, Vec<(NodeId, u32)>) {
+        match self {
+            Targets::Nodes(nodes) => (nodes.iter().map(|(id, _)| *id).collect(), Vec::new()),
+            Targets::Vertices(targets) => (
+                Vec::new(),
+                targets
+                    .iter()
+                    .flat_map(|t| t.positions.iter().map(|(vi, _)| (t.node, *vi)))
+                    .collect(),
+            ),
+        }
+    }
+}
+
 /// An in-progress axis-constrained drag.
 #[derive(Clone, Debug)]
 pub struct Drag {
@@ -439,12 +461,23 @@ impl Gizmo {
 
     /// Move the dragged targets along the dragged axis, using the cursor ray.
     ///
+    /// `snap` and `vertex` come from the app, which resolves the vertex under
+    /// the cursor (if any) against the scene's other geometry: [`apply_measure`]
+    /// gets the snapped measure, so the drag lands where the settings say.
+    ///
     /// Every target is re-derived from its drag-start state, so the edit is
     /// idempotent and never accumulates rounding error. Returns whether the
     /// measure could be resolved this frame.
-    pub fn apply(&self, scene: &mut Scene, ray: Ray) -> bool {
+    pub fn apply(
+        &self,
+        scene: &mut Scene,
+        ray: Ray,
+        snap: crate::snap::Snap,
+        vertex: Option<Vec3>,
+    ) -> bool {
         let Some(drag) = self.drag.as_ref() else { return false };
         let Some(measure) = drag.anchor.measure(ray) else { return false };
+        let measure = crate::snap::snap_measure(snap, drag.axis, drag.anchor.origin, measure, vertex);
         match &drag.targets {
             Targets::Nodes(nodes) => {
                 for (id, start) in nodes {
@@ -479,7 +512,15 @@ impl Gizmo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snap::Snap;
     use openforge_core::mesh::Mesh;
+
+    /// Apply a drag with snapping off — the app's default, and what these pure
+    /// gizmo tests exercise. Snapped drags are covered by `snap.rs` and the
+    /// headless interaction tests in `app.rs`.
+    fn gizmo_apply(gizmo: &Gizmo, scene: &mut Scene, ray: Ray) -> bool {
+        gizmo.apply(scene, ray, Snap::default(), None)
+    }
 
     fn camera() -> Camera {
         Camera { distance: 8.0, ..Default::default() }
@@ -725,9 +766,9 @@ mod tests {
         });
 
         let ray_at = |x: f32| Ray { origin: Vec3::new(x, 0.0, 5.0), direction: -Vec3::Z };
-        assert!(gizmo.apply(&mut scene, ray_at(0.0)));
-        assert!(gizmo.apply(&mut scene, ray_at(3.0)));
-        assert!(gizmo.apply(&mut scene, ray_at(1.0)));
+        assert!(gizmo_apply(&gizmo, &mut scene, ray_at(0.0)));
+        assert!(gizmo_apply(&gizmo, &mut scene, ray_at(3.0)));
+        assert!(gizmo_apply(&gizmo, &mut scene, ray_at(1.0)));
 
         let t = scene.get(id).unwrap().transform.translation;
         assert!((t - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5, "got {t:?}");
@@ -790,7 +831,7 @@ mod tests {
             id,
             vec![(0, Vec3::new(0.0, 0.0, 0.0)), (2, Vec3::new(1.0, 1.0, 0.0))],
         );
-        assert!(gizmo.apply(&mut scene, drag_ray(2.0)));
+        assert!(gizmo_apply(&gizmo, &mut scene, drag_ray(2.0)));
 
         let mesh = scene.get(id).unwrap().mesh().unwrap();
         assert!((mesh.positions[0] - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-5);
@@ -809,7 +850,7 @@ mod tests {
         // Sweeping the cursor around must not accumulate: the last position is
         // one drag measured from the start, i.e. x = 1 + 4.
         for x in [0.5, 3.0, -2.0, 4.0] {
-            gizmo.apply(&mut scene, drag_ray(x));
+            gizmo_apply(&gizmo, &mut scene, drag_ray(x));
         }
         let mesh = scene.get(id).unwrap().mesh().unwrap();
         assert!(
@@ -830,7 +871,7 @@ mod tests {
             node.transform.scale = Vec3::splat(2.0);
         }
         let (gizmo, _) = vertex_drag(id, vec![(0, Vec3::ZERO)]);
-        assert!(gizmo.apply(&mut scene, drag_ray(1.0)));
+        assert!(gizmo_apply(&gizmo, &mut scene, drag_ray(1.0)));
 
         let local = scene.get(id).unwrap().mesh().unwrap().positions[0];
         let world = scene.world_matrix(id).unwrap().transform_point3(local);
@@ -862,7 +903,8 @@ mod tests {
                 positions: vec![(2, Vec3::new(1.0, 1.0, 0.0)), (3, Vec3::new(0.0, 1.0, 0.0))],
             }]),
         });
-        assert!(gizmo.apply(
+        assert!(gizmo_apply(
+            &gizmo,
             &mut scene,
             Ray { origin: Vec3::new(5.0, 2.0, 0.0), direction: -Vec3::X }
         ));
@@ -877,5 +919,26 @@ mod tests {
         let start = Transform::from_translation(Vec3::new(4.0, 4.0, 4.0));
         let moved = apply_measure(Axis::Z, &start, Measure::Translate(-2.0));
         assert!((moved.translation - Vec3::new(4.0, 4.0, 2.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn moving_reports_the_geometry_a_drag_carries() {
+        let (_scene, id) = square_scene();
+
+        // An object-level drag carries every vertex of the nodes it moves.
+        let nodes = Targets::Nodes(vec![(id, Transform::identity())]);
+        let (moving_nodes, moving_vertices) = nodes.moving();
+        assert_eq!(moving_nodes, vec![id]);
+        assert!(moving_vertices.is_empty());
+
+        // An element-level drag carries only the vertices it lists, so the rest
+        // of the mesh stays a valid thing to snap to.
+        let vertices = Targets::Vertices(vec![VertexTarget {
+            node: id,
+            positions: vec![(0, Vec3::ZERO), (2, Vec3::ONE)],
+        }]);
+        let (moving_nodes, moving_vertices) = vertices.moving();
+        assert!(moving_nodes.is_empty());
+        assert_eq!(moving_vertices, vec![(id, 0), (id, 2)]);
     }
 }

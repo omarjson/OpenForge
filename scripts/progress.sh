@@ -49,7 +49,7 @@ Animation (tracks, clips, playback)|55|Engine
 Rigging & skinning|60|Engine
 UV math (project, unwrap, pack, edits)|80|Engine
 GPU viewport (depth, shading, grid, gizmo)|70|UI
-Viewport editing UX (gizmos, wireframe, outlines, picking)|70|UI
+Viewport editing UX (gizmos, wireframe, outlines, picking)|75|UI
 UV editor UI|40|UI
 Panels & dialogs (outliner, properties, toolbars)|48|UI
 Import/export UX|40|UI
@@ -89,6 +89,10 @@ report() {
     echo
     printf 'Measured from the repo: %s crates · %s test fns · %s lines of Rust\n' \
         "$crates" "$test_fns" "$rust_loc"
+    # The OVERALL bar can only show whole percent; the exact mean is repeated
+    # here with a decimal so that a single area moving is still visible.
+    printf 'Exact mean of the curated area scores: %s.%s%% (sum %s over %s areas)\n' \
+        "$((total * 10 / count / 10))" "$((total * 10 / count % 10))" "$total" "$count"
     echo "The per-area scores are curated estimates; only the counts above are measured."
 }
 

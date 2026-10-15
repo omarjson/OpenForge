@@ -553,6 +553,85 @@ pub fn pick_vertex(
     best
 }
 
+/// A vertex a drag can snap to: where it is in the world, where it lands on
+/// screen (viewport-relative pixels, the frame [`project`] returns), and its
+/// depth, which breaks a screen-distance tie in favour of the nearer vertex.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SnapCandidate {
+    pub node: NodeId,
+    pub vertex: u32,
+    pub world: Vec3,
+    pub screen: [f32; 2],
+    pub depth: f32,
+}
+
+/// Every vertex a drag may snap to: the vertices of the visible, unfrozen
+/// meshes, projected to screen, minus the geometry the drag itself carries.
+///
+/// `moving_nodes` are the nodes whose vertices all move (object-level drags);
+/// `moving_vertices` are the individual vertices that move (element-level
+/// drags, which may be a subset of their node, so the rest of that node stays
+/// a valid target).
+pub fn snap_candidates(
+    scene: &mut Scene,
+    moving_nodes: &[NodeId],
+    moving_vertices: &[(NodeId, u32)],
+    vp: Mat4,
+    size: [f32; 2],
+) -> Vec<SnapCandidate> {
+    let mut out = Vec::new();
+    let ids: Vec<NodeId> = scene
+        .iter()
+        .filter(|n| n.is_mesh() && n.visible && !n.frozen)
+        .map(|n| n.id)
+        .filter(|id| !moving_nodes.contains(id))
+        .collect();
+    for id in ids {
+        let Ok(world) = scene.world_matrix(id) else { continue };
+        let Ok(node) = scene.get(id) else { continue };
+        let Some(mesh) = node.mesh() else { continue };
+        for (vi, p) in mesh.positions.iter().enumerate() {
+            let vi = vi as u32;
+            if moving_vertices.contains(&(id, vi)) {
+                continue;
+            }
+            let wp = world.transform_point3(*p);
+            let Some((sx, sy, depth)) = project(vp, wp, size) else { continue };
+            out.push(SnapCandidate { node: id, vertex: vi, world: wp, screen: [sx, sy], depth });
+        }
+    }
+    out
+}
+
+/// The candidate closest to `cursor` (viewport-relative pixels) within `radius`
+/// pixels, or `None` when nothing is close enough.
+pub fn nearest_candidate(
+    candidates: &[SnapCandidate],
+    cursor: [f32; 2],
+    radius: f32,
+) -> Option<SnapCandidate> {
+    let mut best: Option<(f32, SnapCandidate)> = None;
+    for c in candidates {
+        let dx = c.screen[0] - cursor[0];
+        let dy = c.screen[1] - cursor[1];
+        let dist = (dx * dx + dy * dy).sqrt();
+        if dist > radius {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some((best_dist, best_c)) => {
+                dist < *best_dist - 1e-6
+                    || ((dist - *best_dist).abs() <= 1e-6 && c.depth < best_c.depth)
+            }
+        };
+        if better {
+            best = Some((dist, *c));
+        }
+    }
+    best.map(|(_, c)| c)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,6 +996,114 @@ mod tests {
         let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, 8.0));
         assert_eq!(edges.len(), 4, "only the visible, unfrozen mesh contributes");
         let _ = shown;
+    }
+
+    // --- snapping -------------------------------------------------------------
+
+    /// A camera five units down `+Z` looking at the origin, so a world point's
+    /// screen position is easy to reason about.
+    fn looking_down_z() -> Mat4 {
+        Mat4::perspective_rh(45.0_f32.to_radians(), 1.0, 0.1, 100.0)
+            * Mat4::look_at_rh(Vec3::new(0.0, 0.0, 5.0), Vec3::ZERO, Vec3::Y)
+    }
+
+    #[test]
+    fn snap_candidates_project_the_visible_unfrozen_vertices() {
+        let mut scene = Scene::new();
+        let quad_id = scene.create_mesh("quad", quad(0.0));
+        let hidden = scene.create_mesh("hidden", quad(1.0));
+        scene.get_mut(hidden).unwrap().visible = false;
+        let frozen = scene.create_mesh("frozen", quad(1.5));
+        scene.get_mut(frozen).unwrap().frozen = true;
+
+        let size = [400.0, 400.0];
+        let candidates = snap_candidates(&mut scene, &[], &[], looking_down_z(), size);
+        assert_eq!(candidates.len(), 4, "only the visible, unfrozen quad offers vertices");
+        assert!(candidates.iter().all(|c| c.node == quad_id));
+
+        // Screen Y grows downwards: the corner at -Y lands below the centre,
+        // the one at -X to its left.
+        let corner = candidates
+            .iter()
+            .find(|c| c.world.x < 0.0 && c.world.y < 0.0)
+            .expect("a corner towards -X, -Y exists");
+        assert!(
+            corner.screen[0] < 200.0 && corner.screen[1] > 200.0,
+            "projected up-left of the centre: {:?}",
+            corner.screen
+        );
+    }
+
+    #[test]
+    fn snap_candidates_leave_out_the_geometry_the_drag_carries() {
+        let mut scene = Scene::new();
+        let a = scene.create_mesh("a", quad(0.0));
+        let b = scene.create_mesh("b", quad(1.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z();
+
+        // An object-level drag moves every vertex of its node, so that node
+        // offers nothing to snap to.
+        let without_a = snap_candidates(&mut scene, &[a], &[], vp, size);
+        assert_eq!(without_a.len(), 4);
+        assert!(without_a.iter().all(|c| c.node == b));
+
+        // An element-level drag moves only the vertices it lists: the rest of
+        // the same mesh stays snappable, which is what makes welding the
+        // selected vertices onto their neighbours work.
+        let some = snap_candidates(&mut scene, &[], &[(b, 0), (b, 3)], vp, size);
+        assert_eq!(some.len(), 6, "four of A plus the two untouched corners of B");
+        let b_vertices: Vec<u32> = some
+            .iter()
+            .filter(|c| c.node == b)
+            .map(|c| c.vertex)
+            .collect();
+        assert!(!b_vertices.contains(&0) && !b_vertices.contains(&3));
+        assert!(b_vertices.contains(&1) && b_vertices.contains(&2));
+    }
+
+    #[test]
+    fn nearest_candidate_takes_the_closest_within_its_radius() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", quad(0.0));
+        let size = [400.0, 400.0];
+        let candidates = snap_candidates(&mut scene, &[], &[], looking_down_z(), size);
+        let corner = candidates
+            .iter()
+            .find(|c| c.world.x < 0.0 && c.world.y < 0.0)
+            .expect("a corner towards -X, -Y exists");
+
+        // Right on it, and just off it, are the same vertex.
+        let hit = nearest_candidate(&candidates, corner.screen, 14.0).expect("the cursor is on it");
+        assert_eq!(hit.vertex, corner.vertex);
+        let near = [corner.screen[0] + 5.0, corner.screen[1] - 5.0];
+        let hit = nearest_candidate(&candidates, near, 14.0).expect("five pixels away is close enough");
+        assert_eq!(hit.vertex, corner.vertex);
+
+        // Out of reach: nothing at all. (The viewport's corner is far from
+        // every corner of the quad, which fills the middle of the frame.)
+        assert!(nearest_candidate(&candidates, [0.0, 0.0], 14.0).is_none());
+    }
+
+    #[test]
+    fn nearest_candidate_prefers_the_nearer_vertex_on_a_tie() {
+        // Two vertices landing on exactly the same pixel, at different depths:
+        // the one nearer the camera is the one meant.
+        let on_the_pixel = |node, vertex, depth| SnapCandidate {
+            node,
+            vertex,
+            world: Vec3::ZERO,
+            screen: [100.0, 100.0],
+            depth,
+        };
+        let candidates = vec![on_the_pixel(NodeId(7), 3, 0.5), on_the_pixel(NodeId(9), 0, 0.2)];
+        let hit = nearest_candidate(&candidates, [100.0, 100.0], 14.0).expect("both are on the cursor");
+        assert_eq!(hit.node, NodeId(9), "the nearer vertex wins the tie");
+        assert_eq!(hit.vertex, 0);
+
+        // Just an arm's length from the tie: still resolved the same way.
+        let hit = nearest_candidate(&candidates, [105.0, 100.0], 14.0).expect("both are in reach");
+        assert_eq!(hit.node, NodeId(9));
     }
 }
 

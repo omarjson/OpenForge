@@ -3,6 +3,7 @@
 
 use crate::gizmo;
 use crate::gpu_viewport::{self, GpuViewport};
+use crate::snap::{self, SnapMode};
 use crate::uv_editor::{self, UvEditor};
 use crate::viewport::{self, Camera};
 use eframe::egui;
@@ -90,6 +91,11 @@ pub struct OpenForgeApp {
     rig_bones: usize,
     /// Live transform-gizmo state (hover, drag, this frame's handle layout).
     gizmo: gizmo::Gizmo,
+    /// What a transform drag snaps to.
+    snap: snap::Snap,
+    /// Where a live snapped drag is landing, as an absolute screen position:
+    /// what the marker is painted at for as long as that drag runs.
+    snap_marker: Option<egui::Pos2>,
     /// How much edge overlay the viewport draws over the shading.
     wireframe: viewport::Wireframe,
     /// The project's materials and textures.
@@ -152,6 +158,8 @@ impl OpenForgeApp {
             rig_angle: 0.0,
             rig_bones: 4,
             gizmo: gizmo::Gizmo::default(),
+            snap: snap::Snap::default(),
+            snap_marker: None,
             wireframe: viewport::Wireframe::default(),
             materials: default_materials(),
             plugins: openforge_plugin::builtin_host(),
@@ -898,6 +906,66 @@ impl OpenForgeApp {
         )
     }
 
+    /// The vertex a live Move drag would land on this frame: the one nearest
+    /// the cursor within [`snap::SNAP_RADIUS_PIXELS`] on screen, excluding the
+    /// geometry the drag itself is carrying.
+    ///
+    /// `None` unless vertex snapping is in force, so nothing else pays for the
+    /// scene walk.
+    fn snap_target(
+        &mut self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        vp: glam::Mat4,
+        mode: SnapMode,
+    ) -> Option<viewport::SnapCandidate> {
+        if mode != SnapMode::Vertex {
+            return None;
+        }
+        let targets = self.gizmo.drag.as_ref()?.targets.clone();
+        let (moving_nodes, moving_vertices) = targets.moving();
+        let size = [rect.width(), rect.height()];
+        let candidates =
+            viewport::snap_candidates(&mut self.scene, &moving_nodes, &moving_vertices, vp, size);
+        // `project` yields viewport-relative pixels; the cursor is in window
+        // space, so bring it into the same frame before measuring.
+        let local = [cursor.x - rect.min.x, cursor.y - rect.min.y];
+        viewport::nearest_candidate(&candidates, local, snap::SNAP_RADIUS_PIXELS)
+    }
+
+    /// The status bar's readout for a live snapped drag — `Move · snap grid
+    /// 0.25 · Δ 1.250` — or `None` when this frame is not snapping.
+    fn snap_readout(
+        &self,
+        snap: snap::Snap,
+        ray: openforge_core::math::Ray,
+        target: Option<viewport::SnapCandidate>,
+    ) -> Option<String> {
+        if !snap.is_on() {
+            return None;
+        }
+        let drag = self.gizmo.drag.as_ref()?;
+        let measure = drag.anchor.measure(ray)?;
+        let measure = snap::snap_measure(
+            snap,
+            drag.axis,
+            drag.anchor.origin,
+            measure,
+            target.map(|c| c.world),
+        );
+        let tool = match drag.mode {
+            TransformMode::Move => "Move",
+            TransformMode::Scale => "Scale",
+            TransformMode::Rotate => "Rotate",
+        };
+        let what = match snap.mode {
+            SnapMode::Grid => format!("snap grid {}", snap.grid),
+            SnapMode::Vertex => "snap vertex".to_string(),
+            SnapMode::Off => return None,
+        };
+        Some(format!("{tool} · {what} · {}", snap::format_measure(measure)))
+    }
+
     /// A world-space picking ray for a screen position inside the viewport.
     ///
     /// Takes the camera by reference rather than `&self` so it can be called
@@ -1001,15 +1069,32 @@ impl OpenForgeApp {
         // the handle, so hit-testing then would always miss.
         let mut consumed = false;
         let mut gizmo_undo: Option<(String, Scene)> = None;
+        // What a live snapped drag reports in the status bar, if anything.
+        let mut snap_readout: Option<String> = None;
+        // A snap marker only lives for the drag that shows it.
+        if !self.gizmo.is_dragging() {
+            self.snap_marker = None;
+        }
         if self.gizmo.is_dragging() {
             consumed = true;
             if let Some(pos) = cursor {
                 let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
-                if self.gizmo.apply(&mut self.scene, ray) {
+                // Snapping is resolved per frame, so a held modifier takes
+                // effect the moment it goes down or comes up, mid-drag.
+                let snap = if ui.input(|i| i.modifiers.ctrl) {
+                    self.snap.inverted()
+                } else {
+                    self.snap
+                };
+                let target = self.snap_target(pos, rect, vp, snap.mode);
+                self.snap_marker = target.map(|c| rect.min + egui::vec2(c.screen[0], c.screen[1]));
+                if self.gizmo.apply(&mut self.scene, ray, snap, target.map(|c| c.world)) {
                     self.dirty = true;
                 }
+                snap_readout = self.snap_readout(snap, ray, target);
             }
             if released {
+                self.snap_marker = None;
                 if let Some(label) = self.gizmo.finish() {
                     if let Some(before) = self.edit_before.take() {
                         gizmo_undo = Some((label.to_string(), before));
@@ -1128,13 +1213,19 @@ impl OpenForgeApp {
             }
         }
 
-        self.status = match self.tool {
-            ActiveTool::Select => {
-                format!("Select — {} object(s) selected.", self.selection.node_count())
-            }
-            ActiveTool::Move => "Move — drag an axis handle, or drag the mesh in the view plane.".into(),
-            ActiveTool::Scale => "Scale — drag an axis handle away from the centre.".into(),
-            ActiveTool::Rotate => "Rotate — drag one of the axis rings.".into(),
+        // A live snapped drag reports its own value instead of the tool hint.
+        self.status = match snap_readout {
+            Some(readout) => readout,
+            None => match self.tool {
+                ActiveTool::Select => {
+                    format!("Select — {} object(s) selected.", self.selection.node_count())
+                }
+                ActiveTool::Move => {
+                    "Move — drag an axis handle, or drag the mesh in the view plane.".into()
+                }
+                ActiveTool::Scale => "Scale — drag an axis handle away from the centre.".into(),
+                ActiveTool::Rotate => "Rotate — drag one of the axis rings.".into(),
+            },
         };
     }
 
@@ -1394,6 +1485,11 @@ impl OpenForgeApp {
             self.wireframe = self.wireframe.next();
             self.dirty = true;
         }
+        // Snapping: G cycles Off → Grid → Vertex.
+        if ctx.input(|i| i.key_pressed(egui::Key::G)) {
+            self.snap.mode = self.snap.mode.next();
+            self.dirty = true;
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
             self.duplicate_selected();
         }
@@ -1472,6 +1568,58 @@ impl OpenForgeApp {
                     .clicked()
                 {
                     self.uv.open = !self.uv.open;
+                }
+                ui.separator();
+                ui.label("Snap:");
+                for mode in [SnapMode::Off, SnapMode::Grid, SnapMode::Vertex] {
+                    let hover = match mode {
+                        SnapMode::Off => "Free transforms (hold Ctrl to snap to the grid)",
+                        SnapMode::Grid => {
+                            "Land on grid values; rotations and scales snap to their steps (hold Ctrl to turn off)"
+                        }
+                        SnapMode::Vertex => {
+                            "Move lands the grabbed point on the vertex under the cursor (hold Ctrl to turn off)"
+                        }
+                    };
+                    if ui
+                        .selectable_label(self.snap.mode == mode, mode.label())
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        self.snap.mode = mode;
+                    }
+                }
+                if self.snap.mode == SnapMode::Grid {
+                    ui.add(
+                        egui::DragValue::new(&mut self.snap.grid)
+                            .speed(0.01)
+                            .range(0.01..=10.0)
+                            .fixed_decimals(2)
+                            .prefix("step "),
+                    )
+                    .on_hover_text("World units between grid values");
+                    let mut degrees = self.snap.angle.to_degrees();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut degrees)
+                                .speed(0.5)
+                                .range(1.0..=90.0)
+                                .fixed_decimals(0)
+                                .suffix("°"),
+                        )
+                        .on_hover_text("Degrees per rotation step")
+                        .changed()
+                    {
+                        self.snap.angle = degrees.to_radians();
+                    }
+                    ui.add(
+                        egui::DragValue::new(&mut self.snap.factor)
+                            .speed(0.01)
+                            .range(0.01..=1.0)
+                            .fixed_decimals(2)
+                            .prefix("× "),
+                    )
+                    .on_hover_text("Scale factor step");
                 }
             });
             // Second row: sub-object modeling operations.
@@ -2181,6 +2329,20 @@ impl OpenForgeApp {
     /// screen space by the input pass, so what is drawn here is exactly what
     /// can be grabbed.
     fn paint_gizmo(&self, painter: &egui::Painter) {
+        // A live snapped drag shows exactly where it is landing, above the
+        // handles that are being dragged.
+        if let Some(p) = self.snap_marker {
+            let color = egui::Color32::from_rgb(255, 210, 90);
+            painter.circle_stroke(p, 5.0, egui::Stroke::new(1.6_f32, color));
+            painter.line_segment(
+                [p - egui::vec2(9.0, 0.0), p + egui::vec2(9.0, 0.0)],
+                egui::Stroke::new(1.2_f32, color),
+            );
+            painter.line_segment(
+                [p - egui::vec2(0.0, 9.0), p + egui::vec2(0.0, 9.0)],
+                egui::Stroke::new(1.2_f32, color),
+            );
+        }
         let Some(layout) = self.gizmo.layout.as_ref() else { return };
         let mode = match self.tool {
             ActiveTool::Select => return,
@@ -2853,6 +3015,13 @@ mod tests {
         input
     }
 
+    /// A frame with Ctrl held down, for the snapping tests.
+    fn ctrl_frame(time: f64, pointer: egui::Pos2, click: Option<bool>) -> egui::RawInput {
+        let mut input = frame(time, pointer, click);
+        input.modifiers = egui::Modifiers::CTRL;
+        input
+    }
+
     /// Drive one frame including the global shortcuts, the way `update` does.
     fn step_with_keys(ctx: &egui::Context, app: &mut OpenForgeApp, input: egui::RawInput) {
         let _ = ctx.run(input, |ctx| {
@@ -3011,6 +3180,159 @@ mod tests {
             "undo restored the start: {:?}",
             restored.translation
         );
+    }
+
+    #[test]
+    fn grid_snapping_lands_a_move_on_a_grid_value() {
+        let ctx = egui::Context::default();
+
+        // The same drag twice: once free, to learn where it would have landed,
+        // and once snapped, to see it land on the grid instead.
+        let drag = egui::vec2(163.0, 0.0);
+        let free = {
+            let (mut app, id) = app_ready_to_move();
+            step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+            let tip = arm_tip(&app, gizmo::Axis::X);
+            step(&ctx, &mut app, frame(1.0, tip, Some(true)));
+            step(&ctx, &mut app, frame(2.0, tip + drag, None));
+            step(&ctx, &mut app, frame(3.0, tip + drag, Some(false)));
+            app.scene.get(id).unwrap().transform.translation.x
+        };
+        assert!(free > 0.05, "the free drag moved ({free})");
+        assert!(
+            (free / 0.25 - (free / 0.25).round()).abs() > 1e-3,
+            "and did not land on a grid value by luck ({free})"
+        );
+
+        let (mut app, id) = app_ready_to_move();
+        app.snap = snap::Snap { mode: SnapMode::Grid, grid: 0.25, ..app.snap };
+        step(&ctx, &mut app, frame(4.0, egui::pos2(500.0, 350.0), None));
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        step(&ctx, &mut app, frame(5.0, tip, Some(true)));
+        step(&ctx, &mut app, frame(6.0, tip + drag, None));
+        assert!(
+            app.status.contains("snap grid 0.25") && app.status.contains("Move"),
+            "the readout says what it snapped to: {}",
+            app.status
+        );
+        step(&ctx, &mut app, frame(7.0, tip + drag, Some(false)));
+
+        let x = app.scene.get(id).unwrap().transform.translation.x;
+        assert!(
+            (x - snap::snap_to_step(free, 0.25)).abs() < 1e-3,
+            "the same drag came to rest on the nearest grid value: {free} -> {x}"
+        );
+        assert!((x / 0.25 - (x / 0.25).round()).abs() < 1e-4, "x = {x} sits exactly on the grid");
+
+        // One undo entry covers the whole snapped gesture.
+        assert!(app.undo.can_undo());
+        app.undo_edit();
+        assert_eq!(app.scene.get(id).unwrap().transform.translation.x, 0.0);
+    }
+
+    #[test]
+    fn holding_ctrl_inverts_snapping() {
+        let ctx = egui::Context::default();
+        let drag = egui::vec2(150.0, 0.0);
+
+        // Snapping off + Ctrl: the drag snaps to the grid.
+        let (mut app, id) = app_ready_to_move();
+        assert_eq!(app.snap.mode, SnapMode::Off);
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        step(&ctx, &mut app, ctrl_frame(1.0, tip, Some(true)));
+        step(&ctx, &mut app, ctrl_frame(2.0, tip + drag, None));
+        assert!(app.status.contains("snap grid"), "{}", app.status);
+        step(&ctx, &mut app, ctrl_frame(3.0, tip + drag, Some(false)));
+        let x = app.scene.get(id).unwrap().transform.translation.x;
+        let steps = x / app.snap.grid;
+        assert!((steps - steps.round()).abs() < 1e-4, "x = {x} landed on the grid");
+
+        // Snapping on + Ctrl: the drag is free again.
+        let (mut app, id) = app_ready_to_move();
+        app.snap = snap::Snap { mode: SnapMode::Grid, grid: 0.5, ..app.snap };
+        step(&ctx, &mut app, frame(4.0, egui::pos2(500.0, 350.0), None));
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        step(&ctx, &mut app, ctrl_frame(5.0, tip, Some(true)));
+        step(&ctx, &mut app, ctrl_frame(6.0, tip + drag, None));
+        assert!(!app.status.contains("snap"), "no readout while inverted: {}", app.status);
+        step(&ctx, &mut app, ctrl_frame(7.0, tip + drag, Some(false)));
+        let x = app.scene.get(id).unwrap().transform.translation.x;
+        assert!(x > 0.05, "it still moved ({x})");
+        let steps = x / 0.5;
+        assert!((steps - steps.round()).abs() > 1e-3, "x = {x} is off the grid when inverted");
+    }
+
+    #[test]
+    fn vertex_snapping_lands_the_grab_point_on_the_vertex_under_the_cursor() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+
+        // A marker mesh with a lone vertex out at +X, and nothing else near it.
+        let mut marker = Mesh::new();
+        marker.add_vertex(Vec3::new(3.0, 0.0, 0.0));
+        marker.add_vertex(Vec3::new(3.0, 1.0, 0.0));
+        marker.add_vertex(Vec3::new(3.0, 0.0, 1.0));
+        marker.add_face(&[0, 1, 2]);
+        app.scene.create_mesh("Marker", marker);
+        app.snap.mode = SnapMode::Vertex;
+
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        // The world -> screen mapping, confirmed against the gizmo itself: the
+        // handles sit on the projected bounds centre.
+        let size = [SCREEN[0], SCREEN[1]];
+        let vp = app.camera.view_proj(size[0] / size[1]);
+        let ids: Vec<NodeId> = app.selection.selected_nodes().collect();
+        let centre = app.scene.world_bounds(&ids).center();
+        let layout_origin = app.gizmo.layout.as_ref().expect("handles are laid out").origin;
+        let (cx, cy, _) = viewport::project(vp, centre, size).expect("the centre is in front");
+        assert!(
+            (layout_origin - egui::pos2(cx, cy)).length() < 1.0,
+            "the gizmo sits on the projected centre: {layout_origin:?} vs ({cx}, {cy})"
+        );
+
+        let target = Vec3::new(3.0, 0.0, 0.0);
+        let (vx, vy, _) = viewport::project(vp, target, size).expect("the marker is in front");
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        step(&ctx, &mut app, frame(1.0, tip, Some(true)));
+        assert_eq!(app.gizmo.active, Some(gizmo::Axis::X));
+
+        // Drag with the cursor over the marker's vertex.
+        let over = egui::pos2(vx, vy);
+        step(&ctx, &mut app, frame(2.0, over, None));
+        assert!(app.snap_marker.is_some(), "the target is marked while the drag runs");
+        assert!(app.status.contains("snap vertex"), "{}", app.status);
+        step(&ctx, &mut app, frame(3.0, over, Some(false)));
+        assert!(app.snap_marker.is_none(), "the marker goes when the drag does");
+
+        // The grabbed point — the selection's centre — landed on the vertex.
+        let moved = app.scene.world_bounds(&ids).center();
+        assert!(
+            (moved.x - target.x).abs() < 1e-3,
+            "the grab point landed on the vertex: {} vs {}",
+            moved.x,
+            target.x
+        );
+        assert!((moved.y - centre.y).abs() < 1e-4, "nothing moved off the dragged axis");
+        assert!(
+            app.scene.get(id).unwrap().transform.translation.x > 1.5,
+            "and the node went with the grab point"
+        );
+    }
+
+    #[test]
+    fn the_g_key_cycles_the_snap_mode() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        assert_eq!(app.snap.mode, SnapMode::Off);
+
+        step_with_keys(&ctx, &mut app, key_frame(0.0, egui::Key::G));
+        assert_eq!(app.snap.mode, SnapMode::Grid);
+        step_with_keys(&ctx, &mut app, key_frame(1.0, egui::Key::G));
+        assert_eq!(app.snap.mode, SnapMode::Vertex);
+        step_with_keys(&ctx, &mut app, key_frame(2.0, egui::Key::G));
+        assert_eq!(app.snap.mode, SnapMode::Off, "the cycle comes round again");
     }
 
     #[test]

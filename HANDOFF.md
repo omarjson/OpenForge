@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (394 `#[test]` fns; 396 tests run, all green)
+## 4. Repo layout — 12 crates (413 `#[test]` fns; 415 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 85 (bin) | eframe/egui GUI. `app.rs` (~3600 lines) + `gizmo.rs` (screen-space transform gizmo) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
+| `openforge-app` | 104 (bin) | eframe/egui GUI. `app.rs` (~4100 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking) + `gpu_viewport.rs` (wgpu bridge) + `uv_editor.rs` (UV panel). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -109,6 +109,17 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   pixel length and picking is a 2D distance test. The layout is computed once by
   the input pass and stored on the gizmo for the paint pass to reuse; the grab
   is taken on the *press*, not on egui's later `drag_started`. See §8.
+- **Snapping is decided per frame, in the app, and applied to the drag's
+  measure** (`snap.rs` holds the settings and the pure maths). `Gizmo::apply`
+  takes a `snap::Snap` plus an optional vertex *target*: the app resolves that
+  target (the vertex nearest the cursor within `SNAP_RADIUS_PIXELS`, excluding
+  the geometry the drag carries) because it needs the camera and the scene, and
+  `snap_measure` turns both into the measure the drag uses. Grid mode snaps the
+  *destination* of the grabbed point (so a drag lands on a grid value wherever
+  it began), rotations and scales snap to the angle/factor steps, and a held
+  **Ctrl** inverts whatever the toolbar says (Off becomes Grid, anything else
+  becomes Off). Snapping covers the gizmo's axis-constrained drags; the
+  free-form view-plane tool drag is deliberately unsnapped.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -143,12 +154,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **396 tests pass**, CI green on all 3
-platforms. Nine work-streams are done — the **wgpu viewport** (#1), the
+workspace builds with **0 warnings**, **415 tests pass**, CI green on all 3
+platforms. Ten work-streams are done — the **wgpu viewport** (#1), the
 **interactive UV editor** (#2), the **transform gizmo** (#3), the **edge
 overlay** (#4), the **sub-object transforms** (#5), **materials** (#6), the
-**plugin host** (#7), the **GPU edge overlay + MSAA** (#8) and **per-face
-materials** (#9) — plus a progress report:
+**plugin host** (#7), the **GPU edge overlay + MSAA** (#8), **per-face
+materials** (#9) and **snapping** (#10) — plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -371,12 +382,55 @@ materials** (#9) — plus a progress report:
   colour, survives undo; the command refuses at Object level and pushes no undo
   for a no-op).
 
+- **Transforms snap now, and a snapped drag says where it is landing.** New
+  `openforge-app/src/snap.rs` holds `SnapMode` (Off / Grid / Vertex) and `Snap`
+  (mode + a grid step in world units, an angle step and a scale factor step),
+  with the maths pure and unit-tested: `snap_to_step` rounds to the nearest
+  multiple, `snap_measure` turns any `Measure` into its snapped one, and
+  `format_measure` is the status-bar readout (`Δ 1.250`, `× 1.200`, `45.0°`).
+  Grid mode snaps the **destination** of the grabbed point rather than the
+  distance it travelled — a drag comes to rest *on* a grid value wherever it
+  started — and clamps a snapping scale to its step so it can never collapse to
+  zero. Vertex mode lands the grabbed point on the vertex under the cursor:
+  `viewport::snap_candidates` projects every vertex of the visible, unfrozen
+  meshes and `nearest_candidate` takes the closest within
+  `snap::SNAP_RADIUS_PIXELS` (14 px), preferring the nearer vertex on a tie;
+  `gizmo::Targets::moving` is what keeps a drag from snapping to the geometry it
+  is carrying — the whole node at object level, because its own pivot sits on
+  its vertices, and just the moving vertices at element level, so the rest of
+  the same mesh stays a valid target.
+- `Gizmo::apply` now takes the frame's `Snap` and the resolved vertex target, so
+  the app decides what a drag lands on while the gizmo stays pure math. The app
+  side: a **Snap:** group in the toolbar's first row (mode + the step fields,
+  which appear only in Grid mode), `G` cycles the mode, holding **Ctrl**
+  inverts it for as long as it is held (Off → Grid, anything → Off) — decided
+  *per frame*, so it takes effect mid-drag — and **the live value is painted and
+  reported**: a gold cross-hair marks the vertex being snapped onto, and the
+  status bar shows `Move · snap grid 0.25 · Δ 1.250` instead of the tool hint
+  until the release. The gesture still lands as **one** undo entry, and a drag
+  that snaps back to where it started leaves none.
+- **19 new tests**: 10 in `snap.rs` (nearest multiple — negatives and a
+  non-positive step included; grid landing on a value *and* being idempotent
+  under a repeated measure; vertex landing and its free fallback with no vertex;
+  vertex leaving rotate/scale alone; angle and factor stepping; the factor floor;
+  Ctrl inversion keeping the steps; the readout format; the mode cycle),
+  4 in `viewport.rs` (`snap_candidates` projecting only visible, unfrozen
+  meshes and dropping exactly what a drag carries — whole nodes at object level,
+  named vertices at element level — plus the radius, the nearest-wins rule and
+  the nearer-vertex tie-break), 1 in `gizmo.rs` (`Targets::moving` for both
+  kinds of drag) and 4 in `app.rs`, driving real gestures headlessly: the same
+  drag once free and once snapped to prove it lands on the nearest grid value
+  with the readout showing and one undo restoring it, Ctrl inverting both ways
+  (off→snapped, grid→free), a vertex-snapped drag that walks the grab point onto
+  a marked vertex of another mesh (checking the marker comes and goes with the
+  drag), and the `G` cycle.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **396 pass, 0 failures**
+build too); `cargo test --workspace` → **415 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
-behind the UV canvas, the side panels and now the plugin seam are all covered
-*without* a display: the `app.rs` test module runs the real
+behind the UV canvas, the side panels, the snapping gestures and now the plugin
+seam are all covered *without* a display: the `app.rs` test module runs the real
 `handle_central_viewport` / `handle_side_panels` against a plain
 `egui::Context` with synthetic pointer events and asserts on both the gesture
 (hover, grab, axis-constrained drag, release, undo) and the shapes the frame
@@ -384,9 +438,11 @@ painted, and on what the host did (import/export through a filter, a plugin's
 filter taking effect, a rejected plugin changing nothing).
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
-and the MSAA smoothing), and now the **per-face material shading on the GPU
+and the MSAA smoothing), the **per-face material shading on the GPU
 path** (assign one face a different material and confirm the two paths agree
-visually) — the agent has no display access, so a human should
+visually), and the **snapping feedback** (the gold marker on the vertex a drag
+is about to land on, the live status readout, and Ctrl switching snapping on and
+off mid-drag) — the agent has no display access, so a human should
 look at all of those once. (An earlier session did launch the app on the wgpu
 path and saw `eframe: ... Using wgpu.` with a Metal adapter, no `egui_wgpu`
 warnings and no panic over a 12 s run.)
@@ -396,12 +452,12 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 (`collapsible_if`, …): untouched here, and not part of CI.
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
-the per-area bars (`scripts/progress.sh --write` regenerates it; the unweighted
-mean of the 16 curated areas is **58%**). The engine
-layer is essentially done, and the two largest application-surface gaps — the
-GPU viewport and the UV editor — now have real implementations, with materials
-shading per face on both paths as of #9. Prioritized
-next steps:
+the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
+16 curated areas is **58.9%**, which the overall bar shows as 58%). The engine
+layer is essentially done, and the largest application-surface gaps — the GPU
+viewport, the UV editor and the editing UX around the gizmo — now have real
+implementations, with materials shading per face on both paths as of #9 and the
+gizmo snapping as of #10. Prioritized next steps:
 
 1. **Deepen the GPU viewport** (still the best next value). MSAA, the
    depth-tested edge overlay and **per-face material shading** (work-stream #9)
@@ -410,9 +466,14 @@ next steps:
    aligned with the CPU raycast). The shading itself is still flat colour +
    Lambert with no texture sampling — that is the material node graph in item 6.
    All additive to `GpuRenderer`.
-2. **Extend the gizmo** (`gizmo.rs`, all additive): plane and centre handles,
-   snapping, and numeric entry. (Sub-object pivots are done: a vertex/face-level
-   drag moves only its own geometry, via `gizmo::Targets` +
+2. **Extend the gizmo further** (`gizmo.rs`, all additive): plane and centre
+   handles, and numeric entry for rotation/scale (translation already has
+   DragValues in Properties). Snapping landed in #10 but is deliberately partial:
+   only the gizmo's axis drags snap (the free-form view-plane drag does not) and
+   only the grid and *vertices* are targets — ZModeler also snaps to edges,
+   faces, midpoints and the grid of the *screen plane*, and its snapping works
+   during free drags too. (Sub-object pivots are done: a vertex/face-level drag
+   moves only its own geometry, via `gizmo::Targets` +
    `viewport::element_centroid`.)
 3. **Deepen the UV editor.** No texture background yet, no island-level ops
    (weld/split/mirror), no snapping, and the 3D face selection is pushed into
@@ -483,6 +544,19 @@ deltas and are many work-streams, not one push.
   computed is stored on the gizmo (`Gizmo::layout`) and reused by `paint_gizmo`;
   recomputing it in the paint pass would let what is drawn drift from what can
   be grabbed.
+- **Snapping must never offer the geometry a drag is carrying.** A node's pivot
+  sits on its own vertices, so at object level the whole node is excluded from
+  the candidates (`gizmo::Targets::moving`) — otherwise the nearest vertex is
+  the one the drag started on and the node can never move at all. At element
+  level only the moving vertices are excluded, which is what makes welding a
+  vertex onto its neighbour work. And the modifier test is per frame: read
+  `modifiers.ctrl` inside the drag branch, not once when the drag begins, or
+  holding Ctrl mid-drag does nothing.
+- **An `egui::Context` keeps its input history across `ctx.run`.** Driving two
+  apps through one context in a test is fine, but the frame times must never go
+  backwards (a second app starting at `time: 0.0` trips emath's
+  `debug_assert!(*last_time <= now)` and panics the test). Continue the clock
+  instead: 0–3 for the first app, 4–7 for the second.
 - **A drag spans frames, so its state must live on the app.** `ToolContext::drag`
   is constructed fresh each frame; `app.rs` keeps it in `self.tool_drag` and
   hands it to the tool and back. Leave either half out and Move/Scale/Rotate

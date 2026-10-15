@@ -5,6 +5,7 @@
 mod app;
 mod gizmo;
 mod gpu_viewport;
+mod snap;
 mod uv_editor;
 mod viewport;
 

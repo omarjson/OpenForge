@@ -115,6 +115,13 @@ A sample GitHub Actions matrix is shown below.
   centroid, where a drag moves *only* those vertices — the node's own transform
   is left alone. Changing level clears the element selection, because a face
   index and a vertex index are not the same thing.
+- **Snapping** (toolbar **Snap:**, or **G** to cycle Off → Grid → Vertex): a
+  gizmo drag then lands on grid values — where the grabbed point *ends up*, not
+  how far it travelled — with rotations and scales stepping too; in **Vertex**
+  mode a Move drag lands the grabbed point on the vertex nearest the cursor
+  (marked with a gold cross-hair while the drag is live). Hold **Ctrl** to
+  invert snapping for as long as it is held, even mid-drag, and the status bar
+  shows the value the drag is snapping to.
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
 - **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Ctrl+D** duplicates the selection,
   **Delete** removes, **F** frames all.
@@ -147,7 +154,10 @@ mature commercial modeler. Sub-element editing, deformers, boolean CSG,
 skeletal skinning, materials, and a **depth-tested `wgpu` viewport** are in;
 what remains is mostly application surface. Natural next steps:
 
-- Gizmo polish: plane and centre handles, snapping, and numeric entry.
+- Gizmo polish: plane and centre handles, and numeric entry for rotation and
+  scale (translation already has fields). Snapping is in for the grid and for
+  vertices; snapping to edges, faces and midpoints, and snapping during the
+  free-form view-plane drag, are still to come.
 - A deeper GPU viewport: a materials-driven shader instead of one Lambert
   pass, and depth-buffer picking so picking matches exactly what is drawn.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.
