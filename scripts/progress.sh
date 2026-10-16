@@ -39,7 +39,7 @@ rust_loc=$(find crates -name '*.rs' -print0 | xargs -0 cat | wc -l | tr -d ' ')
 # reference app, and 0 means not started.
 
 AREAS=$(cat <<'DATA'
-Data model (nodes, mesh, selection, undo, tools)|85|Engine
+Data model (nodes, mesh, selection, undo, tools)|87|Engine
 Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF)|73|Engine
 Modeling ops (extrude, inset, bevel, mirror, weld, deformers)|80|Engine
 Boolean CSG|65|Engine
@@ -51,8 +51,8 @@ UV math (project, unwrap, pack, edits)|87|Engine
 GPU viewport (depth, shading, grid, gizmo)|88|UI
 Viewport editing UX (gizmos, wireframe, outlines, picking)|96|UI
 UV editor UI|70|UI
-Panels & dialogs (outliner, properties, toolbars, Preferences)|64|UI
-Import/export UX|66|UI
+Panels & dialogs (outliner, properties, toolbars, Preferences)|66|UI
+Import/export UX|72|UI
 Plugin / service host|64|UI
 Game tooling (LOD, dummies/TXD, vehicles)|40|UI
 DATA

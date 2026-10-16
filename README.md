@@ -14,7 +14,7 @@ A clean-room, open-source 3D modeling application written in Rust, targeting
 
 ## Architecture
 
-The project is a Cargo workspace of twelve crates; these are the main layers:
+The project is a Cargo workspace of thirteen crates; these are the main layers:
 
 | Crate | Role | Notes |
 |-------|------|-------|
@@ -22,6 +22,7 @@ The project is a Cargo workspace of twelve crates; these are the main layers:
 | `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL, COLLADA, OFF. Clean-room readers and writers. |
 | `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per face, and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew, down to single faces, edges and vertices. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
+| `openforge-project` | Project files | One versioned JSON document — the scene, the material library (textures as base64) and the animation clips — with its own document structs and a bridge to the engine types. Ids never reach the file: references are positions in a parents-first node list. |
 | `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. |
 
 ### Core concepts
@@ -71,16 +72,16 @@ bundle, use the packaging script:
 
 ### Cross-platform targets
 
-The `openforge-core` and `openforge-io` crates are pure Rust and cross-compile
-to every desktop target with no extra dependencies:
+The `openforge-core`, `openforge-io` and `openforge-project` crates are pure
+Rust and cross-compile to every desktop target with no extra dependencies:
 
 ```bash
 rustup target add x86_64-pc-windows-msvc x86_64-unknown-linux-gnu x86_64-apple-darwin
 
 # Type-check the portable crates for each OS
-cargo check -p openforge-core -p openforge-io --target x86_64-pc-windows-msvc
-cargo check -p openforge-core -p openforge-io --target x86_64-unknown-linux-gnu
-cargo check -p openforge-core -p openforge-io --target x86_64-apple-darwin
+cargo check -p openforge-core -p openforge-io -p openforge-project --target x86_64-pc-windows-msvc
+cargo check -p openforge-core -p openforge-io -p openforge-project --target x86_64-unknown-linux-gnu
+cargo check -p openforge-core -p openforge-io -p openforge-project --target x86_64-apple-darwin
 ```
 
 The `openforge-app` GUI crate links against each platform's native windowing and
@@ -251,6 +252,13 @@ A sample GitHub Actions matrix is shown below.
   the list of extensions that would have worked, exporting is refused when the
   selection holds more than one mesh node rather than quietly writing one, and
   the statuses name the file and the format.
+- **File → Open Project… / Save Project / Save Project As…** keeps the whole
+  document — the scene with its transforms, visibility, LOD tags and per-face
+  materials, the material library with its textures, and the animation clips —
+  in one versioned `.ofproj` JSON file (`Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S`).
+  Opening replaces the document and starts a fresh undo history; a file that
+  is not JSON, not an OpenForge project, or from a newer build is refused
+  with a sentence saying which one it was.
 - The **Plugins** section of the Properties panel lists the loaded plugins and
   the services, tools and formats they contributed.
 - **Create** menu adds primitives (box, sphere, cylinder, cone, plane).
@@ -289,7 +297,7 @@ mostly application surface. Natural next steps:
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
 - Settings that persist across runs, an asset browser, and the deeper
-  panel/dialog surface.
+  panel/dialog surface — and the rig in the project file.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) and a fuller
   COLLADA (node transforms, effects, animation) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) behind the host seam, which already

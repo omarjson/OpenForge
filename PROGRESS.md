@@ -6,7 +6,7 @@
 OpenForge — progress toward ZModeler parity
 
 ENGINE
-  Data model (nodes, mesh, selection, undo, tools)     █████████████████░░░  85%
+  Data model (nodes, mesh, selection, undo, tools)     █████████████████░░░  87%
   Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF) ██████████████░░░░░░  73%
   Modeling ops (extrude, inset, bevel, mirror, weld, deformers) ████████████████░░░░  80%
   Boolean CSG                                          █████████████░░░░░░░  65%
@@ -20,15 +20,15 @@ APPLICATION SURFACE
   GPU viewport (depth, shading, grid, gizmo)           █████████████████░░░  88%
   Viewport editing UX (gizmos, wireframe, outlines, picking) ███████████████████░  96%
   UV editor UI                                         ██████████████░░░░░░  70%
-  Panels & dialogs (outliner, properties, toolbars, Preferences) ████████████░░░░░░░░  64%
-  Import/export UX                                     █████████████░░░░░░░  66%
+  Panels & dialogs (outliner, properties, toolbars, Preferences) █████████████░░░░░░░  66%
+  Import/export UX                                     ██████████████░░░░░░  72%
   Plugin / service host                                ████████████░░░░░░░░  64%
   Game tooling (LOD, dummies/TXD, vehicles)            ████████░░░░░░░░░░░░  40%
 
-  OVERALL (unweighted mean of 16 areas)                ██████████████░░░░░░  73%
+  OVERALL (unweighted mean of 16 areas)                ██████████████░░░░░░  74%
 
-Measured from the repo: 12 crates · 615 test fns · 35147 lines of Rust
-Exact mean of the curated area scores: 73.7% (sum 1180 over 16 areas)
+Measured from the repo: 13 crates · 629 test fns · 36416 lines of Rust
+Exact mean of the curated area scores: 74.3% (sum 1190 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 
