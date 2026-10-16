@@ -470,10 +470,19 @@ pub fn element_centroid(scene: &mut Scene, selection: &Selection) -> Option<Vec3
                         count += 1;
                     }
                 }
-                SelectLevel::Face | SelectLevel::Edge => {
+                SelectLevel::Face => {
                     let Some(face) = mesh.faces.get(index as usize) else { continue };
                     for corner in &face.corners {
                         if let Some(p) = mesh.positions.get(corner.position as usize) {
+                            sum += world.transform_point3(*p);
+                            count += 1;
+                        }
+                    }
+                }
+                SelectLevel::Edge => {
+                    let Some([a, b]) = mesh.edges().get(index as usize).copied() else { continue };
+                    for &vi in &[a, b] {
+                        if let Some(p) = mesh.positions.get(vi as usize) {
                             sum += world.transform_point3(*p);
                             count += 1;
                         }
@@ -506,11 +515,16 @@ pub fn selected_vertices(scene: &mut Scene, selection: &Selection) -> Vec<(NodeI
                 SelectLevel::Vertex => {
                     indices.insert(index);
                 }
-                SelectLevel::Face | SelectLevel::Edge => {
+                SelectLevel::Face => {
                     let Some(face) = mesh.faces.get(index as usize) else { continue };
                     for corner in &face.corners {
                         indices.insert(corner.position);
                     }
+                }
+                SelectLevel::Edge => {
+                    let Some([a, b]) = mesh.edges().get(index as usize).copied() else { continue };
+                    indices.insert(a);
+                    indices.insert(b);
                 }
                 SelectLevel::Object => {}
             }
@@ -573,6 +587,92 @@ pub fn pick_vertex(
     best
 }
 
+/// Result of an edge pick: the node and the edge index into [`Mesh::edges`].
+///
+/// [`Mesh::edges`]: openforge_core::mesh::Mesh::edges
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct EdgeHit {
+    pub node: NodeId,
+    pub edge: u32,
+    pub dist: f32,
+}
+
+/// Cast a ray and return the nearest edge within a world-space tolerance.
+///
+/// Edge indices are [`Mesh::edges`] indices, so a hit here names the same edge
+/// the ID pass draws a line for. The distance is the ray parameter of the
+/// closest point on the edge, exactly like [`VertexHit::dist`], and the nearest
+/// one wins.
+///
+/// [`Mesh::edges`]: openforge_core::mesh::Mesh::edges
+pub fn pick_edge(scene: &mut Scene, ray: Ray, tol_world: f32) -> Option<EdgeHit> {
+    let candidates: Vec<(NodeId, Mesh)> = scene
+        .iter()
+        .filter(|n| n.is_mesh() && n.visible && !n.frozen)
+        .filter_map(|n| n.mesh().map(|m| (n.id, m.clone())))
+        .collect();
+
+    let mut best: Option<EdgeHit> = None;
+    for (id, mesh) in candidates {
+        let Ok(world) = scene.world_matrix(id) else { continue };
+        for (ei, [a, b]) in mesh.edges().iter().enumerate() {
+            let pa = world.transform_point3(mesh.positions[*a as usize]);
+            let pb = world.transform_point3(mesh.positions[*b as usize]);
+            let seg = pb - pa;
+            // The segment point closest to the ray *line*: minimise the
+            // squared perpendicular distance, a quadratic in `s` whose
+            // curvature `|seg|² - (seg·dir)²` vanishes only when the segment
+            // is parallel to the ray. Clamping `s` to the segment and then
+            // recomputing the perpendicular distance is the whole test.
+            let u = pa - ray.origin;
+            let along_seg = seg.dot(ray.direction);
+            let denom = seg.length_squared() - along_seg * along_seg;
+            let s = if denom > 0.0 {
+                ((u.dot(ray.direction) * along_seg - u.dot(seg)) / denom).clamp(0.0, 1.0)
+            } else {
+                // Parallel: the distance varies linearly along the segment,
+                // so one of its endpoints is the closer one.
+                let at = |s: f32| {
+                    let w = u + seg * s;
+                    w.length_squared() - w.dot(ray.direction).powi(2)
+                };
+                if at(1.0) < at(0.0) { 1.0 } else { 0.0 }
+            };
+            let closest = pa + seg * s;
+            let along = (closest - ray.origin).dot(ray.direction);
+            if along < 0.0 {
+                continue;
+            }
+            let perp = closest.distance(ray.at(along));
+            if perp <= tol_world {
+                let better = best.map(|b| along < b.dist).unwrap_or(true);
+                if better {
+                    best = Some(EdgeHit { node: id, edge: ei as u32, dist: along });
+                }
+            }
+        }
+    }
+    best
+}
+
+/// True when two segments properly cross: each straddles the line of the
+/// other, strictly on both sides.
+///
+/// Collinear and merely touching cases answer `false` — the marquee's
+/// inclusive endpoint test is what catches a segment whose endpoint lies
+/// exactly on the rectangle, and a segment that only touches a corner of it.
+/// No epsilon is involved, so the answer is exact and the same on every run.
+fn segments_cross(a: (f32, f32), b: (f32, f32), c: (f32, f32), d: (f32, f32)) -> bool {
+    let cross = |o: (f32, f32), p: (f32, f32), q: (f32, f32)| {
+        (p.0 - o.0) * (q.1 - o.1) - (p.1 - o.1) * (q.0 - o.0)
+    };
+    let ab_c = cross(a, b, c);
+    let ab_d = cross(a, b, d);
+    let cd_a = cross(c, d, a);
+    let cd_b = cross(c, d, b);
+    (ab_c > 0.0) != (ab_d > 0.0) && (cd_a > 0.0) != (cd_b > 0.0)
+}
+
 /// Every element of the given level whose projection falls inside a viewport
 /// rectangle.
 ///
@@ -589,7 +689,13 @@ pub fn pick_vertex(
 /// - `Vertex`: every mesh position index inside the rectangle.
 /// - `Face`: every face with at least one corner position inside the
 ///   rectangle.
-/// - `Edge`: nothing — there is no edge index in the mesh.
+/// - `Edge`: every edge whose projected segment meets the rectangle — either
+///   endpoint inside (the inclusive test above), or the segment crossing one
+///   of the rectangle's four sides. An endpoint that projects to nothing
+///   (behind the camera) leaves its edge out, the same way a position behind
+///   the camera is never inside at any level. Collinear and merely touching
+///   cases may resolve either way; a segment whose endpoint sits exactly on
+///   the rectangle counts through the inclusive test.
 ///
 /// A point exactly on the rectangle's edge counts as inside. The result is
 /// deterministic: nodes in scene order, indices ascending, each element once.
@@ -601,9 +707,6 @@ pub fn marquee_elements(
     level: SelectLevel,
 ) -> Vec<PickElement> {
     let mut out = Vec::new();
-    if level == SelectLevel::Edge {
-        return out;
-    }
 
     let candidates: Vec<(NodeId, Mesh)> = scene
         .iter()
@@ -648,7 +751,29 @@ pub fn marquee_elements(
                     }
                 }
             }
-            SelectLevel::Edge => {}
+            SelectLevel::Edge => {
+                // The rectangle's four sides, walked as a closed loop.
+                let corners = [
+                    (rect.min.x, rect.min.y),
+                    (rect.max.x, rect.min.y),
+                    (rect.max.x, rect.max.y),
+                    (rect.min.x, rect.max.y),
+                ];
+                for (ei, [a, b]) in mesh.edges().iter().enumerate() {
+                    let (Some(sa), Some(sb)) = (
+                        screen.get(*a as usize).copied().flatten(),
+                        screen.get(*b as usize).copied().flatten(),
+                    ) else {
+                        continue;
+                    };
+                    let crosses = (0..4).any(|k| {
+                        segments_cross(sa, sb, corners[k], corners[(k + 1) % 4])
+                    });
+                    if inside(*a) || inside(*b) || crosses {
+                        out.push(PickElement::Edge { node: id, edge: ei as u32 });
+                    }
+                }
+            }
         }
     }
     out
@@ -1258,6 +1383,124 @@ mod tests {
         assert_eq!(tris[1].v[2].uv, Vec2::new(0.0, 1.0));
     }
 
+    // --- edge picking ---------------------------------------------------------
+
+    /// A ray straight down `-Z` at `(x, y)`, five units up: the shortest way
+    /// from the test camera to a quad lying in the XY plane.
+    fn ray_down_z(x: f32, y: f32) -> Ray {
+        Ray { origin: Vec3::new(x, y, 5.0), direction: Vec3::NEG_Z }
+    }
+
+    #[test]
+    fn a_ray_picks_the_edge_it_meets_and_the_face_middle_picks_none() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        // Edge 0 is the bottom side, from (-1, -1) to (1, -1): its midpoint
+        // sits straight under this ray.
+        let hit = pick_edge(&mut scene, ray_down_z(0.0, -1.0), 0.1).expect("the bottom side");
+        assert_eq!((hit.node, hit.edge), (id, 0));
+        assert!((hit.dist - 5.0).abs() < 1e-4, "dist {} is the ray parameter", hit.dist);
+
+        // The middle of the quad is a whole unit from every side.
+        assert_eq!(pick_edge(&mut scene, ray_down_z(0.0, 0.0), 0.5), None);
+    }
+
+    #[test]
+    fn the_nearer_of_two_parallel_edges_wins() {
+        let mut scene = Scene::new();
+        // The far quad first, so scene order alone would answer with the
+        // wrong node if distance were ignored.
+        let far = scene.create_mesh("far", quad(0.0));
+        scene.get_mut(far).unwrap().set_translation(Vec3::new(0.0, 0.0, -4.0));
+        let near = scene.create_mesh("near", quad(0.0));
+
+        let hit = pick_edge(&mut scene, ray_down_z(0.0, -1.0), 0.1).expect("both bottom sides");
+        assert_eq!(hit.node, near, "z = 0 is nearer than z = -4");
+        assert_eq!(hit.edge, 0);
+        assert!((hit.dist - 5.0).abs() < 1e-4, "got {}", hit.dist);
+    }
+
+    #[test]
+    fn the_closest_point_clamps_to_the_edges_endpoints() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        // Edge 0 ends at (1, -1). This ray aims a little past that endpoint,
+        // so the nearest point of the segment is the endpoint itself,
+        // sqrt(0.02² + 0.06²) ≈ 0.063 away — inside the tolerance.
+        let near = pick_edge(&mut scene, ray_down_z(1.02, -1.06), 0.1).expect("the endpoint");
+        // Both sides meeting at the corner are that close, so the lower edge
+        // index answers: the walk keeps the first on a tie.
+        assert_eq!((near.node, near.edge), (id, 0), "got {near:?}");
+
+        // Further out the same ray pattern is 0.5 from the endpoint, past the
+        // tolerance. Without the clamp the point on the edge's *line* under
+        // the ray (1.5, -1, 0) would be 0.06 away and would hit.
+        assert_eq!(pick_edge(&mut scene, ray_down_z(1.5, -1.06), 0.1), None);
+    }
+
+    #[test]
+    fn a_segment_behind_the_ray_origin_is_not_picked() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", quad(0.0));
+        // The ray starts past the quad (z = -5) and walks further away, so
+        // the nearest point on every edge lies behind its origin, t < 0.
+        let away = Ray { origin: Vec3::new(0.0, -1.0, -5.0), direction: Vec3::NEG_Z };
+        assert_eq!(pick_edge(&mut scene, away, 0.5), None);
+    }
+
+    #[test]
+    fn hidden_and_frozen_meshes_are_skipped_when_picking_edges() {
+        let mut scene = Scene::new();
+        // The hidden quad sits nearest the ray and the frozen one next to it,
+        // so either leaking into the walk would win before the shown quad.
+        let hidden = scene.create_mesh("hidden", quad(0.0));
+        let node = scene.get_mut(hidden).unwrap();
+        node.set_translation(Vec3::new(0.0, 0.0, 1.0));
+        node.visible = false;
+        let frozen = scene.create_mesh("frozen", quad(0.0));
+        let node = scene.get_mut(frozen).unwrap();
+        node.set_translation(Vec3::new(0.0, 0.0, 0.5));
+        node.frozen = true;
+        let shown = scene.create_mesh("shown", quad(0.0));
+
+        let hit = pick_edge(&mut scene, ray_down_z(0.0, -1.0), 0.1).expect("the shown quad");
+        assert_eq!((hit.node, hit.edge), (shown, 0));
+        assert!((hit.dist - 5.0).abs() < 1e-4, "got {}", hit.dist);
+    }
+
+    #[test]
+    fn an_empty_scene_and_a_mesh_without_faces_pick_no_edge() {
+        let mut scene = Scene::new();
+        let ray = ray_down_z(0.0, 0.0);
+        assert_eq!(pick_edge(&mut scene, ray, 1.0), None, "nothing in the scene");
+
+        // Positions alone are not edges: `edges()` walks faces.
+        let mut bare = Mesh::new();
+        bare.add_vertex(Vec3::new(-1.0, -1.0, 0.0));
+        bare.add_vertex(Vec3::new(1.0, -1.0, 0.0));
+        scene.create_mesh("bare", bare);
+        assert_eq!(pick_edge(&mut scene, ray, 1.0), None, "a mesh with no faces");
+
+        // A face too short for a polygon has no sides either.
+        let mut sliver = Mesh::new();
+        sliver.add_vertex(Vec3::new(0.0, 0.0, 0.0));
+        sliver.add_vertex(Vec3::new(1.0, 0.0, 0.0));
+        sliver.add_face(&[0, 1]);
+        scene.create_mesh("sliver", sliver);
+        assert_eq!(pick_edge(&mut scene, ray, 1.0), None, "a two-corner face is no edge");
+    }
+
+    #[test]
+    fn the_tolerance_is_a_limit_and_a_ray_just_past_it_misses() {
+        let mut scene = Scene::new();
+        scene.create_mesh("quad", quad(0.0));
+        // The bottom side is at y = -1; this ray runs about 0.1005 away.
+        let ray = ray_down_z(0.0, -1.1005);
+        assert_eq!(pick_edge(&mut scene, ray, 0.1), None, "just past the tolerance");
+        let hit = pick_edge(&mut scene, ray, 0.2).expect("well inside a wider tolerance");
+        assert_eq!(hit.edge, 0);
+    }
+
     // --- marquee selection ----------------------------------------------------
 
     /// The down-`+Z` view of [`looking_down_z`], pulled back far enough that
@@ -1477,13 +1720,177 @@ mod tests {
     }
 
     #[test]
-    fn edge_level_has_nothing_to_select() {
+    fn the_endpoints_of_one_side_bring_that_side_and_the_sides_meeting_it() {
+        // The box around both endpoints of the bottom side is that side's own
+        // projected segment. Those endpoints are corners of the two sides
+        // meeting it, so those come along through the inclusive endpoint rule;
+        // the top side, the only edge with both endpoints outside and no
+        // crossing, stays out.
         let mut scene = Scene::new();
-        scene.create_mesh("triangles", two_gapped_triangles());
+        let id = scene.create_mesh("quad", quad(0.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+
+        // A box in the empty top-left of the frame selects no edge at all.
+        let away = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(10.0, 10.0));
+        assert!(marquee_elements(&mut scene, vp, size, away, SelectLevel::Edge).is_empty());
+
+        let world = world_positions(&mut scene, id);
+        let rect = screen_box(vp, size, &[world[0], world[1]]);
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Edge);
+        assert_eq!(
+            sel,
+            vec![
+                PickElement::Edge { node: id, edge: 0 },
+                PickElement::Edge { node: id, edge: 1 },
+                PickElement::Edge { node: id, edge: 3 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_segment_crossing_the_box_selects_its_edge_with_no_endpoint_inside() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        let world = world_positions(&mut scene, id);
+
+        // A box over the middle of the bottom side: both of the side's
+        // endpoints are outside it, the segment crosses the box's left and
+        // right sides, and the other three sides of the quad pass well clear.
+        let (ax, ay, _) = project(vp, world[0], size).unwrap();
+        let (bx, _, _) = project(vp, world[1], size).unwrap();
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(ax + (bx - ax) * 0.4, ay - 15.0),
+            egui::pos2(ax + (bx - ax) * 0.6, ay + 15.0),
+        );
+        assert!(ax < rect.min.x && bx > rect.max.x, "neither endpoint is inside");
+
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Edge);
+        assert_eq!(sel, vec![PickElement::Edge { node: id, edge: 0 }]);
+    }
+
+    #[test]
+    fn an_endpoint_exactly_on_the_box_edge_counts_through_the_inclusive_test() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        let world = world_positions(&mut scene, id);
+        let (x, y, _) = project(vp, world[0], size).unwrap();
+
+        // Vertex 0 sits exactly on the box's min corner: the two sides
+        // meeting there are selected, each by an endpoint on the boundary.
+        let on_the_edge =
+            egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + 40.0, y + 40.0));
+        let sel = marquee_elements(&mut scene, vp, size, on_the_edge, SelectLevel::Edge);
+        assert_eq!(
+            sel,
+            vec![
+                PickElement::Edge { node: id, edge: 0 },
+                PickElement::Edge { node: id, edge: 3 },
+            ]
+        );
+
+        // Pulled one pixel in, no endpoint is inside and the bottom side,
+        // running along just under the box, crosses none of its sides.
+        let pulled_in =
+            egui::Rect::from_min_max(egui::pos2(x + 1.0, y + 1.0), egui::pos2(x + 41.0, y + 41.0));
+        assert!(marquee_elements(&mut scene, vp, size, pulled_in, SelectLevel::Edge).is_empty());
+    }
+
+    #[test]
+    fn an_endpoint_behind_the_camera_leaves_its_edges_out() {
+        let mut scene = Scene::new();
+        // One triangle with its last corner past the eye (the camera looks
+        // from z = 10): only the edge between the two corners in front of it
+        // can be selected, even by a box over the whole frame.
+        let mut m = Mesh::new();
+        m.add_vertex(Vec3::new(-2.0, -2.0, 0.0));
+        m.add_vertex(Vec3::new(2.0, -2.0, 0.0));
+        m.add_vertex(Vec3::new(0.0, 2.0, 12.0));
+        m.add_face(&[0, 1, 2]);
+        let id = scene.create_mesh("wedge", m);
+
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        assert!(project(vp, Vec3::new(0.0, 2.0, 12.0), size).is_none(), "behind the eye");
+        let all = egui::Rect::from_min_max(egui::pos2(-100.0, -100.0), egui::pos2(500.0, 500.0));
+        let sel = marquee_elements(&mut scene, vp, size, all, SelectLevel::Edge);
+        assert_eq!(sel, vec![PickElement::Edge { node: id, edge: 0 }]);
+    }
+
+    #[test]
+    fn hidden_and_frozen_nodes_are_skipped_at_edge_level() {
+        let mut scene = Scene::new();
+        // Three coincident quads: an unfiltered walk would report twelve
+        // edges where only the visible, unfrozen node may contribute four.
+        let shown = scene.create_mesh("shown", quad(0.0));
+        let hidden = scene.create_mesh("hidden", quad(0.0));
+        scene.get_mut(hidden).unwrap().visible = false;
+        let frozen = scene.create_mesh("frozen", quad(0.0));
+        scene.get_mut(frozen).unwrap().frozen = true;
+
         let size = [400.0, 400.0];
         let vp = looking_down_z_from_afar();
         let rect = egui::Rect::from_min_max(egui::pos2(-100.0, -100.0), egui::pos2(500.0, 500.0));
-        assert!(marquee_elements(&mut scene, vp, size, rect, SelectLevel::Edge).is_empty());
+        let sel = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Edge);
+        let expected: Vec<PickElement> =
+            (0..4u32).map(|ei| PickElement::Edge { node: shown, edge: ei }).collect();
+        assert_eq!(sel, expected);
+    }
+
+    #[test]
+    fn the_edge_result_is_deterministic_with_each_edge_once_and_indices_ascending() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("triangles", two_gapped_triangles());
+        let size = [400.0, 400.0];
+        let vp = looking_down_z_from_afar();
+        let rect = screen_box(vp, size, &world_positions(&mut scene, id));
+
+        let first = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Edge);
+        let second = marquee_elements(&mut scene, vp, size, rect, SelectLevel::Edge);
+        assert_eq!(first, second, "two calls, one answer");
+
+        assert_eq!(first.len(), 6, "two triangles, six edges, each once");
+        let indices: Vec<u32> = first.iter().map(|e| e.index()).collect();
+        assert_eq!(indices, (0..6).collect::<Vec<u32>>(), "indices ascending");
+        assert!(first.iter().all(|e| e.node() == id));
+    }
+
+    #[test]
+    fn the_element_centroid_and_dragged_vertices_of_selected_edges() {
+        // Two edges of the quad: the bottom side [0, 1] and the right side
+        // [1, 2]. They share vertex 1.
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let mut sel = Selection::new();
+        sel.level = SelectLevel::Edge;
+        sel.select_node(id);
+        sel.select_elements(id, [0u32, 1]);
+
+        // The centroid averages the selected edges' four endpoint slots:
+        // (-1, -1), (1, -1), (1, -1) again and (1, 1).
+        let c = element_centroid(&mut scene, &sel).expect("two selected edges");
+        let expected = (Vec3::new(-1.0, -1.0, 0.0)
+            + Vec3::new(1.0, -1.0, 0.0)
+            + Vec3::new(1.0, -1.0, 0.0)
+            + Vec3::new(1.0, 1.0, 0.0))
+            / 4.0;
+        assert!((c - expected).length() < 1e-5, "got {c:?}");
+
+        // A drag moves the three distinct endpoints, the shared one once.
+        let targets = selected_vertices(&mut scene, &sel);
+        assert_eq!(targets.len(), 1, "both edges belong to one node");
+        let (node, positions) = &targets[0];
+        assert_eq!(*node, id);
+        assert_eq!(
+            positions.iter().map(|(vi, _)| *vi).collect::<Vec<u32>>(),
+            vec![0, 1, 2],
+            "the shared corner is listed once"
+        );
+        assert!(positions.contains(&(0, Vec3::new(-1.0, -1.0, 0.0))));
     }
 
     #[test]

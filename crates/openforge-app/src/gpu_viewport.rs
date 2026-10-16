@@ -252,14 +252,16 @@ pub fn marquee_pixel_rect(
 /// The element a click at `level` should take from a pick's hits.
 ///
 /// Hits come back nearest first, but a level only accepts what it edits: the
-/// pass draws vertices as points over the faces they lie on, so a face-level
-/// click has to skip past a nearer vertex and a vertex-level click has to skip
-/// the face covering it. Object and edge levels pick nothing here — object
-/// clicks go through the select tool, which owns node picking.
+/// pass draws vertices as points over the faces they lie on and edges as lines
+/// over the faces they bound, so a face-level click has to skip past a nearer
+/// vertex or edge, and a vertex- or edge-level click has to skip the face they
+/// sit on. Object level picks nothing here — object clicks go through the
+/// select tool, which owns node picking.
 pub fn chosen_hit(level: SelectLevel, hits: &[PickElement]) -> Option<PickElement> {
     hits.iter().copied().find(|hit| match (level, hit) {
         (SelectLevel::Face, PickElement::Face { .. }) => true,
         (SelectLevel::Vertex, PickElement::Vertex { .. }) => true,
+        (SelectLevel::Edge, PickElement::Edge { .. }) => true,
         _ => false,
     })
 }
@@ -449,17 +451,22 @@ mod tests {
     fn chosen_hit_skips_elements_the_level_cannot_use() {
         let face = PickElement::Face { node: NodeId(2), face: 7 };
         let vertex = PickElement::Vertex { node: NodeId(1), vertex: 3 };
+        let edge = PickElement::Edge { node: NodeId(1), edge: 5 };
 
-        // A vertex point sits on top of its face: a face click must skip it.
+        // A vertex point sits on top of its face and an edge line lies on it:
+        // a face click must skip past both, and a vertex or edge click must
+        // skip the face underneath in turn.
         assert_eq!(chosen_hit(SelectLevel::Face, &[vertex, face]), Some(face));
+        assert_eq!(chosen_hit(SelectLevel::Face, &[edge, face]), Some(face));
         assert_eq!(chosen_hit(SelectLevel::Vertex, &[face, vertex]), Some(vertex));
+        assert_eq!(chosen_hit(SelectLevel::Edge, &[face, edge]), Some(edge));
         // A level with no usable hit falls through to the caller's raycast.
         assert_eq!(chosen_hit(SelectLevel::Vertex, &[face]), None);
         assert_eq!(chosen_hit(SelectLevel::Face, &[vertex]), None);
-        assert_eq!(chosen_hit(SelectLevel::Face, &[]), None);
-        // Node clicks go through the select tool, and edges are not pickable
-        // yet: neither takes anything from a pick.
-        assert_eq!(chosen_hit(SelectLevel::Object, &[vertex, face]), None);
         assert_eq!(chosen_hit(SelectLevel::Edge, &[vertex, face]), None);
+        assert_eq!(chosen_hit(SelectLevel::Face, &[]), None);
+        assert_eq!(chosen_hit(SelectLevel::Edge, &[]), None);
+        // Node clicks go through the select tool: it takes nothing from a pick.
+        assert_eq!(chosen_hit(SelectLevel::Object, &[vertex, face]), None);
     }
 }

@@ -1220,6 +1220,11 @@ impl OpenForgeApp {
                     viewport::pick_vertex(&mut self.scene, ray, self.camera.eye(), tol)
                         .map(|hit| PickElement::Vertex { node: hit.node, vertex: hit.vertex })
                 }
+                SelectLevel::Edge => {
+                    let tol = (self.camera.distance * 0.02).max(0.01);
+                    viewport::pick_edge(&mut self.scene, ray, tol)
+                        .map(|hit| PickElement::Edge { node: hit.node, edge: hit.edge })
+                }
                 _ => None,
             })
     }
@@ -1273,9 +1278,6 @@ impl OpenForgeApp {
     /// Selection only — nothing in the mesh changes, so there is nothing to
     /// undo.
     fn apply_marquee(&mut self, level: SelectLevel, hits: &[PickElement], additive: bool) {
-        if matches!(level, SelectLevel::Edge) {
-            return;
-        }
         if !additive {
             self.selection.clear();
         }
@@ -1606,7 +1608,10 @@ impl OpenForgeApp {
                         "Select — {} face(s) selected.",
                         self.selection.total_element_count()
                     ),
-                    SelectLevel::Edge => "Select — edges are not selectable yet.".into(),
+                    SelectLevel::Edge => format!(
+                        "Select — {} edge(s) selected.",
+                        self.selection.total_element_count()
+                    ),
                 },
                 ActiveTool::Move => {
                     "Move — drag an axis handle, or drag the mesh in the view plane.".into()
@@ -3766,6 +3771,40 @@ mod tests {
         app.selection.selected_elements(id).map(|s| s.len()).unwrap_or(0)
     }
 
+    /// The selected element indices of `id`, ascending.
+    fn selected_indices(app: &OpenForgeApp, id: NodeId) -> Vec<u32> {
+        app.selection
+            .selected_elements(id)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// A 2×2 quad flat on the XY plane, centred on the origin and facing +Z.
+    ///
+    /// With the camera turned to look straight down -Z it projects as an
+    /// axis-aligned square around the gizmo origin: its bottom edge runs
+    /// below the centre, its top edge above it, its left and right edges to
+    /// the sides, which makes every edge's screen position predictable. Its
+    /// four edges walk the corners in order, so the bottom edge is edge 0,
+    /// the right 1, the top 2 and the left 3.
+    fn centred_quad() -> Mesh {
+        let mut m = Mesh::new();
+        m.add_vertex(Vec3::new(-1.0, -1.0, 0.0));
+        m.add_vertex(Vec3::new(1.0, -1.0, 0.0));
+        m.add_vertex(Vec3::new(1.0, 1.0, 0.0));
+        m.add_vertex(Vec3::new(-1.0, 1.0, 0.0));
+        m.add_face(&[0, 1, 2, 3]);
+        m
+    }
+
+    /// Point the camera straight down -Z at the origin and return where the
+    /// quad's centre lands on screen.
+    fn face_quad(ctx: &egui::Context, app: &mut OpenForgeApp, id: NodeId) -> egui::Pos2 {
+        app.camera.yaw = std::f32::consts::FRAC_PI_2;
+        app.camera.pitch = 0.0;
+        gizmo_origin(ctx, app, id, 0.0)
+    }
+
     /// Whether a frame painted a rectangle with exactly this rect.
     fn paints_rect(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> bool {
         fn walk(shape: &egui::Shape, rect: egui::Rect) -> bool {
@@ -3902,6 +3941,99 @@ mod tests {
             false,
         );
         assert_eq!(app.selection.node_count(), 0, "empty space selects nothing");
+    }
+
+    #[test]
+    fn an_edge_click_selects_the_edge_under_the_pointer() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Quad", centred_quad());
+        let centre = face_quad(&ctx, &mut app, id);
+        app.tool = ActiveTool::Select;
+        app.selection.level = SelectLevel::Edge;
+
+        // The screen position of the quad's bottom edge, from the same
+        // projection the app picks with — confirmed, like the snapping tests
+        // do, against the gizmo the frame drew.
+        let size = [SCREEN[0], SCREEN[1]];
+        let vp = app.camera.view_proj(size[0] / size[1]);
+        let (ex, ey, _) = viewport::project(vp, Vec3::new(0.0, -1.0, 0.0), size)
+            .expect("the edge midpoint is in front");
+        let (cx, cy, _) = viewport::project(vp, Vec3::ZERO, size).expect("the centre is in front");
+        assert!(
+            (egui::pos2(cx, cy) - centre).length() < 1.0,
+            "the projection and the gizmo agree: ({cx}, {cy}) vs {centre:?}"
+        );
+
+        let on_edge = egui::pos2(ex, ey);
+        step(&ctx, &mut app, frame(1.0, on_edge, None));
+        step(&ctx, &mut app, frame(1.1, on_edge, Some(true)));
+        step(&ctx, &mut app, frame(1.2, on_edge, Some(false)));
+        assert_eq!(
+            selected_indices(&app, id),
+            vec![0],
+            "the click must take the edge under it"
+        );
+        assert!(app.selection.is_node_selected(id), "the node comes with its edge");
+
+        // The middle of the face is most of a world unit clear of every edge:
+        // a click there takes no edge, and an edge level has nothing else.
+        app.selection.clear();
+        let inside = egui::pos2(cx, cy);
+        step(&ctx, &mut app, frame(2.0, inside, None));
+        step(&ctx, &mut app, frame(2.1, inside, Some(true)));
+        step(&ctx, &mut app, frame(2.2, inside, Some(false)));
+        assert_eq!(
+            app.selection.total_element_count(),
+            0,
+            "no edge runs under the middle of the face"
+        );
+    }
+
+    #[test]
+    fn an_edge_rectangle_selects_the_edges_it_covers() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Quad", centred_quad());
+        let centre = face_quad(&ctx, &mut app, id);
+        app.tool = ActiveTool::Select;
+        app.selection.level = SelectLevel::Edge;
+
+        // The quad's sides sit about 84 px from its centre at the default
+        // distance, so a rectangle over the upper-left corner covers the top
+        // edge (2 → 3) and the left edge (0 → 3) and neither of the other two.
+        drag_rectangle(
+            &ctx,
+            &mut app,
+            1.0,
+            centre + egui::vec2(-110.0, -110.0),
+            centre + egui::vec2(-10.0, -10.0),
+            false,
+        );
+        assert_eq!(
+            selected_indices(&app, id),
+            vec![2, 3],
+            "only the edges the rectangle covers"
+        );
+        assert!(app.selection.is_node_selected(id), "the node comes with its edges");
+
+        // A rectangle over the whole quad takes all four edges.
+        drag_rectangle(
+            &ctx,
+            &mut app,
+            2.0,
+            centre + egui::vec2(-110.0, -110.0),
+            centre + egui::vec2(110.0, 110.0),
+            false,
+        );
+        assert_eq!(
+            selected_indices(&app, id),
+            vec![0, 1, 2, 3],
+            "the whole quad is all four edges"
+        );
+        assert_eq!(app.status, "Select — 4 edge(s) selected.", "the status counts them");
     }
 
     #[test]
