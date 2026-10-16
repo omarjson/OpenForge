@@ -103,6 +103,16 @@ fn round_trip_stl() {
 }
 
 #[test]
+fn round_trip_dae() {
+    round_trip("dae")
+}
+
+#[test]
+fn round_trip_off() {
+    round_trip("off")
+}
+
+#[test]
 fn unknown_extension_errors() {
     let dir = temp_dir();
     let path = dir.join("mesh.xyz");
