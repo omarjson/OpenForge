@@ -140,6 +140,11 @@ pub struct OpenForgeApp {
     dirty: bool,
     show_outliner: bool,
     show_properties: bool,
+    /// Picks ignore occlusion ("Select Through"): the sub-object picks answer
+    /// from the projection — the nearest element under the pointer, or every
+    /// element a rectangle covers, geometry in front of it or not — instead of
+    /// the occluding ID pass.
+    select_through: bool,
     /// Deformer axis index (0 = X, 1 = Y, 2 = Z).
     deform_axis: usize,
     /// Deformer amount: taper factor, or twist/bend angle in radians.
@@ -228,6 +233,7 @@ impl OpenForgeApp {
             dirty: true,
             show_outliner: true,
             show_properties: true,
+            select_through: false,
             deform_axis: 1,
             deform_amount: 0.5,
             rig_skeleton: None,
@@ -1294,6 +1300,42 @@ impl OpenForgeApp {
         self.status = self.selection_status(name);
     }
 
+    /// Flip **Select Through**: with it on, the picks stop asking the ID pass
+    /// and answer from the projection instead, so occluded elements can be
+    /// picked.
+    fn toggle_select_through(&mut self) {
+        self.select_through = !self.select_through;
+        self.status = if self.select_through {
+            "Select Through on — picks ignore occlusion (P).".into()
+        } else {
+            "Select Through off — picks follow the drawn frame (P).".into()
+        };
+    }
+
+    /// Show or hide one node, the outliner's visibility box.
+    ///
+    /// The same scene edit the H shortcut makes, scaled to one node: one undo
+    /// step, and hiding drops the node from the selection the way H does.
+    fn set_node_visible(&mut self, id: NodeId, visible: bool) {
+        let name = match self.scene.get(id) {
+            Ok(node) => node.name.clone(),
+            Err(_) => return,
+        };
+        self.with_edit(if visible { "Show Node" } else { "Hide Node" }, |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                node.visible = visible;
+            }
+        });
+        if !visible {
+            self.selection.deselect_node(id);
+        }
+        self.status = if visible {
+            format!("Shown {name}.")
+        } else {
+            format!("Hidden {name}.")
+        };
+    }
+
     /// Hide every selected node and drop it from the selection.
     ///
     /// Hiding is a scene edit — the undo stack records it — and the hidden
@@ -1486,12 +1528,25 @@ impl OpenForgeApp {
         camera.ray_from_ndc(ndc.x, ndc.y, aspect)
     }
 
+    /// Whether the picks may run through the occluding ID pass: only a backend
+    /// that has one, and only while Select Through is off.
+    ///
+    /// Select Through is the author asking for the *other* answer — the one
+    /// the projection gives on a machine without wgpu: the nearest element
+    /// under the pointer, or everything a rectangle covers, hidden behind
+    /// geometry or not.
+    fn occluding_picks(select_through: bool, has_backend: bool) -> bool {
+        has_backend && !select_through
+    }
+
     /// What the GPU's ID pass finds under a click, at the current selection
     /// level.
     ///
     /// `None` when there is no wgpu backend, or when the patch around the
     /// click holds no element the level can use — the caller then falls back
-    /// to its own raycast.
+    /// to its own raycast. With Select Through on, it answers `None` at once:
+    /// the mode is exactly the request *not* to draw a line at what the image
+    /// shows, so the raycast always gets the question.
     fn gpu_pick(
         &mut self,
         render_state: Option<&RenderState>,
@@ -1500,6 +1555,9 @@ impl OpenForgeApp {
         scale: f32,
         level: SelectLevel,
     ) -> Option<PickElement> {
+        if !Self::occluding_picks(self.select_through, render_state.is_some() && self.gpu.is_some()) {
+            return None;
+        }
         let Some(state) = render_state else { return None };
         let Some(gpu) = self.gpu.as_mut() else { return None };
         let camera = gpu_viewport::orbit_camera(&self.camera);
@@ -1513,7 +1571,9 @@ impl OpenForgeApp {
     /// The ID pass draws exactly what the frame drew, so a click can only land
     /// on geometry the image shows. The raycast answers when there is no wgpu
     /// backend, when the patch holds nothing the level can use, and for the
-    /// levels the ID pass does not serve.
+    /// levels the ID pass does not serve. With **Select Through** on, the
+    /// raycast answers every time — a click may then land on geometry the
+    /// frame hides.
     fn resolve_click(
         &mut self,
         render_state: Option<&RenderState>,
@@ -1549,7 +1609,8 @@ impl OpenForgeApp {
     /// empty space selects nothing, and one that covers no pixel of the target
     /// at all covers no element either. Falling back to a projection that
     /// selects through geometry would contradict the picture the click path
-    /// obeys; the projection is only for a machine without wgpu.
+    /// obeys — so the projection serves a machine without wgpu, and whoever
+    /// turned **Select Through** on and asked for exactly that answer.
     fn marquee_hits(
         &mut self,
         render_state: Option<&RenderState>,
@@ -1560,19 +1621,23 @@ impl OpenForgeApp {
         level: SelectLevel,
     ) -> Vec<PickElement> {
         if let (Some(state), Some(gpu)) = (render_state, self.gpu.as_mut()) {
-            let camera = gpu_viewport::orbit_camera(&self.camera);
-            return gpu
-                .pick_rect(
-                    state,
-                    rect,
-                    box_.min,
-                    box_.max,
-                    scale,
-                    &mut self.scene,
-                    &camera,
-                    level,
-                )
-                .unwrap_or_default();
+            // Select Through sends the rectangle to the projection below, so
+            // the walk through the ID pass is skipped, not re-run.
+            if Self::occluding_picks(self.select_through, true) {
+                let camera = gpu_viewport::orbit_camera(&self.camera);
+                return gpu
+                    .pick_rect(
+                        state,
+                        rect,
+                        box_.min,
+                        box_.max,
+                        scale,
+                        &mut self.scene,
+                        &camera,
+                        level,
+                    )
+                    .unwrap_or_default();
+            }
         }
         // The fallback works in viewport-local points, exactly like the
         // painter's own projection.
@@ -2222,6 +2287,19 @@ impl OpenForgeApp {
                         ui.close_menu();
                     }
                     if ui
+                        .button(format!(
+                            "Select Through: {}",
+                            if self.select_through { "on" } else { "off" }
+                        ))
+                        .on_hover_text(
+                            "Picks ignore occlusion — occluded elements answer too (P)",
+                        )
+                        .clicked()
+                    {
+                        self.toggle_select_through();
+                        ui.close_menu();
+                    }
+                    if ui
                         .button(format!("Wireframe: {}", self.wireframe.label()))
                         .on_hover_text("Cycle Off / Selection / All (Z)")
                         .clicked()
@@ -2304,6 +2382,9 @@ impl OpenForgeApp {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L)) {
             self.select_edge_loops();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
+            self.toggle_select_through();
         }
         // Visibility.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::H)) {
@@ -2756,13 +2837,10 @@ impl OpenForgeApp {
             ui.horizontal(|ui| {
                 if ui
                     .checkbox(&mut shown, "")
-                    .on_hover_text("Visible in the viewport")
+                    .on_hover_text("Visible in the viewport — one undo step, like H")
                     .changed()
                 {
-                    if let Ok(node) = self.scene.get_mut(id) {
-                        node.visible = shown;
-                    }
-                    self.dirty = true;
+                    self.set_node_visible(id, shown);
                 }
                 let line = ui.selectable_label(selected, format!("{}{}", icon, name));
                 resp = Some(line);
@@ -5247,6 +5325,79 @@ mod tests {
         app.selection.clear_elements();
         app.select_edge_rings();
         assert_eq!(app.status, "Select an edge to walk from.");
+    }
+
+    #[test]
+    fn select_through_makes_the_picks_ignore_occlusion() {
+        // The gate first: the occluding pass serves only when there is a
+        // backend that has one, and only while Select Through is off.
+        assert!(OpenForgeApp::occluding_picks(false, true));
+        assert!(!OpenForgeApp::occluding_picks(true, true));
+        assert!(!OpenForgeApp::occluding_picks(false, false));
+        assert!(!OpenForgeApp::occluding_picks(true, false));
+
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        assert!(!app.select_through, "off by default");
+        step_with_keys(&ctx, &mut app, key_frame(0.0, egui::Key::P));
+        assert!(app.select_through, "P turns Select Through on");
+        step_with_keys(&ctx, &mut app, key_frame(1.0, egui::Key::P));
+        assert!(!app.select_through, "and P turns it off again");
+        // The viewport rewrites the status line every frame, so the messages
+        // are pinned on the action itself, like the Select menu's.
+        app.toggle_select_through();
+        assert_eq!(app.status, "Select Through on — picks ignore occlusion (P).");
+        app.toggle_select_through();
+        assert_eq!(app.status, "Select Through off — picks follow the drawn frame (P).");
+
+        // This machine has no ID pass, so the picks answer from the projection
+        // either way — the fallback the mode asks for on machines that have
+        // one. A vertex behind a surface takes the click that lands on it.
+        app.scene = Scene::new();
+        let mut m = Mesh::new();
+        for (x, y) in [(-1.0f32, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        let hidden = m.add_vertex(Vec3::new(0.0, 0.0, -1.0));
+        m.add_face(&[0, 1, 2, 3]);
+        let id = app.scene.create_mesh("Quad", m);
+        app.selection.level = SelectLevel::Vertex;
+        app.select_through = true;
+
+        let size = [SCREEN[0], SCREEN[1]];
+        let vp = app.camera.view_proj(size[0] / size[1]);
+        let (x, y, _) = viewport::project(vp, Vec3::new(0.0, 0.0, -1.0), size)
+            .expect("behind the quad, still in front of the camera");
+        let pos = egui::pos2(x, y);
+        step(&ctx, &mut app, frame(2.0, pos, None));
+        step(&ctx, &mut app, frame(2.1, pos, Some(true)));
+        step(&ctx, &mut app, frame(2.2, pos, Some(false)));
+        assert_eq!(
+            selected_indices(&app, id),
+            vec![hidden],
+            "the occluded vertex takes the click"
+        );
+        assert!(app.selection.is_node_selected(id), "and the node comes with it");
+    }
+
+    #[test]
+    fn the_outliner_visibility_toggle_is_an_undoable_edit() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Grid", face_grid());
+        app.selection.select_node(id);
+
+        app.set_node_visible(id, false);
+        assert!(!app.scene.get(id).unwrap().visible, "the box hid the node");
+        assert_eq!(app.status, "Hidden Grid.");
+        assert!(!app.selection.is_node_selected(id), "hiding drops the selection");
+        app.undo_edit();
+        assert!(app.scene.get(id).unwrap().visible, "and it is one undo step");
+
+        app.set_node_visible(id, false);
+        app.set_node_visible(id, true);
+        assert!(app.scene.get(id).unwrap().visible, "the box shows it again");
+        assert_eq!(app.status, "Shown Grid.");
     }
 
     #[test]
