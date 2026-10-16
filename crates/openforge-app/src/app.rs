@@ -43,6 +43,57 @@ use std::path::{Path, PathBuf};
 const SPIN_SECONDS: f64 = 2.0;
 const SPIN_STEPS: u32 = 4;
 
+/// The game-model report over a set of nodes: mesh nodes and triangles per LOD
+/// level, with the untagged pile first — the budget a game model is judged by.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LodReport {
+    /// `(level, mesh nodes, triangles)`, `None` (untagged) first, then levels
+    /// ascending.
+    levels: Vec<(Option<u8>, usize, usize)>,
+    /// Every mesh node in the set, tagged or not.
+    nodes: usize,
+    /// Every triangle those nodes hold.
+    triangles: usize,
+}
+
+impl LodReport {
+    /// Fold one mesh node into the report.
+    fn add(&mut self, lod: Option<u8>, triangles: usize) {
+        self.nodes += 1;
+        self.triangles += triangles;
+        match self.levels.iter_mut().find(|(level, _, _)| *level == lod) {
+            Some((_, nodes, tris)) => {
+                *nodes += 1;
+                *tris += triangles;
+            }
+            None => self.levels.push((lod, 1, triangles)),
+        }
+        self.levels.sort_by_key(|(level, _, _)| match level {
+            None => (0, 0),
+            Some(n) => (1, *n),
+        });
+    }
+
+    /// The panel lines: one per level, then the total.
+    fn lines(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .levels
+            .iter()
+            .map(|(level, nodes, tris)| match level {
+                Some(n) => format!("LOD {n}: {nodes} node(s), {tris} tri(s)."),
+                None => format!("Untagged: {nodes} node(s), {tris} tri(s)."),
+            })
+            .collect();
+        if self.nodes > 0 {
+            out.push(format!(
+                "Total: {} node(s), {} tri(s).",
+                self.nodes, self.triangles
+            ));
+        }
+        out
+    }
+}
+
 fn default_materials() -> MaterialLibrary {
     let mut library = MaterialLibrary::new();
     for (name, rgb, shininess, specular) in [
@@ -2420,6 +2471,41 @@ impl OpenForgeApp {
                         ui.close_menu();
                     }
                 });
+                ui.menu_button("Game", |ui| {
+                    if ui
+                        .button("Add Dummy")
+                        .on_hover_text("A non-rendered attach point at the selection's centre")
+                        .clicked()
+                    {
+                        self.add_dummy();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.menu_button("Set LOD", |ui| {
+                        for level in 0u8..=3 {
+                            if ui.button(level.to_string()).clicked() {
+                                self.set_lod(Some(level));
+                                ui.close_menu();
+                            }
+                        }
+                        if ui.button("Clear").clicked() {
+                            self.set_lod(None);
+                            ui.close_menu();
+                        }
+                    });
+                    ui.menu_button("Isolate LOD", |ui| {
+                        for level in 0u8..=3 {
+                            if ui
+                                .button(level.to_string())
+                                .on_hover_text("Hide everything the level does not hold (U shows it again)")
+                                .clicked()
+                            {
+                                self.isolate_lod(level);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                });
                 ui.menu_button("Select", |ui| {
                     let sub_level = self.selection.level != SelectLevel::Object;
                     if ui.button("All (Ctrl+A)").clicked() {
@@ -3016,14 +3102,21 @@ impl OpenForgeApp {
     fn outliner_node(&mut self, ui: &mut egui::Ui, id: NodeId) {
         // Snapshot the node's display data so we don't hold a borrow on the
         // scene while recursively painting children.
-        let (name, icon, has_children, children, visible) = match self.scene.get(id) {
+        let (name, icon, has_children, children, visible, lod) = match self.scene.get(id) {
             Ok(node) => {
                 let icon = match &node.kind {
                     NodeKind::Group => "[] ",
                     NodeKind::Dummy => "() ",
                     NodeKind::Mesh { .. } => "/\\ ",
                 };
-                (node.name.clone(), icon, !node.children.is_empty(), node.children.clone(), node.visible)
+                (
+                    node.name.clone(),
+                    icon,
+                    !node.children.is_empty(),
+                    node.children.clone(),
+                    node.visible,
+                    node.lod,
+                )
             }
             Err(_) => return,
         };
@@ -3040,7 +3133,8 @@ impl OpenForgeApp {
                 {
                     self.set_node_visible(id, shown);
                 }
-                let line = ui.selectable_label(selected, format!("{}{}", icon, name));
+                let tag = lod.map(|level| format!("  LOD {level}")).unwrap_or_default();
+                let line = ui.selectable_label(selected, format!("{}{}{}", icon, name, tag));
                 resp = Some(line);
             });
             if resp.map(|r| r.clicked()).unwrap_or(false) {
@@ -3295,6 +3389,16 @@ impl OpenForgeApp {
             ui.label("Nothing selected.");
             ui.label(format!("Nodes: {}", self.scene.node_count()));
             ui.label(format!("Mesh nodes: {}", self.scene.mesh_names().len()));
+            let all: Vec<NodeId> = self.scene.iter().map(|n| n.id).collect();
+            let report = self.lod_report(&all);
+            ui.label(format!("Triangles: {}", report.triangles));
+            if report.levels.iter().any(|(level, _, _)| level.is_some()) {
+                ui.separator();
+                ui.label("Model report");
+                for line in report.lines() {
+                    ui.label(line);
+                }
+            }
             return;
         }
         for &id in &ids {
@@ -3307,6 +3411,20 @@ impl OpenForgeApp {
                 ui.label(format!("Triangles: {}", mesh.triangulated_count()));
                 let slot = node.face_material_slot(0);
                 ui.label(format!("Material: {} (slot {slot})", self.materials.resolve(slot).name));
+            }
+            if let Some(level) = node.lod {
+                ui.label(format!("LOD {level}"));
+            }
+            ui.separator();
+        }
+
+        // The model report over the selection — worth the lines once it is
+        // more than the one node's own row above, or once anything is tagged.
+        let report = self.lod_report(&ids);
+        if report.nodes > 1 || report.levels.iter().any(|(level, _, _)| level.is_some()) {
+            ui.label("Model report");
+            for line in report.lines() {
+                ui.label(line);
             }
             ui.separator();
         }
@@ -3919,6 +4037,104 @@ impl OpenForgeApp {
                 ui.label(format!("keys: {}", ticks.join(", ")));
             }
         });
+    }
+
+    // --- Game asset prep --------------------------------------------------------
+
+    /// Create a dummy node at the selection's centre — a gameplay attach point,
+    /// the kind of node game formats carry beside their geometry.
+    ///
+    /// With nothing selected it lands on the origin. One undo step, and the
+    /// dummy comes up selected so it can be dragged at once.
+    fn add_dummy(&mut self) {
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        let mut centre = Vec3::ZERO;
+        if !ids.is_empty() {
+            let mut sum = Vec3::ZERO;
+            for id in &ids {
+                if let Ok(world) = self.scene.world_transform(*id) {
+                    sum += world.translation;
+                }
+            }
+            centre = sum / ids.len() as f32;
+        }
+        let name = format!("dummy {}", self.scene.node_count() + 1);
+        let status = format!("Added {name} — a non-rendered attach point.");
+        self.with_edit("Add Dummy", |app| {
+            let id = app.scene.create_dummy(name);
+            if let Ok(node) = app.scene.get_mut(id) {
+                node.transform.translation = centre;
+            }
+            app.selection.clear();
+            app.selection.select_node(id);
+        });
+        self.status = status;
+    }
+
+    /// Tag the selected nodes with an LOD level (0 = highest detail), or clear
+    /// the tag. One undo step; geometry and pose stay untouched.
+    fn set_lod(&mut self, level: Option<u8>) {
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if ids.is_empty() {
+            self.status = "Select a node to tag.".into();
+            return;
+        }
+        let label = match level {
+            Some(n) => format!("Set LOD {n}"),
+            None => "Clear LOD".into(),
+        };
+        self.with_edit(&label, |app| {
+            for id in &ids {
+                if let Ok(node) = app.scene.get_mut(*id) {
+                    node.lod = level;
+                }
+            }
+        });
+        self.status = match level {
+            Some(n) => format!("LOD {n} — {} node(s) tagged.", ids.len()),
+            None => format!("LOD cleared — {} node(s).", ids.len()),
+        };
+    }
+
+    /// Show only the nodes tagged `level`, hiding everything else — the
+    /// preview a game model needs while one detail level is being worked on.
+    /// One undo step, exactly like Isolate; U shows everything again.
+    fn isolate_lod(&mut self, level: u8) {
+        let all: Vec<NodeId> = self.scene.iter().map(|n| n.id).collect();
+        let keep: Vec<NodeId> = self
+            .scene
+            .iter()
+            .filter(|n| n.lod == Some(level))
+            .map(|n| n.id)
+            .collect();
+        if keep.is_empty() {
+            self.status = format!("Nothing is tagged LOD {level} — set it first.");
+            return;
+        }
+        self.with_edit(&format!("Isolate LOD {level}"), |app| {
+            for id in &all {
+                if let Ok(node) = app.scene.get_mut(*id) {
+                    node.visible = keep.contains(id);
+                }
+            }
+        });
+        let hidden = all.len() - keep.len();
+        self.status = format!(
+            "LOD {level} — {} node(s) visible, {hidden} hidden.",
+            keep.len()
+        );
+    }
+
+    /// The game-model report over a set of nodes: triangles per LOD level.
+    fn lod_report(&self, ids: &[NodeId]) -> LodReport {
+        let mut report = LodReport::default();
+        for id in ids {
+            let Ok(node) = self.scene.get(*id) else { continue };
+            if let NodeKind::Mesh { mesh, .. } = &node.kind {
+                report.add(node.lod, mesh.triangulated_count());
+            }
+        }
+        report
     }
 
     // --- UV editor --------------------------------------------------------------
@@ -6851,6 +7067,130 @@ mod tests {
             "the clip turned the node"
         );
         assert!(!app.undo.can_undo(), "playback is not an edit");
+    }
+
+    #[test]
+    fn lod_tags_isolate_and_undo() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let hi = app.scene.create_mesh("Hi", primitive_box(1.0));
+        let lo = app.scene.create_mesh("Lo", primitive_box(1.0));
+
+        app.set_lod(Some(0));
+        assert_eq!(app.status, "Select a node to tag.");
+
+        app.selection.select_node(hi);
+        app.set_lod(Some(0));
+        assert_eq!(app.status, "LOD 0 — 1 node(s) tagged.");
+        app.selection.clear();
+        app.selection.select_node(lo);
+        app.set_lod(Some(1));
+        assert_eq!(app.scene.get(hi).unwrap().lod, Some(0));
+        assert_eq!(app.scene.get(lo).unwrap().lod, Some(1));
+
+        // Isolating a level is a scene edit: one undo step, like Isolate.
+        app.isolate_lod(1);
+        assert_eq!(app.status, "LOD 1 — 1 node(s) visible, 1 hidden.");
+        assert!(!app.scene.get(hi).unwrap().visible);
+        assert!(app.scene.get(lo).unwrap().visible);
+        app.undo_edit();
+        assert!(app.scene.get(hi).unwrap().visible, "the isolate undid in one step");
+
+        app.isolate_lod(3);
+        assert_eq!(app.status, "Nothing is tagged LOD 3 — set it first.");
+
+        // Clearing the tag is an edit too.
+        app.selection.clear();
+        app.selection.select_node(hi);
+        app.set_lod(None);
+        assert_eq!(app.status, "LOD cleared — 1 node(s).");
+        assert_eq!(app.scene.get(hi).unwrap().lod, None);
+    }
+
+    #[test]
+    fn the_model_report_counts_triangles_per_lod() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let hi = app.scene.create_mesh("Hi", primitive_box(1.0));
+        let mid = app.scene.create_mesh("Mid", primitive_box(1.0));
+        let lo = app.scene.create_mesh("Lo", primitive_box(1.0));
+
+        app.selection.select_node(hi);
+        app.set_lod(Some(0));
+        app.selection.clear();
+        app.selection.select_node(mid);
+        app.set_lod(Some(1));
+
+        let ids = vec![hi, mid, lo];
+        let report = app.lod_report(&ids);
+        assert_eq!(report.nodes, 3);
+        assert_eq!(report.triangles, 36, "three boxes at 12 triangles each");
+        assert_eq!(
+            report.levels,
+            vec![(None, 1, 12), (Some(0), 1, 12), (Some(1), 1, 12)],
+            "untagged first, then levels ascending"
+        );
+        assert_eq!(
+            report.lines(),
+            vec![
+                "Untagged: 1 node(s), 12 tri(s).".to_string(),
+                "LOD 0: 1 node(s), 12 tri(s).".to_string(),
+                "LOD 1: 1 node(s), 12 tri(s).".to_string(),
+                "Total: 3 node(s), 36 tri(s).".to_string(),
+            ]
+        );
+
+        // A dummy holds no triangles and is simply not in the report.
+        let dummy = app.scene.create_dummy("attach");
+        let report = app.lod_report(&[dummy]);
+        assert_eq!(report, LodReport::default());
+        assert!(report.lines().is_empty());
+    }
+
+    #[test]
+    fn a_dummy_lands_at_the_selection_centre() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+
+        // Nothing selected: the dummy lands on the origin and comes up
+        // selected, as one undo step.
+        app.add_dummy();
+        let first = app
+            .selection
+            .selected_nodes()
+            .next()
+            .expect("the dummy is selected");
+        assert!(matches!(app.scene.get(first).unwrap().kind, NodeKind::Dummy));
+        assert_eq!(
+            app.scene.get(first).unwrap().transform.translation,
+            Vec3::ZERO
+        );
+        assert!(
+            app.status.contains("non-rendered attach point"),
+            "{}",
+            app.status
+        );
+        assert!(app.undo.can_undo(), "the dummy is an undo step");
+
+        // With a selection: the centre of the selected nodes' world positions.
+        app.scene = Scene::new();
+        let a = app.scene.create_mesh("A", primitive_box(1.0));
+        let b = app.scene.create_mesh("B", primitive_box(1.0));
+        app.scene.get_mut(b).unwrap().transform.translation = Vec3::new(4.0, 2.0, 0.0);
+        app.selection.clear();
+        app.selection.select_node(a);
+        app.selection.select_node(b);
+        app.add_dummy();
+        let second = app
+            .selection
+            .selected_nodes()
+            .next()
+            .expect("the dummy is selected");
+        let centre = app.scene.get(second).unwrap().transform.translation;
+        assert!(
+            (centre - Vec3::new(2.0, 1.0, 0.0)).length() < 1e-5,
+            "{centre:?}"
+        );
     }
 
     #[test]

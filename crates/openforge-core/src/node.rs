@@ -30,6 +30,10 @@ pub struct Node {
     pub visible: bool,
     /// When frozen, the node is not selectable in the viewport.
     pub frozen: bool,
+    /// The game-model detail level this node belongs to (0 = highest detail),
+    /// tagged by the app's Game menu. `None` is untagged — the usual state of
+    /// an ordinary modelling scene.
+    pub lod: Option<u8>,
 }
 
 impl Node {
@@ -43,6 +47,7 @@ impl Node {
             children: Vec::new(),
             visible: true,
             frozen: false,
+            lod: None,
         }
     }
 
