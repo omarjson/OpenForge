@@ -33,8 +33,11 @@
 //! # }
 //! ```
 //!
-//! Two honest limits of version 1: the skinned rig is not part of the file
-//! yet, and neither are the application's preferences.
+//! Version 1 files still load — they simply carry no rig. What this build
+//! writes is version 2, which adds the skinned rig: the skeleton with its
+//! current pose, the per-vertex weights, the bind positions and the mesh
+//! node the rig drives. The application's preferences are still not part
+//! of the file.
 
 mod base64;
 mod doc;
@@ -44,13 +47,15 @@ pub use base64::{decode as decode_base64, encode as encode_base64};
 use doc::Doc;
 use openforge_animation::ClipLibrary;
 use openforge_core::scene::Scene;
+use openforge_core::{NodeId, Vec3};
 use openforge_materials::MaterialLibrary;
+use openforge_rig::{Skeleton, SkinWeights};
 use std::path::Path;
 
 /// The `format` field every project file starts with.
 pub const FORMAT: &str = "openforge-project";
 /// The format version this build reads and writes.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 /// The file extension the app's dialogs offer (without the dot).
 pub const EXTENSION: &str = "ofproj";
 
@@ -76,7 +81,7 @@ pub enum ProjectError {
     Malformed(String),
 }
 
-/// An in-memory document: exactly the three pieces a project file holds.
+/// An in-memory document: exactly the pieces a project file holds.
 ///
 /// The clones are deliberate — a save must not disturb the app's live scene,
 /// and an open hands the app a document it owns outright.
@@ -85,15 +90,34 @@ pub struct Project {
     pub scene: Scene,
     pub materials: MaterialLibrary,
     pub clips: ClipLibrary,
+    /// The skinned rig, when the document has one (since version 2).
+    pub rig: Option<ProjectRig>,
+}
+
+/// The skinned rig a project carries: the skeleton with both its poses, the
+/// per-vertex weights, the bind (rest) positions and the node the rig drives.
+///
+/// The pieces are `openforge-rig`'s own types — the document stores a
+/// spelled-out form of them, so nothing here depends on how they serialize.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProjectRig {
+    pub skeleton: Skeleton,
+    pub weights: SkinWeights,
+    /// One bind (rest) position per vertex of the driven mesh.
+    pub bind: Vec<Vec3>,
+    /// The mesh node the rig drives, when it still exists in the scene.
+    pub node: Option<NodeId>,
 }
 
 impl Project {
-    /// Capture the three pieces as a document.
+    /// Capture the three pieces as a document (with no rig; set
+    /// [`Project::rig`] to save one).
     pub fn from_parts(scene: &Scene, materials: &MaterialLibrary, clips: &ClipLibrary) -> Self {
         Self {
             scene: scene.clone(),
             materials: materials.clone(),
             clips: clips.clone(),
+            rig: None,
         }
     }
 
@@ -104,6 +128,7 @@ impl Project {
             &self.scene,
             &self.materials,
             &self.clips,
+            self.rig.as_ref(),
         ))?)
     }
 
@@ -134,11 +159,12 @@ impl Project {
         }
         let doc: Doc = serde_json::from_value(value)
             .map_err(|error| ProjectError::Malformed(error.to_string()))?;
-        let (scene, materials, clips) = doc.into_parts()?;
+        let (scene, materials, clips, rig) = doc.into_parts()?;
         Ok(Self {
             scene,
             materials,
             clips,
+            rig,
         })
     }
 
@@ -161,6 +187,10 @@ impl Project {
             materials: self.materials.materials.len(),
             textures: self.materials.textures.len(),
             clips: self.clips.len(),
+            bones: self
+                .rig
+                .as_ref()
+                .map_or(0, |rig| rig.skeleton.bones().len()),
             keys: self
                 .clips
                 .clips()
@@ -179,6 +209,8 @@ pub struct ProjectSummary {
     pub materials: usize,
     pub textures: usize,
     pub clips: usize,
+    /// Bones in the document's rig (`0` when there is none).
+    pub bones: usize,
     pub keys: usize,
 }
 
@@ -201,6 +233,7 @@ mod tests {
     use openforge_core::mesh::{Corner, Face, Mesh};
     use openforge_core::node::NodeKind;
     use openforge_core::{NodeId, Quat, Vec2, Vec3, Vec4};
+    use openforge_rig::{Bone, LocalTransform};
 
     /// A two-triangle quad in the XY plane, with normals, UVs and a material
     /// slot on the face.
@@ -300,7 +333,53 @@ mod tests {
             scene,
             materials,
             clips,
+            rig: None,
         }
+    }
+
+    /// `rich_project` with a rig over the "Plates" node: three bones (the
+    /// second one posed), two influences on one corner vertex, and the quad's
+    /// own positions as the bind list.
+    fn rigged_project() -> Project {
+        let mut project = rich_project();
+        let body = project
+            .scene
+            .iter()
+            .find(|n| n.name == "Plates")
+            .unwrap()
+            .id;
+        let mut skeleton = Skeleton::new();
+        for i in 0..3 {
+            let parent = if i == 0 { None } else { Some(i - 1) };
+            skeleton
+                .add_bone(Bone::with_transform(
+                    format!("bone_{i}"),
+                    parent,
+                    LocalTransform::from_translation(Vec3::new(0.0, 1.0, 0.0)),
+                ))
+                .unwrap();
+        }
+        skeleton
+            .set_pose_rotation(1, Quat::from_rotation_z(0.5))
+            .unwrap();
+        let mut weights = SkinWeights::new(4, 3);
+        weights.set_weights(0, &[(0, 1.0)]).unwrap();
+        weights.set_weights(3, &[(1, 0.25), (2, 0.75)]).unwrap();
+        let bind = project
+            .scene
+            .get(body)
+            .unwrap()
+            .mesh()
+            .unwrap()
+            .positions
+            .clone();
+        project.rig = Some(ProjectRig {
+            skeleton,
+            weights,
+            bind,
+            node: Some(body),
+        });
+        project
     }
 
     fn temp_path(extension: &str) -> std::path::PathBuf {
@@ -367,7 +446,7 @@ mod tests {
     fn the_json_names_its_format_and_version() {
         let text = rich_project().to_json().unwrap();
         assert!(text.contains("\"format\": \"openforge-project\""));
-        assert!(text.contains("\"version\": 1"));
+        assert!(text.contains("\"version\": 2"));
         // Ids are never written; positions are.
         assert!(
             text.contains("\"parent\": 0"),
@@ -397,6 +476,89 @@ mod tests {
     }
 
     #[test]
+    fn a_rig_round_trips_through_its_json() {
+        let project = rigged_project();
+        let loaded = Project::from_json(&project.to_json().unwrap()).unwrap();
+        let rig = loaded.rig.as_ref().expect("the rig came back");
+
+        assert_eq!(rig.skeleton.bones().len(), 3);
+        assert_eq!(rig.skeleton.bones()[1].name, "bone_1");
+        assert_eq!(rig.skeleton.bones()[1].parent, Some(0));
+        // The pose, not just the bind pose: the saved document opens posed.
+        assert_eq!(
+            rig.skeleton.pose_local(1).unwrap().rotation,
+            Quat::from_rotation_z(0.5)
+        );
+        assert_eq!(rig.weights.vertex_count(), 4);
+        assert_eq!(rig.weights.bone_count(), 3);
+        assert_eq!(rig.weights.influences(0).unwrap().len(), 1);
+        assert!(
+            rig.weights.influences(1).unwrap().is_empty(),
+            "an unweighted vertex stays unweighted"
+        );
+        let influences = rig.weights.influences(3).unwrap();
+        assert_eq!(influences.len(), 2);
+        // Heaviest-first, the way live weights are stored.
+        assert_eq!(influences[0].bone, 2);
+        assert_eq!(influences[1].bone, 1);
+        assert_eq!(rig.bind.len(), 4);
+
+        // The driven node is mapped to the rebuilt scene's fresh id.
+        let node = loaded.scene.get(rig.node.expect("a driven node")).unwrap();
+        assert_eq!(node.name, "Plates");
+        assert_eq!(loaded.summary().bones, 3);
+        assert_eq!(loaded.summary(), project.summary());
+    }
+
+    #[test]
+    fn a_version_one_file_loads_without_a_rig() {
+        let project = rigged_project();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&project.to_json().unwrap()).unwrap();
+        value.as_object_mut().unwrap().remove("rig");
+        value["version"] = serde_json::json!(1);
+
+        // Version 1 files are still read: the rig is simply absent.
+        let loaded = Project::from_json(&value.to_string()).unwrap();
+        assert!(loaded.rig.is_none());
+        assert!(loaded.scene.content_eq(&project.scene));
+        assert_eq!(loaded.summary().bones, 0);
+    }
+
+    #[test]
+    fn a_broken_rig_is_refused_not_guessed() {
+        let text = rigged_project().to_json().unwrap();
+
+        // A bone whose parent is listed after it.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["rig"]["bones"][0]["parent"] = serde_json::json!(2);
+        let error = Project::from_json(&value.to_string()).unwrap_err();
+        assert!(matches!(error, ProjectError::Malformed(_)), "{error}");
+        assert!(error.to_string().contains("rig bone 0"), "{error}");
+
+        // An influence on a bone the skeleton does not have.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["rig"]["weights"]["vertices"][3][0]["bone"] = serde_json::json!(9);
+        let error = Project::from_json(&value.to_string()).unwrap_err();
+        assert!(
+            error.to_string().contains("rig weights for vertex 3"),
+            "{error}"
+        );
+
+        // A bind list that does not cover the weight rows.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["rig"]["bind"] = serde_json::json!([[0.0, 0.0, 0.0]]);
+        let error = Project::from_json(&value.to_string()).unwrap_err();
+        assert!(error.to_string().contains("binds 1 vertex"), "{error}");
+
+        // A rig driving a node the file does not define.
+        let mut value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["rig"]["node"] = serde_json::json!(99);
+        let error = Project::from_json(&value.to_string()).unwrap_err();
+        assert!(error.to_string().contains("drives node 99"), "{error}");
+    }
+
+    #[test]
     fn foreign_files_are_refused_by_name() {
         // Not JSON at all (an OBJ opened as a project, say).
         let error = Project::from_json("o Cube\nv 0 0 0\n").unwrap_err();
@@ -416,9 +578,9 @@ mod tests {
     #[test]
     fn a_newer_version_is_refused_with_its_number() {
         let error =
-            Project::from_json("{\"format\": \"openforge-project\", \"version\": 2}").unwrap_err();
+            Project::from_json("{\"format\": \"openforge-project\", \"version\": 3}").unwrap_err();
         match error {
-            ProjectError::NewerVersion { found } => assert_eq!(found, 2),
+            ProjectError::NewerVersion { found } => assert_eq!(found, 3),
             other => panic!("expected NewerVersion, got {other}"),
         }
         assert!(error.to_string().contains("newer OpenForge"));

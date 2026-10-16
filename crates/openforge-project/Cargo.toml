@@ -9,6 +9,7 @@ description = "The OpenForge project file: one versioned JSON document holding t
 openforge-core = { path = "../openforge-core", features = ["serde"] }
 openforge-materials = { path = "../openforge-materials" }
 openforge-animation = { path = "../openforge-animation" }
+openforge-rig = { path = "../openforge-rig" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

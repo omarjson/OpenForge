@@ -20,13 +20,14 @@ use openforge_animation::{Clip, ClipLibrary, Interp, TransformTrack};
 use openforge_core::math::Transform;
 use openforge_core::node::{Node, NodeKind};
 use openforge_core::scene::Scene;
-use openforge_core::NodeId;
+use openforge_core::{NodeId, Vec3};
 use openforge_materials::{Material, MaterialLibrary, Texture};
+use openforge_rig::{Bone, LocalTransform, Skeleton, SkinWeights};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 use crate::base64;
-use crate::{ProjectError, FORMAT, FORMAT_VERSION};
+use crate::{ProjectError, ProjectRig, FORMAT, FORMAT_VERSION};
 
 /// The JSON document, exactly as it sits in the file.
 #[derive(Serialize, Deserialize)]
@@ -37,6 +38,9 @@ pub(crate) struct Doc {
     pub materials: Vec<DocMaterial>,
     pub textures: Vec<DocTexture>,
     pub clips: Vec<DocClip>,
+    /// The skinned rig, since version 2; absent in version-1 files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rig: Option<DocRig>,
 }
 
 /// One scene node: its own fields, its kind (`openforge-core`'s `NodeKind`,
@@ -178,12 +182,70 @@ impl From<DocInterp> for Interp {
     }
 }
 
+/// The skinned rig (since version 2): the skeleton with both its poses, the
+/// per-vertex weights, the bind positions and the mesh node it drives.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct DocRig {
+    /// Position of the driven mesh node in `Doc::nodes`, when it still exists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub node: Option<usize>,
+    pub bones: Vec<DocBone>,
+    pub weights: DocWeights,
+    /// One bind (rest) position per vertex, in vertex order.
+    pub bind: Vec<Vec3>,
+}
+
+/// One bone: its name, its parent as a position in `DocRig::bones` (parents
+/// first — the skeleton's own invariant), its local bind transform and the
+/// local pose the project was saved with.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct DocBone {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent: Option<usize>,
+    pub transform: Transform,
+    pub pose: Transform,
+}
+
+/// The per-vertex weights: the influence cap plus one row per vertex.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct DocWeights {
+    pub max_influences: usize,
+    pub vertices: Vec<Vec<DocInfluence>>,
+}
+
+/// One bone influence on a vertex.
+#[derive(Serialize, Deserialize)]
+pub(crate) struct DocInfluence {
+    pub bone: usize,
+    pub weight: f32,
+}
+
+/// A rig local transform as the document's TRS — the same three components,
+/// spelled the way every other transform in the file is.
+fn trs_of(t: LocalTransform) -> Transform {
+    Transform {
+        translation: t.translation,
+        rotation: t.rotation,
+        scale: t.scale,
+    }
+}
+
+fn local_of(t: Transform) -> LocalTransform {
+    LocalTransform {
+        translation: t.translation,
+        rotation: t.rotation,
+        scale: t.scale,
+    }
+}
+
 impl Doc {
     /// Capture the in-memory document.
     pub(crate) fn from_parts(
         scene: &Scene,
         library: &MaterialLibrary,
         clips: &ClipLibrary,
+        rig: Option<&ProjectRig>,
     ) -> Self {
         // Depth-first, parents before children; entries the scene cannot
         // resolve are left out of *both* this list and the name map, so the
@@ -243,6 +305,49 @@ impl Doc {
             })
             .collect();
 
+        let rig = rig.map(|rig| DocRig {
+            // The driven node may be gone (the rig outlives a delete), and
+            // then the rig saves without saying what it drives.
+            node: rig.node.and_then(|id| index_of.get(&id).copied()),
+            bones: rig
+                .skeleton
+                .bones()
+                .iter()
+                .enumerate()
+                .map(|(index, bone)| DocBone {
+                    name: bone.name.clone(),
+                    parent: bone.parent,
+                    transform: trs_of(bone.transform),
+                    // The animated pose, not just the bind pose: a project
+                    // saved mid-pose opens mid-pose.
+                    pose: rig
+                        .skeleton
+                        .pose_local(index)
+                        .map(|t| trs_of(*t))
+                        .unwrap_or_else(|_| trs_of(bone.transform)),
+                })
+                .collect(),
+            weights: DocWeights {
+                max_influences: rig.weights.max_influences(),
+                vertices: (0..rig.weights.vertex_count())
+                    .map(|vertex| {
+                        rig.weights
+                            .influences(vertex)
+                            .map(|list| {
+                                list.iter()
+                                    .map(|influence| DocInfluence {
+                                        bone: influence.bone,
+                                        weight: influence.weight,
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default()
+                    })
+                    .collect(),
+            },
+            bind: rig.bind.clone(),
+        });
+
         Doc {
             format: FORMAT.to_string(),
             version: FORMAT_VERSION,
@@ -250,11 +355,14 @@ impl Doc {
             materials,
             textures,
             clips,
+            rig,
         }
     }
 
     /// Rebuild the in-memory document, refusing references the file got wrong.
-    pub(crate) fn into_parts(self) -> Result<(Scene, MaterialLibrary, ClipLibrary), ProjectError> {
+    pub(crate) fn into_parts(
+        self,
+    ) -> Result<(Scene, MaterialLibrary, ClipLibrary, Option<ProjectRig>), ProjectError> {
         let mut scene = Scene::new();
         let mut ids: Vec<NodeId> = Vec::with_capacity(self.nodes.len());
         for (index, doc) in self.nodes.iter().enumerate() {
@@ -340,7 +448,85 @@ impl Doc {
             clips.add_clip(clip);
         }
 
-        Ok((scene, materials, clips))
+        let rig = match &self.rig {
+            Some(doc) => {
+                let mut skeleton = Skeleton::new();
+                for (index, bone) in doc.bones.iter().enumerate() {
+                    // `add_bone` enforces the parents-first invariant, so a
+                    // bone listed after its child (or under itself) is caught
+                    // here as a malformed document.
+                    skeleton
+                        .add_bone(Bone::with_transform(
+                            bone.name.clone(),
+                            bone.parent,
+                            local_of(bone.transform),
+                        ))
+                        .map_err(|error| {
+                            ProjectError::Malformed(format!(
+                                "rig bone {index} ({:?}): {error}",
+                                bone.name
+                            ))
+                        })?;
+                }
+                for (index, bone) in doc.bones.iter().enumerate() {
+                    skeleton
+                        .set_pose_local(index, local_of(bone.pose))
+                        .map_err(|error| {
+                            ProjectError::Malformed(format!(
+                                "rig bone {index} ({:?}) pose: {error}",
+                                bone.name
+                            ))
+                        })?;
+                }
+                if doc.bind.len() != doc.weights.vertices.len() {
+                    return Err(ProjectError::Malformed(format!(
+                        "the rig binds {} vertex position(s) to {} vertex weight row(s)",
+                        doc.bind.len(),
+                        doc.weights.vertices.len()
+                    )));
+                }
+                let mut weights = SkinWeights::with_max_influences(
+                    doc.weights.vertices.len(),
+                    doc.bones.len(),
+                    doc.weights.max_influences,
+                );
+                for (vertex, list) in doc.weights.vertices.iter().enumerate() {
+                    if list.is_empty() {
+                        // A vertex with no influences is a legal state — it
+                        // skips skinning — and `set_weights` refuses empty
+                        // input, so the freshly built row stays as it is.
+                        continue;
+                    }
+                    let pairs: Vec<(usize, f32)> = list
+                        .iter()
+                        .map(|influence| (influence.bone, influence.weight))
+                        .collect();
+                    // `set_weights` validates the bone indices and the weight
+                    // values, and renormalizes — the same path live weights
+                    // take, not a bypass.
+                    weights.set_weights(vertex, &pairs).map_err(|error| {
+                        ProjectError::Malformed(format!("rig weights for vertex {vertex}: {error}"))
+                    })?;
+                }
+                let node = match doc.node {
+                    Some(index) => Some(*ids.get(index).ok_or_else(|| {
+                        ProjectError::Malformed(format!(
+                            "the rig drives node {index}, which the file does not define"
+                        ))
+                    })?),
+                    None => None,
+                };
+                Some(ProjectRig {
+                    skeleton,
+                    weights,
+                    bind: doc.bind.clone(),
+                    node,
+                })
+            }
+            None => None,
+        };
+
+        Ok((scene, materials, clips, rig))
     }
 }
 

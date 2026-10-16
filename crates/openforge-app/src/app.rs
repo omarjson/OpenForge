@@ -26,7 +26,7 @@ use openforge_core::NodeId;
 use openforge_ops::MeshOps;
 use openforge_materials::{Material, MaterialLibrary, Texture};
 use openforge_plugin::{builtin_plugins, PluginHost};
-use openforge_project::Project;
+use openforge_project::{Project, ProjectRig};
 use openforge_render::{FaceShading, FrameStats, NodeMaterials, PickElement, TextureLayer};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
@@ -1313,7 +1313,19 @@ impl OpenForgeApp {
 
     /// Save the document to `path` and remember it as the current project.
     fn save_project_to(&mut self, path: PathBuf) {
-        let project = Project::from_parts(&self.scene, &self.materials, self.anim.library());
+        let mut project = Project::from_parts(&self.scene, &self.materials, self.anim.library());
+        // The rig rides along when there is one: the skeleton with its
+        // current pose, the weights, the bind positions, and the node it
+        // drives.
+        project.rig = self.rig_skeleton.as_ref().map(|skeleton| ProjectRig {
+            skeleton: skeleton.clone(),
+            weights: self
+                .rig_weights
+                .clone()
+                .unwrap_or_else(|| SkinWeights::new(0, 0)),
+            bind: self.rig_bind.clone(),
+            node: self.rig_node,
+        });
         match project.save(&path) {
             Ok(()) => {
                 self.status = format!(
@@ -1361,10 +1373,10 @@ impl OpenForgeApp {
     /// Replace the document with the project at `path`.
     ///
     /// Opening is a fresh start, the way New is: the selection and the undo
-    /// history belong to the document being replaced, so they go with it —
-    /// and so does the rig, because version 1 of the format does not carry a
-    /// rig yet and one left pointing at the old node ids would be worse than
-    /// none.
+    /// history belong to the document being replaced, so they go with it. The
+    /// rig comes from the file when it carries one (since version 2) and is
+    /// cleared otherwise — a stale rig pointing at old node ids would be
+    /// worse than none.
     fn open_project_from(&mut self, path: PathBuf) {
         let label = Self::file_label(&path);
         match Project::load(&path) {
@@ -1373,12 +1385,14 @@ impl OpenForgeApp {
                 self.scene = project.scene;
                 self.materials = project.materials;
                 self.anim = Player::with_library(project.clips);
+                self.restore_rig(project.rig.map(|rig| RigSnapshot {
+                    skeleton: rig.skeleton,
+                    weights: rig.weights,
+                    bind: rig.bind,
+                    node: rig.node,
+                }));
                 self.selection.clear();
                 self.undo.clear();
-                self.rig_skeleton = None;
-                self.rig_weights = None;
-                self.rig_bind.clear();
-                self.rig_node = None;
                 self.key_selected = None;
                 self.key_drag = None;
                 self.current_file = Some(path);
@@ -8376,7 +8390,10 @@ mod tests {
         // Opening starts a fresh history, selection and rig state.
         assert!(!app.undo.can_undo());
         assert_eq!(app.selection.node_count(), 0);
-        assert!(app.rig_node.is_none() && app.rig_bind.is_empty(), "the rig is not in a project yet");
+        assert!(
+            app.rig_node.is_none() && app.rig_bind.is_empty(),
+            "no skeleton meant no rig in the file, so opening starts clean"
+        );
         assert_eq!(app.key_selected, None);
         let _ = std::fs::remove_file(&path);
     }
@@ -8407,6 +8424,76 @@ mod tests {
         app.open_project_from(path.clone());
         assert!(app.status.contains("not an OpenForge project file"), "status: {}", app.status);
         assert_eq!(app.scene.node_count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn projects_carry_the_rig() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.new_scene();
+        app.create_primitive("Box");
+        app.rig_create();
+        let bones = app
+            .rig_skeleton
+            .as_ref()
+            .expect("the rig row built a chain")
+            .bones()
+            .len();
+        assert!(bones >= 2, "the default chain has bones to pose");
+
+        // Pose a bone and re-skin: the save must carry the posed skeleton
+        // *and* the deformed mesh.
+        app.rig_bone = 1;
+        app.rig_angle = 0.5;
+        app.rig_apply_pose();
+        let posed = app
+            .rig_skeleton
+            .as_ref()
+            .unwrap()
+            .pose_local(1)
+            .unwrap()
+            .rotation;
+        let mesh_positions = app
+            .scene
+            .iter()
+            .find(|n| n.is_mesh())
+            .and_then(|n| n.mesh())
+            .unwrap()
+            .positions
+            .clone();
+        let influences = app.rig_weights.as_ref().unwrap().influences(0).unwrap().to_vec();
+        let bind = app.rig_bind.clone();
+        assert!(!bind.is_empty());
+
+        let path = temp_path("ofproj");
+        app.save_project_to(path.clone());
+        assert!(app.status.starts_with("Saved project to"), "status: {}", app.status);
+        let saved = Project::load(&path).expect("the file loads");
+        assert_eq!(saved.summary().bones, bones);
+
+        // Wreck everything, then open the file back.
+        app.new_scene();
+        app.rig_skeleton = None;
+        app.rig_weights = None;
+        app.rig_bind.clear();
+        app.rig_node = None;
+        app.open_project_from(path.clone());
+        assert!(app.status.starts_with("Opened project"), "status: {}", app.status);
+        let restored = app.rig_skeleton.as_ref().expect("the rig came back");
+        assert_eq!(restored.bones().len(), bones);
+        assert_eq!(restored.pose_local(1).unwrap().rotation, posed);
+        assert_eq!(
+            app.rig_weights.as_ref().unwrap().influences(0).unwrap(),
+            influences.as_slice()
+        );
+        assert_eq!(app.rig_bind, bind);
+        let node = app.rig_node.expect("the rig still drives a node");
+        let mesh = app.scene.get(node).unwrap().mesh().unwrap();
+        assert_eq!(app.scene.get(node).unwrap().name, "Box 1");
+        assert_eq!(
+            mesh.positions, mesh_positions,
+            "the posed (skinned) mesh is what the file carried"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
