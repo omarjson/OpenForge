@@ -165,6 +165,14 @@ A sample GitHub Actions matrix is shown below.
   cluster-decimated copies (`{name}_LOD1..3`, one undo step) land tagged and
   hidden until **Isolate LOD n** previews them; a level that removed no face
   is skipped rather than duplicated.
+- **Rig (the toolbar's Rig row)**: **Create Rig** builds a bone chain along Y
+  and auto-weights the active mesh; the **Bone** combo picks one by name and
+  the **Angle** slider poses it live (**Reset**/**Clear** step back to rest).
+  With a rig up, the **Weights** row edits the skin over the vertex
+  selection: **Assign** binds to the active bone at full weight, **Blend**
+  moves a share of every vertex's influence onto it, and **Smooth** averages
+  over the mesh's edges — each one undo step, and Edit ▸ Undo puts the
+  weights back.
 - **The Plugins panel** lists each built-in plugin with a checkbox and what it
   brings (its formats, services and tools); unchecking one rebuilds the host
   without it, so its formats stop being importable/exportable and its tools
