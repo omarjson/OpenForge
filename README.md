@@ -124,6 +124,16 @@ A sample GitHub Actions matrix is shown below.
   the same thing — and the viewport refuses to read one level's indices as
   another's, so a selected edge never tints a face that happens to share its
   number.
+- **Selection tools** (the **Select** menu, the "Select:" toolbar row, or
+  hotkeys): **Ctrl+A** takes everything at the current level — every visible
+  node at the object level, every vertex/edge/face of the meshes being edited
+  at a sub-object level — **Ctrl+Shift+A** clears it, **Ctrl+I** inverts it,
+  and **Ctrl+Plus** / **Ctrl+Minus** grow or shrink it along the topology
+  (faces through shared edges, edges through shared vertices, vertices through
+  edges), the result counted in the status bar. **H** hides the selected
+  nodes, **Shift+H** isolates them (everything else hidden) and **U** shows
+  everything again; all three are undo steps, and hidden nodes drop out of the
+  viewport and the picks at once.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,
   camera, depth test and back-face culling as the frame, so only what the image
@@ -204,12 +214,14 @@ mostly application surface. Natural next steps:
   scale (translation already has fields). Snapping is in for the grid and for
   vertices; snapping to edges, faces and midpoints, and snapping during the
   free-form view-plane drag, are still to come.
-- A deeper GPU viewport: the selection **tools** around the levels
-  (isolate/hide, a select-through toggle, grow/shrink) on top of the ID pass
-  that now resolves faces, edges and vertices — and rectangles of them —
-  exactly as drawn, with a picked edge already highlighted in the frame, then
-  the materials node graph — normal/specular maps and mipmapped sampling on top
-  of the diffuse map that samples today.
+- A deeper GPU viewport: a **select-through** toggle (picking what the frame
+  hides) and **edge ring / loop** selection — the ops crate walks face loops
+  and rings today, the edge-level walk is still to come — on top of the ID
+  pass that now resolves faces, edges and vertices — and rectangles of them —
+  exactly as drawn, with a picked edge already highlighted in the frame and
+  the selection tools (all / none / invert, grow / shrink, hide / isolate) in
+  place, then the materials node graph — normal/specular maps and mipmapped
+  sampling on top of the diffuse map that samples today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.

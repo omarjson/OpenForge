@@ -49,9 +49,9 @@ Animation (tracks, clips, playback)|55|Engine
 Rigging & skinning|60|Engine
 UV math (project, unwrap, pack, edits)|85|Engine
 GPU viewport (depth, shading, grid, gizmo)|88|UI
-Viewport editing UX (gizmos, wireframe, outlines, picking)|91|UI
+Viewport editing UX (gizmos, wireframe, outlines, picking)|93|UI
 UV editor UI|58|UI
-Panels & dialogs (outliner, properties, toolbars)|51|UI
+Panels & dialogs (outliner, properties, toolbars)|52|UI
 Import/export UX|40|UI
 Plugin / service host|35|UI
 Game tooling (LOD, dummies/TXD, vehicles)|5|UI

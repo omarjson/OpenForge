@@ -42,11 +42,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (540 `#[test]` fns; 542 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (554 `#[test]` fns; 556 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 39 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, and `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index). |
+| `openforge-core` | 46 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink) on that same edge list. |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 158 (bin) | eframe/egui GUI. `app.rs` (~4800 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). |
+| `openforge-app` | 165 (bin) | eframe/egui GUI. `app.rs` (~5000 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect`; hide/isolate/unhide are undoable scene edits. |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -189,6 +189,22 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   Both viewports draw it the way they draw the vertex dots — projected through
   the shared camera, on top, unoccluded — while the GPU overlay itself stays
   depth-tested inside the frame (see §8).
+- **The Select tools are pure maths on one mesh** (`openforge_core::subselect`).
+  All / Invert / Grow / Shrink take a level plus an element set and return a
+  new set; the app owns which nodes they run on (the selected mesh nodes, like
+  the modeling ops) and the status line. Adjacency is the app's own topology
+  rule: faces are neighbours through a shared mesh *edge* (never a bare
+  corner), edges through a shared position, vertices through an edge, all of
+  it from `Mesh::edges()` — so an element the visible pass skips is neither
+  selectable nor anybody's neighbour. Shrink is grow's exact mirror
+  (`shrink(grow(set))` is the set it started from, which is a test), and "All"
+  is exactly the list a picker can answer with (`all_elements`). At the object
+  level All / None / Invert work on the *nodes* — every visible one — while
+  grow and shrink report that they belong to the sub-object levels. Hide /
+  Isolate / Unhide are scene edits, one undo step each through `with_edit`:
+  hiding drops the node from the selection too (the gizmo must not sit on
+  something the frame no longer draws), isolate keeps it, and both show up in
+  every path immediately because the collectors already skip hidden nodes.
 - **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
   the canvas math and panel state, `app.rs` owns the wiring).
   `uv_editor::island_selection` grows a UV selection to whole islands through
@@ -793,9 +809,40 @@ progress report:
   every face on the node tint, while the same index at the face level carries
   the face tint).
 
+- **Selection tools** (work-stream #16). The tools *around* the levels, all of
+  them on the one edge list #14 established:
+  - **`openforge_core::subselect`** — pure maps from one element set to
+    another at a level: `all_elements`, `invert_selection`, `grow_selection`,
+    `shrink_selection`, over `Mesh::edges()`. Faces are neighbours through a
+    shared edge, edges through a shared position, vertices through an edge; an
+    undrawable face is no element and joins nothing (the `face_is_valid` rule
+    `edges()` now shares).
+  - **The app drives them per mesh node**: a **Select** menu, a "Select:"
+    toolbar row and hotkeys — Ctrl+A, Ctrl+Shift+A, Ctrl+I, Ctrl+Plus (or
+    Ctrl+Equals), Ctrl+Minus — each action leaving a status that counts the
+    result. At the object level All / None / Invert work on the visible nodes;
+    grow and shrink say where they work instead of doing nothing quietly.
+  - **Hide / Isolate / Unhide** (**H**, **Shift+H**, **U**, and the View
+    menu): one undo step each through the same `with_edit` every scene edit
+    takes. Hiding drops the node from the selection, isolate keeps it, and the
+    frame follows at once because the collectors already skip hidden nodes.
+
+- **13 new tests**: 6 in `openforge-core::subselect` (the per-level element
+  counts; an undrawable face is no selectable face, no side and no neighbour;
+  invert flips only the level's own list; face grow takes the edge neighbours
+  and not the corner one; shrink cuts exactly the boundary grow would have
+  reached, so growing then shrinking gives back the seed; the vertex and edge
+  walks, with the diagonal staying out two steps in), 1 in `selection.rs`
+  (`set_elements` replaces, never adds) and 7 in `app.rs`: Select All / None on
+  every level with their statuses; the "no mesh" and "wrong level" messages;
+  invert round-tripping; grow and shrink through the app on a 2×2 grid; the
+  hotkeys driven as real key events; and hide (the visible flag, the dropped
+  selection, undo, and the frame's stroke count following it) plus
+  isolate/unhide with their undo steps.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **542 pass, 0 failures**
+build too); `cargo test --workspace` → **556 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -825,7 +872,11 @@ it), the ray-vs-segment and segment-rectangle rules in `viewport.rs`, and both
 gestures end to end in `app.rs` — plus what the edge level *draws*: the frames
 are asserted on the shapes painted (four outline strokes through an off
 overlay, two bold highlight segments matched against the projected edge
-endpoints), and `overlay_mode`'s table is tested directly.
+endpoints), and `overlay_mode`'s table is tested directly. The selection tools
+are covered at both ends: the set maths headless in `subselect` (including
+that grow and shrink are inverses and that a corner is not a neighbour) and
+the app actions with their statuses, hotkeys and undo steps — hide is even
+followed into the painted frame, whose stroke count drops and returns.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -847,7 +898,11 @@ prove through a readback — should match what the image shows), and the
 box at the Edge level: the pass answers from one-pixel lines, the frame should
 outline the edited mesh through an off overlay and draw a bold line over every
 picked edge, and the highlight is projected rather than depth-tested — so a
-picked edge behind a face glows through, exactly like the vertex dots) — the
+picked edge behind a face glows through, exactly like the vertex dots), the
+**Select menu / toolbar row / hotkeys and hide-isolate by eye** (Ctrl+A should
+fill the level, Ctrl+Plus/Ctrl+Minus should step along the topology with the
+status counting, H/Shift+H/U should hide, isolate and reveal with undo
+stepping back) — the
 agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
@@ -859,24 +914,27 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **63.4%**, shown as 63%). The engine
+16 curated areas is **63.6%**, shown as 63%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
 gizmo snapping as of #10, textures sampling on both paths as of #11,
 sub-object picking that matches the drawn frame (plus UV islands) as of #12,
 rectangle selection through that same pass as of #13, edge-level picking by
-click and rectangle as of #14 and the visible sub-object selection as of #15.
+click and rectangle as of #14, the visible sub-object selection as of #15 and
+the selection tools (all / none / invert, grow / shrink, hide / isolate /
+unhide) as of #16.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
    material shading (#9), texture sampling (#11), occlusion-exact sub-object
-   picking (#12), rectangle selection (#13), edge-level picking (#14) and the
-   visible sub-object selection (#15: the edge-level outline fallback and the
-   bold picked-edge highlight) are in. What remains of the editor surface: the
-   selection *tools* around the levels (isolate/hide, a select-through toggle,
-   grow/shrink). Beyond that: shadowing / ambient occlusion and a configurable
-   shading mode.
+   picking (#12), rectangle selection (#13), edge-level picking (#14), the
+   visible sub-object selection (#15) and the selection tools (#16: all / none
+   / invert, grow / shrink, hide / isolate / unhide) are in. What remains of
+   the editor surface: a **select-through toggle** (pick what the frame hides)
+   and **edge ring / loop selection** — the ops crate walks *face* loops and
+   rings today, an edge-level walk on `Mesh::edges()` is still to come. Beyond
+   that: shadowing / ambient occlusion and a configurable shading mode.
 2. **Extend the gizmo further** (`gizmo.rs`, all additive): plane and centre
    handles, and numeric entry for rotation/scale (translation already has
    DragValues in Properties). Snapping landed in #10 but is deliberately partial:
@@ -973,6 +1031,27 @@ deltas and are many work-streams, not one push.
   `Selection::selected_faces` for faces (it answers only at the face level);
   the indices themselves stay where they were put, so `element_count` and the
   status bar count them at any level.
+- **Element sets replace, they do not merge** (`Selection::set_elements`).
+  `select_elements` extends — it is what a pick does when Shift adds — while
+  invert, grow, shrink and select-all compute a whole new set, and using the
+  extending call there would leave the old indices behind (a grown set would
+  look right only by accident, and a shrink could never remove anything).
+  `clear_elements` keeps the nodes being edited; `Selection::clear` drops both,
+  which is the object level's "None".
+- **Selection state is not scene state — except visibility, which is.**
+  The Select tools touch only `Selection`, so they never push an undo entry
+  (and undoing an edit must not resurrect an old selection). Hide / Isolate /
+  Unhide *are* scene edits: `Scene::content_eq` compares whole `Node`s with
+  `visible` in them, which is what lets `with_edit` record them — hiding an
+  already-hidden node pushes nothing. Hiding also deselects the node, so undo
+  does not bring the selection back with it; the test that compares painted
+  frames around a hide re-selects first, because a selected node drags its
+  gizmo into the picture and changes the stroke count.
+- **egui's `consume_key` matches modifiers exactly.** `Ctrl+A` and
+  `Ctrl+Shift+A` (as `H` and `Shift+H`) are separate patterns, so no ordering
+  is needed and a pattern that omits `SHIFT` will not fire while Shift is
+  held; `Modifiers::NONE` means *no* modifier, which is how the plain-key
+  hotkeys (H, U) are read.
 - **In `app.rs` tests the viewport rect is the whole `SCREEN` (1000×700).**
   `CentralPanel` gets no margin in that path, so
   `viewport::project(app.camera.view_proj(SCREEN[0] / SCREEN[1]), world, SCREEN)`
