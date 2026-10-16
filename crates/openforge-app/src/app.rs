@@ -4,7 +4,7 @@
 use crate::file_options::{self, FileOptions, UpAxis};
 use crate::gizmo;
 use crate::gpu_viewport::{self, GpuViewport};
-use crate::settings::{Settings, Theme, SHORTCUTS};
+use crate::settings::{self, Settings, Theme, SHORTCUTS};
 use crate::snap::{self, SnapMode};
 use crate::uv_editor::{self, UvEditor};
 use crate::viewport::{self, Camera};
@@ -374,6 +374,11 @@ pub struct OpenForgeApp {
     /// Preferences: the theme, the ground grid and the camera speed
     /// multipliers, as the Preferences window edits them.
     settings: Settings,
+    /// Where the preferences are filed away between runs, following the
+    /// platform's config-directory convention. `None` when the environment
+    /// names no such directory — and in the test constructor, so tests
+    /// never read or write the real user's file.
+    settings_path: Option<PathBuf>,
     /// The theme the egui context currently carries, so a changed one is
     /// applied once rather than re-styling every frame.
     applied_theme: Option<Theme>,
@@ -388,8 +393,14 @@ impl OpenForgeApp {
         // eframe hands us a live wgpu device when it runs the wgpu backend;
         // otherwise `gpu` stays `None` and the CPU painter takes over.
         let mut app = Self::with_gpu(cc.wgpu_render_state.as_ref().map(GpuViewport::new));
-        // The default theme is part of the settings now; put it on the real
-        // context (tests apply it to a bare one).
+        // Preferences are the one piece of state that outlives the process:
+        // point them at the platform's config directory and read them back
+        // before the first frame paints. (The test constructor leaves the
+        // path out, so tests never touch the real user's file.)
+        app.settings_path = settings::default_settings_path();
+        app.load_settings();
+        // The default theme — or the loaded one — is part of the settings
+        // now; put it on the real context (tests apply it to a bare one).
         app.apply_settings(&cc.egui_ctx);
         app
     }
@@ -456,6 +467,7 @@ impl OpenForgeApp {
             rename_before: None,
             tool_drag: None,
             settings: Settings::default(),
+            settings_path: None,
             applied_theme: None,
             preferences_open: false,
             shortcuts_open: false,
@@ -3829,12 +3841,54 @@ impl OpenForgeApp {
         self.preferences_open = true;
     }
 
+    /// Read the preferences file back in. `true` when it was there and
+    /// parsed; a missing or unparsable file leaves the defaults.
+    fn load_settings(&mut self) -> bool {
+        let Some(path) = self.settings_path.clone() else {
+            return false;
+        };
+        let Some(settings) = Settings::load(&path) else {
+            return false;
+        };
+        self.settings = settings;
+        self.status = format!("Loaded preferences from {}.", path.display());
+        true
+    }
+
+    /// Write the preferences file. `false` — with the reason in the status —
+    /// when the environment names no config directory or the write fails.
+    fn save_settings(&mut self) -> bool {
+        let Some(path) = self.settings_path.clone() else {
+            self.status = "Preferences are kept for this session only: there is no config directory to write them to."
+                .into();
+            return false;
+        };
+        match self.settings.save(&path) {
+            Ok(()) => {
+                self.status = format!("Preferences saved to {}.", path.display());
+                true
+            }
+            Err(error) => {
+                self.status = format!("Could not save preferences to {}: {error}", path.display());
+                false
+            }
+        }
+    }
+
+    /// Close the Preferences window (the Close button, the X, or a test)
+    /// and file the choices away.
+    fn close_preferences(&mut self) {
+        self.preferences_open = false;
+        self.save_settings();
+    }
+
     /// The Preferences window: theme, ground grid, camera speeds, reset.
     fn handle_preferences(&mut self, ctx: &egui::Context) {
         if !self.preferences_open {
             return;
         }
-        let mut open = self.preferences_open;
+        let mut open = true;
+        let mut close = false;
         egui::Window::new("Preferences")
             .open(&mut open)
             .resizable(false)
@@ -3890,11 +3944,15 @@ impl OpenForgeApp {
                         self.dirty = true;
                     }
                     if ui.button("Close").clicked() {
-                        self.preferences_open = false;
+                        close = true;
                     }
                 });
             });
-        self.preferences_open = self.preferences_open && open;
+        if !open || close {
+            // The X and the button both file the choices away; before this,
+            // the running session was the only place they lived.
+            self.close_preferences();
+        }
     }
 
     /// Every shortcut the Keyboard Shortcuts window lists: the fixed table,
@@ -9682,5 +9740,65 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("MIT OR Apache-2.0")));
         assert!(lines.iter().any(|line| line.contains("no proprietary")));
+    }
+
+    #[test]
+    fn the_preferences_reach_the_settings_file_and_come_back() {
+        let path = temp_path("prefs.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.settings_path = Some(path.clone());
+        app.settings.theme = Theme::Light;
+        app.settings.grid_step = 2.5;
+        app.settings.show_grid = false;
+        app.settings.orbit_speed = 1.75;
+        assert!(app.save_settings(), "the file is written");
+        assert!(path.exists());
+        assert!(app.status.contains("Preferences saved"), "{}", app.status);
+
+        let mut reopened = OpenForgeApp::with_gpu(None);
+        reopened.settings_path = Some(path.clone());
+        assert!(reopened.load_settings(), "the file is read back");
+        assert_eq!(reopened.settings, app.settings, "the choices survive the trip");
+        assert!(reopened.status.contains("Loaded preferences"), "{}", reopened.status);
+
+        std::fs::write(&path, "not a settings file").unwrap();
+        let mut confused = OpenForgeApp::with_gpu(None);
+        confused.settings_path = Some(path.clone());
+        assert!(!confused.load_settings(), "a corrupt file is refused, not guessed");
+        assert_eq!(confused.settings, Settings::default(), "the defaults survive the refusal");
+        let _ = std::fs::remove_file(&path);
+
+        // No path: the choices stay in the session, and nothing panics.
+        let mut homeless = OpenForgeApp::with_gpu(None);
+        homeless.settings.theme = Theme::Light;
+        assert!(!homeless.save_settings());
+        assert!(homeless.status.contains("session only"), "{}", homeless.status);
+        assert!(!homeless.load_settings());
+    }
+
+    #[test]
+    fn closing_the_preferences_window_files_the_choices_away() {
+        let path = temp_path("prefs-close.json");
+        let _ = std::fs::remove_file(&path);
+        let ctx = egui::Context::default();
+
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.settings_path = Some(path.clone());
+        app.open_preferences();
+        app.settings.theme = Theme::Light;
+        app.settings.grid_step = 2.5;
+        let _ = ctx.run(frame(0.0, egui::pos2(500.0, 350.0), None), |ctx| app.handle_preferences(ctx));
+        assert!(app.preferences_open, "the window is still up");
+        assert!(!path.exists(), "an open window writes nothing yet");
+
+        app.close_preferences(); // what the Close button and the X both call
+        assert!(!app.preferences_open);
+        assert!(path.exists(), "closing the window is what files the choices away");
+        let filed = Settings::load(&path).expect("the file parses back");
+        assert_eq!(filed.theme, Theme::Light);
+        assert_eq!(filed.grid_step, 2.5);
+        let _ = std::fs::remove_file(&path);
     }
 }

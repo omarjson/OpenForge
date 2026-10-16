@@ -26,6 +26,10 @@ openforge-render = { path = "../openforge-render", features = ["gpu"] }
 glam.workspace = true
 log.workspace = true
 env_logger.workspace = true
+# The preferences file: the one piece of app state that outlives the
+# process, kept as a small JSON document the user can read and hand-edit.
+serde.workspace = true
+serde_json.workspace = true
 
 # GUI + rendering. eframe bundles winit (windowing), wgpu (GPU) and egui
 # (immediate-mode UI) with versions known to work together, giving us
