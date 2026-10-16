@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (561 `#[test]` fns; 563 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (564 `#[test]` fns; 566 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 168 (bin) | eframe/egui GUI. `app.rs` (~5100 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, and **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection. |
+| `openforge-app` | 171 (bin) | eframe/egui GUI. `app.rs` (~5300 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, and import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status. |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -405,7 +405,13 @@ progress report:
   clash), registration is atomic (a plugin registers into a staged host and is
   merged only if it succeeds, so a rejected plugin leaves nothing behind), and
   the app's Properties panel gained a **Plugins** section listing the loaded
-  plugins and the services, tools and formats they contributed.
+  plugins and the services, tools and formats they contributed. Import/export
+  goes through it end to end (work-stream #19): the open dialog carries one
+  filter group per format, **Export selected as** names them, files dropped on
+  the window import through `import_files`, and `for_path` / `extensions`
+  answer the refusals and the format labels every status rides on — a path no
+  filter knows is turned down before anything is read or written, naming every
+  extension that would have worked.
 - **18 tests** in `openforge-plugin`: extension dispatch and its
   case/dot handling, the unique-name rules for all four kinds, the atomic
   rollback of a plugin that clashes on its *second* registration,
@@ -899,9 +905,35 @@ progress report:
   (the projection's own answer, pinned because it is what the mode falls back
   to); the other takes the outliner's box through hide, undo and show.
 
+- **An import/export surface that says what it will do** (work-stream #19).
+  The file plumbing existed; the *feedback* did not:
+  - **Formats come from the registry** in the UI as well as in the plumbing:
+    the open dialog carries one filter group per registered format, **Export
+    selected as ▸** lists them by label (Wavefront OBJ, glTF 2.0, Stanford PLY,
+    STL) and saves with a matching default file name, so a plugin's format
+    appears in the menus with no app change.
+  - **Refusals name what would have worked**: a path no filter knows is turned
+    down before anything is read or written — "Skipped a.foo — no filter knows
+    it (glb, gltf, obj, ply, stl)." / "Can't export to a.foo — …" — and every
+    status names the file and the format ("Imported 2 mesh(es) from scene.obj
+    (Wavefront OBJ).", "Exported Cube to cube.obj (Wavefront OBJ).").
+  - **Export refuses ambiguity**: more than one selected mesh node is "Select
+    one mesh to export — 2 mesh nodes selected." and writes nothing, instead
+    of quietly writing the first one; an empty selection and a selected
+    non-mesh keep their own messages.
+  - **Files dropped on the window import** through the same registry, at the
+    end of the frame so the status survives the viewport hint: one file reports
+    like a menu import (own file, own undo step), a pile ends on "Dropped 3
+    file(s) — imported 2 mesh node(s)."
+
+- **3 new tests**: the format-naming import with its refusal list (and its undo
+  step), the export refusals (empty, ambiguous, unknown extension) around a
+  real write whose status names the format, and a drop driven through a frame —
+  one file, then a mixed pile, with the summary counted.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **563 pass, 0 failures**
+build too); `cargo test --workspace` → **566 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -941,7 +973,10 @@ column, the cube's closed four-edge rings, the non-quad stop) and driven in
 the app through the same keys. Select Through is pinned at the gate itself
 (its truth table and the P key) and by a click landing on a vertex hidden
 behind the face in front of it, and the outliner's box by its single undo
-step.
+step. Import and export are pinned headless too — a real file written and
+read back through the registry, the refusals with their extension lists, and
+a drop driven through a frame — so only the native dialogs themselves are
+left to the eye.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -973,7 +1008,9 @@ quad grid, L should take its column and Shift+L its band of parallels), the
 drag a box over hidden edges: the occluded element should answer, and turning
 it off should bring the image's own answer back) and the **outliner's Visible
 box** by eye (it should hide and show one node with its status and one undo
-step) — the agent has no
+step) and the **File menu's dialogs** by eye (the import dialog's filter
+groups per format, the export submenu's default file names, and a drop of a
+real file onto the window) — the agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -984,7 +1021,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **63.8%**, shown as 63%). The engine
+16 curated areas is **64.3%**, shown as 64%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -993,8 +1030,10 @@ sub-object picking that matches the drawn frame (plus UV islands) as of #12,
 rectangle selection through that same pass as of #13, edge-level picking by
 click and rectangle as of #14, the visible sub-object selection as of #15,
 the selection tools (all / none / invert, grow / shrink, hide / isolate /
-unhide) as of #16, the edge loop / ring walks as of #17 and the
-select-through switch with the outliner's undoable visibility box as of #18.
+unhide) as of #16, the edge loop / ring walks as of #17, the
+select-through switch with the outliner's undoable visibility box as of #18
+and the format-named import/export surface (dialogs, drops, refusals) as of
+#19.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face

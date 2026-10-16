@@ -52,7 +52,7 @@ GPU viewport (depth, shading, grid, gizmo)|88|UI
 Viewport editing UX (gizmos, wireframe, outlines, picking)|96|UI
 UV editor UI|58|UI
 Panels & dialogs (outliner, properties, toolbars)|53|UI
-Import/export UX|40|UI
+Import/export UX|48|UI
 Plugin / service host|35|UI
 Game tooling (LOD, dummies/TXD, vehicles)|5|UI
 DATA

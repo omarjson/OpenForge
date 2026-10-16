@@ -194,10 +194,16 @@ A sample GitHub Actions matrix is shown below.
   **Materials** panel lists the library: pick an entry to edit its colour,
   shininess, opacity and texture, **Assign** it to the selection, or **New** to
   duplicate it. Assigned meshes are shaded with that material in both viewports.
-  The outliner's checkbox hides a node from the viewport.
+  The outliner's **Visible** box hides or shows one node — one undo step, the
+  same edit H makes.
 - **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY and STL. Both go
   through the plugin host's filter registry, so a third-party filter for another
-  extension needs no change to the app.
+  extension needs no change to the app: the open dialog is grouped by format,
+  **Export selected as ▸** picks the format by name, and dropping files on the
+  window imports them the same way. A path no filter knows is turned down with
+  the list of extensions that would have worked, exporting is refused when the
+  selection holds more than one mesh node rather than quietly writing one, and
+  the statuses name the file and the format.
 - The **Plugins** section of the Properties panel lists the loaded plugins and
   the services, tools and formats they contributed.
 - **Create** menu adds primitives (box, sphere, cylinder, cone, plane).
