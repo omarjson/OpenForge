@@ -42,13 +42,13 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (583 `#[test]` fns; 585 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (586 `#[test]` fns; 588 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
 | `openforge-core` | 50 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
-| `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
+| `openforge-ops` | 19 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**, and **grid-cluster decimation** (`decimate_clustered`) for LOD chains. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
 | `openforge-render` | 102 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking — faces as triangles, edges as lines, vertices as points, through a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 187 (bin) | eframe/egui GUI. `app.rs` (~6400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
+| `openforge-app` | 188 (bin) | eframe/egui GUI. `app.rs` (~6400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -306,6 +306,13 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   flattening a mesh. Dropped files skip the dialog by design — a drop cannot
   wait for one — so they take the defaults; the status names the options only
   when they were not the defaults.
+- **Decimation is a grid, and a level that removes nothing is not made.** The
+  LOD generator (`MeshOps::decimate_clustered`) welds every vertex that falls
+  in the same cell of a `resolution³` grid over the mesh's bounds, so the
+  output is deterministic and always inside the old silhouette; the copies are
+  hidden on arrival (a pile of overlapping shells helps nobody) and one level
+  that came back with no face removed is skipped, not added as a duplicate —
+  when every level is skipped the command says so and touches nothing.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -1125,9 +1132,33 @@ progress report:
   on (2, 6, -4), and an export at Z-up 0.5× writing the original (1, 2, 3)
   back to disk.
 
+- **Generate LODs: cluster-decimated copies** (work-stream #25). The LOD tags
+  from #21 could mark levels but nothing could make one; now Game ▸ Generate
+  LODs does:
+  - **`MeshOps::decimate_clustered`** (openforge-ops) is grid-cluster
+    decimation: the bounding box splits into `resolution` cells per axis,
+    every vertex in a cell welds into a cluster at the cell's average, faces
+    that collapse to fewer than three distinct corners drop, each surviving
+    corner takes the first finite UV its cluster's corners carried, and
+    normals stay empty for the renderer's flat fallback. Guards: resolution 0,
+    an empty mesh or an all-degenerate one give `None`; a non-finite vertex
+    clusters as the origin; a zero-extent axis is one cell deep.
+  - **Game ▸ Generate LODs** runs it at 6/4/3 cells per axis for levels 1–3,
+    names the copies `{name}_LOD{n}`, keeps the source's transform, tags them
+    `lod: Some(n)` and hides them until Game ▸ Isolate LOD n — one undo step.
+    A level that removed no face is skipped, and a mesh with nothing to thin
+    (a box: eight corners, one per cell) is refused with "Nothing to decimate
+    — … is already at grid resolution." and no undo entry.
+
+- **3 new tests**: the grid collapse (fewer vertices and faces, every corner
+  resolving, no sliver faces), the guards (empty mesh, resolution 0, the cube
+  that does not collapse, the fully degenerate quad), and the app round —
+  three hidden tagged copies under the source's face counts, one undo step
+  back, and the box's refusal leaving the stack alone.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **585 pass, 0 failures**
+build too); `cargo test --workspace` → **588 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -1184,6 +1215,8 @@ copied indices, the mirror's bounds reflection and the snap's rounded totals,
 plus the panel round with its one-step undo. The file options are pinned at the
 boundary: both turns, the exact inverse over a round trip, the bad-scale
 fallback, and the app-level import/export round written back to disk.
+Decimation joins them: the grid collapse, the guards, and the app's LOD round
+with its one-step undo.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1223,7 +1256,9 @@ Selected: the panel should appear with the clip's five key times under the
 slider, Play and Space should turn the node smoothly, and Stop should snap it
 back to the start), and the **Game menu** by eye (Set LOD / Isolate LOD / Add
 Dummy: outliner rows should carry their `LOD n` tag, Isolate LOD 1 should
-leave only the level-1 nodes standing, and `U` should bring the rest back),
+leave only the level-1 nodes standing, and `U` should bring the rest back;
+Generate LODs should add three hidden `_LOD1..3` rows whose Isolate previews
+show the thinning),
 and the **Plugins panel** by eye (uncheck `openforge.interchange`: the row
 should stay with its formats still listed, the report below should shrink to
 the core-tools counts, and importing a `.obj` should refuse with the
@@ -1240,7 +1275,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **68.8%**, shown as 68%). The engine
+16 curated areas is **70.0%**, shown as 70%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1257,7 +1292,8 @@ the game-prep surface (LOD tags and isolate, dummies, the triangle budget) as
 of #21 and the plugin host controls (per-built-in enable/disable with measured
 attribution) as of #22 and the island-scale UV tools (weld, split, mirror,
 grid snap) as of #23 and the import/export options dialog (up-axis and scale at
-the file boundary) as of #24.
+the file boundary) as of #24 and the LOD generator (cluster decimation into
+hidden LOD 1–3 copies) as of #25.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1297,8 +1333,9 @@ Prioritized next steps:
    per face — landed in #9.
 
 **Honest gap to parity:** format-specific game tooling (vehicles, TXD
-dictionaries, per-game export paths — the generic half, LOD tags, dummies and
-their triangle budget, landed in #21), the full panel/dialog surface, animation
+dictionaries, per-game export paths — the generic half, LOD tags, dummies,
+their triangle budget and the LOD generator, landed in #21/#25), the full
+panel/dialog surface, animation
 *editing* (the timeline plays clips; keys are not yet drawn, dragged or
 recorded), and exact format breadth remain the largest deltas and are many
 work-streams, not one push.

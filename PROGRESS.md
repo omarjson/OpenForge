@@ -23,12 +23,12 @@ APPLICATION SURFACE
   Panels & dialogs (outliner, properties, toolbars)    ██████████░░░░░░░░░░  53%
   Import/export UX                                     ████████████░░░░░░░░  62%
   Plugin / service host                                ██████████░░░░░░░░░░  52%
-  Game tooling (LOD, dummies/TXD, vehicles)            ████░░░░░░░░░░░░░░░░  22%
+  Game tooling (LOD, dummies/TXD, vehicles)            ████████░░░░░░░░░░░░  40%
 
-  OVERALL (unweighted mean of 16 areas)                █████████████░░░░░░░  68%
+  OVERALL (unweighted mean of 16 areas)                ██████████████░░░░░░  70%
 
-Measured from the repo: 12 crates · 583 test fns · 31818 lines of Rust
-Exact mean of the curated area scores: 68.8% (sum 1102 over 16 areas)
+Measured from the repo: 12 crates · 586 test fns · 32154 lines of Rust
+Exact mean of the curated area scores: 70.0% (sum 1120 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

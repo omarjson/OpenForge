@@ -157,6 +157,10 @@ A sample GitHub Actions matrix is shown below.
   attach-point dummy at the selection's centre. The **Properties panel** reports
   the triangle budget per LOD for the selection and the whole scene, and the
   outliner rows carry their `LOD n` tag.
+- **Game ▸ Generate LODs** makes the levels, not just tags them:
+  cluster-decimated copies (`{name}_LOD1..3`, one undo step) land tagged and
+  hidden until **Isolate LOD n** previews them; a level that removed no face
+  is skipped rather than duplicated.
 - **The Plugins panel** lists each built-in plugin with a checkbox and what it
   brings (its formats, services and tools); unchecking one rebuilds the host
   without it, so its formats stop being importable/exportable in one step, and
