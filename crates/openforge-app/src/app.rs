@@ -25,7 +25,7 @@ use openforge_plugin::PluginHost;
 use openforge_render::{FaceShading, FrameStats, NodeMaterials, PickElement, TextureLayer};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The material library a new scene starts with: the crate's default grey at
 /// slot 0 plus a few presets, so the materials panel is not empty on first run.
@@ -794,9 +794,20 @@ impl OpenForgeApp {
         }
     }
 
+    /// Import one file through the plugin host's filter registry: a plugin
+    /// that registers a new extension is picked up here with no app change.
+    ///
+    /// A path no filter knows is refused before anything is read, naming what
+    /// the registry does know.
     fn import_file(&mut self, path: PathBuf) {
-        // Through the plugin host's filter registry: a plugin that registers a
-        // new extension is picked up here with no change to the app.
+        let Some(label) = self.format_label(&path).map(str::to_string) else {
+            self.status = format!(
+                "Skipped {} — no filter knows it ({}).",
+                Self::file_label(&path),
+                self.known_extensions()
+            );
+            return;
+        };
         match self.plugins.import(&path) {
             Ok(loaded) => {
                 let count = loaded.mesh_count();
@@ -805,27 +816,149 @@ impl OpenForgeApp {
                         app.scene.create_mesh(md.name, md.mesh);
                     }
                 });
-                self.status = format!("Imported {} mesh(es) from {}.", count, path.display());
+                self.status = format!(
+                    "Imported {} mesh(es) from {} ({label}).",
+                    count,
+                    Self::file_label(&path)
+                );
             }
             Err(e) => self.status = format!("Import failed: {}", e),
         }
     }
 
+    /// Import every path a drop delivered, in order.
+    ///
+    /// One file reports like a menu import; a pile ends on a summary of what
+    /// the drop added, so the status line answers for the whole gesture.
+    fn import_files(&mut self, paths: &[PathBuf]) {
+        if paths.len() == 1 {
+            self.import_file(paths[0].clone());
+            return;
+        }
+        if paths.is_empty() {
+            return;
+        }
+        let before = self.scene.node_count();
+        for path in paths {
+            self.import_file(path.clone());
+        }
+        let added = self.scene.node_count() - before;
+        self.status = format!(
+            "Dropped {} file(s) — imported {added} mesh node(s).",
+            paths.len()
+        );
+    }
+
+    /// Import whatever files the frame's input says were dropped on the
+    /// window, through the same registry the File menu uses.
+    ///
+    /// Runs at the end of a frame, so the status a drop leaves is the frame's
+    /// own — the viewport hint must not overwrite what it just did.
+    fn import_dropped_files(&mut self, ctx: &egui::Context) {
+        let dropped: Vec<PathBuf> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|file| file.path.clone())
+                .collect()
+        });
+        if !dropped.is_empty() {
+            self.import_files(&dropped);
+        }
+    }
+
+    /// Export the one selected mesh node, naming the format in the status.
+    ///
+    /// The path's extension picks the filter, so one no filter knows is
+    /// refused before anything is written; a selection holding more than one
+    /// mesh node is refused too, rather than quietly writing one of them.
     fn export_selected(&mut self, path: PathBuf) {
-        let Some(id) = self.selection.selected_nodes().next() else {
-            self.status = "Select a mesh node to export.".into();
+        let selected: Vec<NodeId> = self.selection.selected_nodes().collect();
+        let meshes = self.selected_mesh_nodes();
+        match meshes.len() {
+            1 => {}
+            0 if selected.is_empty() => {
+                self.status = "Select a mesh node to export.".into();
+                return;
+            }
+            0 => {
+                self.status = "Selected node has no mesh.".into();
+                return;
+            }
+            n => {
+                self.status = format!("Select one mesh to export — {n} mesh nodes selected.");
+                return;
+            }
+        }
+        let Some(label) = self.format_label(&path).map(str::to_string) else {
+            self.status = format!(
+                "Can't export to {} — no filter knows it ({}).",
+                Self::file_label(&path),
+                self.known_extensions()
+            );
             return;
         };
-        let Some(mesh) = self.scene.get(id).ok().and_then(|n| n.mesh()).cloned() else {
+        let id = meshes[0];
+        let Some(mesh) = self.mesh_copy(id) else {
             self.status = "Selected node has no mesh.".into();
             return;
         };
-        let name = self.scene.get(id).map(|n| n.name.clone()).unwrap_or_else(|_| "mesh".into());
-        let data = openforge_io::MeshData { name, mesh, material: None };
+        let name = self
+            .scene
+            .get(id)
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|_| "mesh".into());
+        let data = openforge_io::MeshData {
+            name: name.clone(),
+            mesh,
+            material: None,
+        };
         match self.plugins.export(&path, &data) {
-            Ok(()) => self.status = format!("Exported to {}.", path.display()),
+            Ok(()) => {
+                self.status = format!(
+                    "Exported {name} to {} ({label}).",
+                    Self::file_label(&path)
+                )
+            }
             Err(e) => self.status = format!("Export failed: {}", e),
         }
+    }
+
+    /// The label of the filter that would handle `path`'s extension.
+    fn format_label(&self, path: &Path) -> Option<&str> {
+        self.plugins.filters.for_path(path).map(|f| f.label())
+    }
+
+    /// Every extension the registry serves, as one readable list, for the
+    /// status that turns a path down.
+    fn known_extensions(&self) -> String {
+        let mut extensions: Vec<&str> = self.plugins.filters.extensions().collect();
+        extensions.sort_unstable();
+        extensions.join(", ")
+    }
+
+    /// A path as the status should name it: the file's own name when it has
+    /// one, the whole path otherwise.
+    fn file_label(path: &Path) -> String {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+
+    /// The registered formats as file-dialog filter groups, `(label,
+    /// extensions)` per filter — what the import and export dialogs offer, so
+    /// a plugin's format shows up in them too.
+    fn format_groups(&self) -> Vec<(String, Vec<String>)> {
+        self.plugins
+            .filters
+            .entries()
+            .map(|(_, label, extensions)| {
+                (
+                    label.to_string(),
+                    extensions.iter().map(|e| e.to_string()).collect(),
+                )
+            })
+            .collect()
     }
 
     // --- Viewport interaction ----------------------------------------------------
@@ -2157,6 +2290,7 @@ impl eframe::App for OpenForgeApp {
         self.handle_uv_editor(ctx);
         self.handle_side_panels(ctx);
         self.handle_central_viewport(ctx, frame.wgpu_render_state());
+        self.import_dropped_files(ctx);
         if self.dirty {
             ctx.request_repaint();
             self.dirty = false;
@@ -2174,18 +2308,26 @@ impl OpenForgeApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Import…").clicked() {
-                        if let Some(path) = rfd_pick_file() {
+                    if ui
+                        .button("Import…")
+                        .on_hover_text("Or drop model files on the window")
+                        .clicked()
+                    {
+                        if let Some(path) = rfd_pick_file(self.format_groups()) {
                             self.import_file(path);
                         }
                         ui.close_menu();
                     }
-                    if ui.button("Export selected…").clicked() {
-                        if let Some(path) = rfd_save_file() {
-                            self.export_selected(path);
+                    ui.menu_button("Export selected as", |ui| {
+                        for (label, extensions) in self.format_groups() {
+                            if ui.button(format!("{label}…")).clicked() {
+                                if let Some(path) = rfd_save_file(&label, &extensions) {
+                                    self.export_selected(path);
+                                }
+                                ui.close_menu();
+                            }
                         }
-                        ui.close_menu();
-                    }
+                    });
                     ui.separator();
                     if ui.button("Quit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -4078,16 +4220,24 @@ fn primitive_cone(radius: f32, height: f32, segments: u32) -> Mesh {
 
 // --- File dialogs (rfd) ---------------------------------------------------------
 
-fn rfd_pick_file() -> Option<PathBuf> {
-    rfd::FileDialog::new()
-        .add_filter("3D models", &["obj", "glb", "gltf", "ply", "stl"])
-        .pick_file()
+/// The open dialog: one filter group per registered format.
+fn rfd_pick_file(groups: Vec<(String, Vec<String>)>) -> Option<PathBuf> {
+    let mut dialog = rfd::FileDialog::new();
+    for (label, extensions) in groups {
+        let exts: Vec<&str> = extensions.iter().map(|e| e.as_str()).collect();
+        dialog = dialog.add_filter(label, &exts);
+    }
+    dialog.pick_file()
 }
 
-fn rfd_save_file() -> Option<PathBuf> {
+/// The save dialog for one format: its own filter and a matching default file
+/// name, so the file the user picks carries the format they chose.
+fn rfd_save_file(label: &str, extensions: &[String]) -> Option<PathBuf> {
+    let exts: Vec<&str> = extensions.iter().map(|e| e.as_str()).collect();
+    let first = exts.first().copied().unwrap_or("obj");
     rfd::FileDialog::new()
-        .add_filter("3D models", &["obj", "glb", "ply", "stl"])
-        .set_file_name("export.obj")
+        .add_filter(label, &exts)
+        .set_file_name(format!("export.{first}"))
         .save_file()
 }
 
@@ -6203,14 +6353,141 @@ mod tests {
     }
 
     #[test]
+    fn import_names_the_format_and_the_refusal_names_what_is_known() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let obj = temp_path("obj");
+        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("the temp obj writes");
+        let name = obj.file_name().unwrap().to_string_lossy().into_owned();
+
+        app.import_file(obj.clone());
+        assert_eq!(app.scene.node_count(), 1, "the triangle landed");
+        assert_eq!(
+            app.status,
+            format!("Imported 1 mesh(es) from {name} (Wavefront OBJ).")
+        );
+        app.undo_edit();
+        assert_eq!(app.scene.node_count(), 0, "and it is one undo step");
+
+        // A path no filter knows is turned down before anything is read, and
+        // the refusal names every extension that would have worked.
+        let unknown = temp_path("wtf");
+        let unknown_name = unknown.file_name().unwrap().to_string_lossy().into_owned();
+        app.import_file(unknown);
+        assert_eq!(
+            app.status,
+            format!("Skipped {unknown_name} — no filter knows it (glb, gltf, obj, ply, stl).")
+        );
+        assert_eq!(app.scene.node_count(), 0, "and nothing came in");
+        let _ = std::fs::remove_file(&obj);
+    }
+
+    #[test]
+    fn export_refuses_ambiguity_and_names_the_format() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Cube", primitive_box(1.0));
+        let path = temp_path("obj");
+        let name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+        app.export_selected(path.clone());
+        assert_eq!(app.status, "Select a mesh node to export.");
+        assert!(!path.exists(), "an empty selection writes no file");
+
+        app.selection.select_node(id);
+        app.export_selected(path.clone());
+        assert!(path.exists(), "the host filter wrote the file");
+        assert_eq!(
+            app.status,
+            format!("Exported Cube to {name} (Wavefront OBJ).")
+        );
+
+        // A second selected mesh makes the answer ambiguous: refuse and write
+        // nothing rather than quietly picking one.
+        let second = app.scene.create_mesh("Box", primitive_box(1.0));
+        app.selection.select_node(second);
+        let two = temp_path("obj");
+        app.export_selected(two.clone());
+        assert_eq!(
+            app.status,
+            "Select one mesh to export — 2 mesh nodes selected."
+        );
+        assert!(!two.exists(), "the ambiguous export writes nothing");
+
+        // An extension no filter knows is refused before the write.
+        app.selection.clear();
+        app.selection.select_node(id);
+        let unknown = temp_path("wtf");
+        let unknown_name = unknown.file_name().unwrap().to_string_lossy().into_owned();
+        app.export_selected(unknown.clone());
+        assert_eq!(
+            app.status,
+            format!("Can't export to {unknown_name} — no filter knows it (glb, gltf, obj, ply, stl).")
+        );
+        assert!(!unknown.exists());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_drop_imports_through_the_same_registry() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let obj = temp_path("obj");
+        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").expect("the temp obj writes");
+        let name = obj.file_name().unwrap().to_string_lossy().into_owned();
+
+        let mut input = frame(0.0, egui::pos2(500.0, 350.0), None);
+        input.dropped_files.push(egui::DroppedFile {
+            path: Some(obj.clone()),
+            ..Default::default()
+        });
+        let _ = ctx.run(input, |ctx| {
+            app.handle_central_viewport(ctx, None);
+            app.import_dropped_files(ctx);
+        });
+        assert_eq!(app.scene.node_count(), 1, "the drop imported it");
+        assert_eq!(
+            app.status,
+            format!("Imported 1 mesh(es) from {name} (Wavefront OBJ)."),
+            "the frame reports the import, not the viewport hint"
+        );
+        app.undo_edit();
+        assert_eq!(app.scene.node_count(), 0, "the drop is undoable");
+
+        // A pile, half of it unknown: the summary answers for the gesture.
+        let mut input = frame(1.0, egui::pos2(500.0, 350.0), None);
+        input.dropped_files.push(egui::DroppedFile {
+            path: Some(obj.clone()),
+            ..Default::default()
+        });
+        input.dropped_files.push(egui::DroppedFile {
+            path: Some(temp_path("wtf")),
+            ..Default::default()
+        });
+        let _ = ctx.run(input, |ctx| {
+            app.handle_central_viewport(ctx, None);
+            app.import_dropped_files(ctx);
+        });
+        assert_eq!(app.scene.node_count(), 1, "one of the two files landed");
+        assert_eq!(app.status, "Dropped 2 file(s) — imported 1 mesh node(s).");
+        let _ = std::fs::remove_file(&obj);
+    }
+
+    #[test]
     fn a_plugin_filter_extends_import_without_touching_the_app() {
         let mut app = OpenForgeApp::with_gpu(None);
         let before = app.scene.node_count();
         let path = temp_path("dot");
 
-        // The engine ships no `.dot` filter, so this has to fail first.
+        // The engine ships no `.dot` filter, so this has to fail first — the
+        // refusal names the extensions that would have worked.
         app.import_file(path.clone());
-        assert!(app.status.contains("Import failed"), "status: {}", app.status);
+        assert!(
+            app.status.contains("no filter knows it"),
+            "status: {}",
+            app.status
+        );
         assert_eq!(app.scene.node_count(), before);
 
         // Registering one plugin is the whole change to the application.
