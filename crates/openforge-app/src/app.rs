@@ -2600,6 +2600,16 @@ impl OpenForgeApp {
                         self.add_dummy();
                         ui.close_menu();
                     }
+                    if ui
+                        .button("Generate LODs")
+                        .on_hover_text(
+                            "Cluster-decimated copies tagged LOD 1–3, hidden until you isolate one",
+                        )
+                        .clicked()
+                    {
+                        self.generate_lods();
+                        ui.close_menu();
+                    }
                     ui.separator();
                     ui.menu_button("Set LOD", |ui| {
                         for level in 0u8..=3 {
@@ -4338,6 +4348,63 @@ impl OpenForgeApp {
     ///
     /// With nothing selected it lands on the origin. One undo step, and the
     /// dummy comes up selected so it can be dragged at once.
+    /// Game ▸ Generate LODs: cluster-decimated copies of the active mesh,
+    /// tagged LOD 1–3 and hidden until isolated, in one undo step.
+    ///
+    /// Each copy carries the source's transform and a `{name}_LOD{n}` name; a
+    /// level whose decimation removed no face is skipped rather than landing
+    /// as a duplicate, and with nothing left to remove the scene is untouched.
+    fn generate_lods(&mut self) {
+        let Some(id) = self.active_mesh_node() else {
+            self.status = "Select a mesh first.".into();
+            return;
+        };
+        let Some(source) = self.mesh_copy(id) else {
+            self.status = "Selected node has no mesh.".into();
+            return;
+        };
+        let (name, transform) = match self.scene.get(id) {
+            Ok(node) => (node.name.clone(), node.transform),
+            Err(_) => ("mesh".to_string(), Transform::default()),
+        };
+        let mut made: Vec<(u8, usize)> = Vec::new();
+        self.with_edit("Generate LODs", |app| {
+            for (level, resolution) in [(1u8, 6u32), (2, 4), (3, 3)] {
+                let Some(copy) = source.decimate_clustered(resolution) else {
+                    continue;
+                };
+                if copy.faces.len() >= source.faces.len() {
+                    continue;
+                }
+                let faces = copy.faces.len();
+                let lid = app.scene.create_mesh(format!("{name}_LOD{level}"), copy);
+                if let Ok(node) = app.scene.get_mut(lid) {
+                    node.transform = transform;
+                    node.lod = Some(level);
+                    node.visible = false;
+                }
+                made.push((level, faces));
+            }
+        });
+        if made.is_empty() {
+            self.status =
+                format!("Nothing to decimate — {name} is already at grid resolution.");
+            return;
+        }
+        let counts = made
+            .iter()
+            .map(|(level, faces)| format!("LOD{level}: {faces}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.status = format!(
+            "Generated {} LOD(s) for {name} — {counts} face(s), hidden until Game ▸ Isolate LOD n.",
+            made.len()
+        );
+    }
+
+    /// The non-rendered attach point a game format carries beside its
+    /// geometry, placed at the selection's centre (the origin when nothing is
+    /// selected) and selected on arrival. One undo step.
     fn add_dummy(&mut self) {
         let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
         let mut centre = Vec3::ZERO;
@@ -7947,5 +8014,68 @@ mod tests {
         }
         let _ = std::fs::remove_file(&obj);
         let _ = std::fs::remove_file(&out);
+    }
+
+    /// A flat `n`×`n` quad grid, spacing 0.1: many vertices for a decimator to
+    /// thin out.
+    fn plane_grid(n: u32) -> Mesh {
+        let mut m = Mesh::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                m.add_vertex(Vec3::new(x as f32 * 0.1, y as f32 * 0.1, 0.0));
+            }
+        }
+        let row = n + 1;
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * row + x;
+                m.add_face(&[a, a + 1, a + row + 1, a + row]);
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn generating_lods_makes_hidden_tagged_copies_in_one_undo_step() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Grid", plane_grid(12));
+        app.selection.select_node(id);
+        let source_faces = app.scene.get(id).unwrap().mesh().unwrap().faces.len();
+        assert_eq!(source_faces, 144);
+        let before = app.scene.node_count();
+
+        app.generate_lods();
+        assert_eq!(app.scene.node_count(), before + 3, "three levels");
+        for level in [1u8, 2, 3] {
+            let node = app
+                .scene
+                .iter()
+                .find(|n| n.name == format!("Grid_LOD{level}"))
+                .unwrap_or_else(|| panic!("LOD {level} exists"));
+            assert_eq!(node.lod, Some(level));
+            assert!(!node.visible, "hidden until isolated");
+            let faces = node.mesh().unwrap().faces.len();
+            assert!(faces < source_faces, "LOD{level}: {faces} of {source_faces}");
+        }
+        assert!(
+            app.status.starts_with("Generated 3 LOD(s) for Grid — LOD1: "),
+            "{}",
+            app.status
+        );
+        assert!(app.status.contains("hidden until"), "{}", app.status);
+        assert!(app.undo.can_undo(), "generation is one edit");
+        app.undo_edit();
+        assert_eq!(app.scene.node_count(), before, "one step back");
+
+        // A box's eight corners are already one per grid cell: nothing to
+        // remove, so the scene stays untouched and no undo entry lands.
+        app.selection.select_node(app.scene.create_mesh("Box", primitive_box(2.0)));
+        app.generate_lods();
+        assert_eq!(
+            app.status,
+            "Nothing to decimate — Box is already at grid resolution."
+        );
+        assert!(!app.undo.can_undo(), "a refusal is not an edit");
     }
 }

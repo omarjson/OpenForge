@@ -11,7 +11,7 @@
 //! doc comment); run [`MeshOps::bevel_vertices`] for a fully watertight chamfer.
 
 use openforge_core::mesh::{Corner, Face, Mesh};
-use openforge_core::Vec3;
+use openforge_core::{Vec2, Vec3};
 use std::collections::{HashMap, HashSet};
 
 /// Extension trait adding advanced modeling operators to [`Mesh`].
@@ -72,6 +72,17 @@ pub trait MeshOps {
     /// line through the mesh centre is preserved; `angle` 0 is a no-op.
     /// Recomputes normals.
     fn bend(&mut self, axis: Vec3, bend_axis: Vec3, angle: f32);
+
+    /// Grid-cluster decimation: a lower-detail copy for LOD chains.
+    ///
+    /// The mesh's bounding box is split into `resolution` cells per axis and
+    /// every vertex in one cell welds into a single cluster placed at the
+    /// cluster's average. A face whose corners collapse together is dropped,
+    /// each surviving corner takes the first finite UV its cluster's corners
+    /// carried, and normals are left empty for the renderer's flat fallback.
+    ///
+    /// `None` when the mesh is empty, `resolution` is 0, or no face survives.
+    fn decimate_clustered(&self, resolution: u32) -> Option<Mesh>;
 }
 
 // --- Shared helpers -----------------------------------------------------------
@@ -473,6 +484,125 @@ impl MeshOps for Mesh {
         }
         self.compute_flat_normals();
     }
+
+    fn decimate_clustered(&self, resolution: u32) -> Option<Mesh> {
+        build_decimated(self, resolution)
+    }
+}
+
+/// Grid-cluster decimation: see [`MeshOps::decimate_clustered`].
+///
+/// Clustering is deterministic: vertices gather in cell order, a cluster takes
+/// its average, and its UV is the first finite one any of its corners carried.
+/// A non-finite position clusters as the origin, so the output is always
+/// finite; a zero-extent axis (a flat mesh) is one cell deep.
+fn build_decimated(mesh: &Mesh, resolution: u32) -> Option<Mesh> {
+    if resolution == 0 || mesh.positions.is_empty() || mesh.faces.is_empty() {
+        return None;
+    }
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for p in &mesh.positions {
+        if !p.is_finite() {
+            continue;
+        }
+        min = min.min(*p);
+        max = max.max(*p);
+    }
+    if !min.is_finite() || !max.is_finite() {
+        return None;
+    }
+    let extent = max - min;
+    let cells = resolution as f32;
+    let cell = |v: f32, lo: f32, len: f32| -> u32 {
+        if len <= 0.0 {
+            return 0;
+        }
+        (((v - lo) / len) * cells).floor().clamp(0.0, cells - 1.0) as u32
+    };
+
+    // One cluster per occupied cell, summed for the average.
+    let mut clusters: HashMap<(u32, u32, u32), u32> = HashMap::new();
+    let mut sums: Vec<(Vec3, usize)> = Vec::new();
+    let mut cluster_of: Vec<u32> = Vec::with_capacity(mesh.positions.len());
+    for p in &mesh.positions {
+        let p = if p.is_finite() { *p } else { Vec3::ZERO };
+        let key = (
+            cell(p.x, min.x, extent.x),
+            cell(p.y, min.y, extent.y),
+            cell(p.z, min.z, extent.z),
+        );
+        let next = sums.len() as u32;
+        let id = *clusters.entry(key).or_insert(next);
+        if id == next {
+            sums.push((Vec3::ZERO, 0));
+        }
+        let slot = &mut sums[id as usize];
+        slot.0 += p;
+        slot.1 += 1;
+        cluster_of.push(id);
+    }
+    let positions: Vec<Vec3> = sums
+        .iter()
+        .map(|(sum, n)| if *n == 0 { Vec3::ZERO } else { *sum / *n as f32 })
+        .collect();
+
+    // Each cluster's UV is the first finite one any of its corners carried.
+    let mut cluster_uv: Vec<Option<Vec2>> = vec![None; positions.len()];
+    for face in &mesh.faces {
+        for corner in &face.corners {
+            let Some(&c) = cluster_of.get(corner.position as usize) else {
+                continue;
+            };
+            if cluster_uv[c as usize].is_none() {
+                if let Some(uv) = mesh.uvs.get(corner.uv as usize) {
+                    if uv.is_finite() {
+                        cluster_uv[c as usize] = Some(*uv);
+                    }
+                }
+            }
+        }
+    }
+
+    // Remap the faces; a face that collapsed to fewer than three distinct
+    // corners is gone.
+    let mut faces: Vec<Face> = Vec::new();
+    let mut uvs: Vec<Vec2> = Vec::new();
+    for face in &mesh.faces {
+        let mut seen: HashSet<u32> = HashSet::new();
+        let kept: Vec<u32> = face
+            .corners
+            .iter()
+            .filter_map(|corner| cluster_of.get(corner.position as usize).copied())
+            .filter(|c| seen.insert(*c))
+            .collect();
+        if kept.len() < 3 {
+            continue;
+        }
+        let mut corners = Vec::with_capacity(kept.len());
+        for c in kept {
+            let uv_index = uvs.len() as u32;
+            uvs.push(cluster_uv[c as usize].unwrap_or(Vec2::ZERO));
+            corners.push(Corner {
+                position: c,
+                normal: 0,
+                uv: uv_index,
+            });
+        }
+        faces.push(Face {
+            corners,
+            material: face.material,
+        });
+    }
+    if faces.is_empty() {
+        return None;
+    }
+    let mut out = Mesh::new();
+    out.positions = positions;
+    out.uvs = uvs;
+    out.faces = faces;
+    // Normals stay empty: the renderer's flat fallback shades the copy.
+    Some(out)
 }
 
 /// Bevel a single vertex into a chamfer polygon, adding bridging triangles so
@@ -807,5 +937,81 @@ mod tests {
         for (a, b) in m.positions.iter().zip(before.iter()) {
             assert!(a.abs_diff_eq(*b, 1e-6));
         }
+    }
+
+    /// A flat `n`×`n` quad grid, spacing 0.1: many closely spaced vertices,
+    /// which is what a decimator should thin out.
+    fn grid(n: u32) -> Mesh {
+        let mut m = Mesh::new();
+        for y in 0..=n {
+            for x in 0..=n {
+                m.add_vertex(Vec3::new(x as f32 * 0.1, y as f32 * 0.1, 0.0));
+            }
+        }
+        let row = n + 1;
+        for y in 0..n {
+            for x in 0..n {
+                let a = y * row + x;
+                m.add_face(&[a, a + 1, a + row + 1, a + row]);
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn decimation_collapses_a_grid_to_fewer_vertices_and_faces() {
+        let mesh = grid(12);
+        assert_eq!(mesh.positions.len(), 169);
+        assert_eq!(mesh.faces.len(), 144);
+
+        let out = mesh.decimate_clustered(6).expect("a dense grid decimates");
+        assert!(
+            out.positions.len() < mesh.positions.len(),
+            "169 -> {}",
+            out.positions.len()
+        );
+        assert!(
+            out.faces.len() < mesh.faces.len(),
+            "144 -> {}",
+            out.faces.len()
+        );
+        // Every corner resolves, and no face is a sliver.
+        for face in &out.faces {
+            assert!(face.corners.len() >= 3);
+            let mut ids: Vec<u32> = face.corners.iter().map(|c| c.position).collect();
+            for c in &face.corners {
+                assert!((c.position as usize) < out.positions.len());
+                assert!((c.uv as usize) < out.uvs.len());
+            }
+            ids.sort_unstable();
+            ids.dedup();
+            assert_eq!(ids.len(), face.corners.len(), "no repeated corners");
+        }
+        // Clusters keep the grid's finite UVs and stay inside the old bounds.
+        assert!(out.uvs.iter().all(|uv| uv.is_finite()));
+        assert!(out.positions.iter().all(|p| p.is_finite()));
+    }
+
+    #[test]
+    fn decimation_guards_refuse_the_impossible() {
+        // An empty mesh, and resolution 0, produce nothing.
+        assert!(Mesh::new().decimate_clustered(4).is_none());
+        assert!(grid(3).decimate_clustered(0).is_none());
+
+        // A cube's eight corners are one per cell at any resolution this
+        // coarse, so nothing collapses — but the copy is still valid.
+        let cube = cube();
+        let out = cube.decimate_clustered(6).expect("the copy survives");
+        assert_eq!(out.positions.len(), cube.positions.len());
+        assert_eq!(out.faces.len(), cube.faces.len());
+        assert!(out.normals.is_empty(), "normals wait for the flat fallback");
+
+        // Degenerate input — every position identical — has no mesh left.
+        let mut flat = Mesh::new();
+        for _ in 0..4 {
+            flat.add_vertex(Vec3::ZERO);
+        }
+        flat.add_face(&[0, 1, 2, 3]);
+        assert!(flat.decimate_clustered(4).is_none());
     }
 }
