@@ -254,11 +254,13 @@ A sample GitHub Actions matrix is shown below.
   the statuses name the file and the format.
 - **File → Open Project… / Save Project / Save Project As…** keeps the whole
   document — the scene with its transforms, visibility, LOD tags and per-face
-  materials, the material library with its textures, and the animation clips —
-  in one versioned `.ofproj` JSON file (`Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S`).
-  Opening replaces the document and starts a fresh undo history; a file that
-  is not JSON, not an OpenForge project, or from a newer build is refused
-  with a sentence saying which one it was.
+  materials, the material library with its textures, the animation clips and
+  (since format version 2) the skinned rig with its pose, weights and bind
+  positions — in one versioned `.ofproj` JSON file
+  (`Ctrl+O` / `Ctrl+S` / `Ctrl+Shift+S`). Opening replaces the document and
+  starts a fresh undo history; a file that is not JSON, not an OpenForge
+  project, or from a newer build is refused with a sentence saying which one
+  it was.
 - The **Plugins** section of the Properties panel lists the loaded plugins and
   the services, tools and formats they contributed.
 - **Create** menu adds primitives (box, sphere, cylinder, cone, plane).
@@ -296,8 +298,8 @@ mostly application surface. Natural next steps:
   of the diffuse map that samples today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
-- Settings that persist across runs, an asset browser, and the deeper
-  panel/dialog surface — and the rig in the project file.
+- Settings that persist across runs (in the app and in the project file), an
+  asset browser, and the deeper panel/dialog surface.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) and a fuller
   COLLADA (node transforms, effects, animation) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) behind the host seam, which already

@@ -46,13 +46,13 @@ Boolean CSG|65|Engine
 Generators & algorithms (primitives, Catmull-Clark, noise, L-systems)|80|Engine
 Materials & textures|72|Engine
 Animation (tracks, clips, playback, key editing)|78|Engine
-Rigging & skinning|72|Engine
+Rigging & skinning|75|Engine
 UV math (project, unwrap, pack, edits)|87|Engine
 GPU viewport (depth, shading, grid, gizmo)|88|UI
 Viewport editing UX (gizmos, wireframe, outlines, picking)|96|UI
 UV editor UI|70|UI
 Panels & dialogs (outliner, properties, toolbars, Preferences)|66|UI
-Import/export UX|72|UI
+Import/export UX|74|UI
 Plugin / service host|64|UI
 Game tooling (LOD, dummies/TXD, vehicles)|40|UI
 DATA
