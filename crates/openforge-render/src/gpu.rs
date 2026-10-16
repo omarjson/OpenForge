@@ -71,6 +71,30 @@ const PICK_ROW_ALIGNMENT: u32 = 256;
 /// map back synchronously.
 const MAX_PICK_RADIUS: u32 = 64;
 
+/// Which element geometry an ID pass draws on top of the faces.
+///
+/// The faces are always drawn — they are what hides whatever is behind — and
+/// the level adds the geometry it has to answer with. A face level adds
+/// neither: a point or a line sitting exactly on its own face would punch a
+/// one-pixel hole or notch into the face's pixels, which is the one way the
+/// picture and the pick could disagree.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PickDraw {
+    lines: bool,
+    points: bool,
+}
+
+impl PickDraw {
+    /// Faces alone.
+    const FACES: Self = Self { lines: false, points: false };
+    /// Faces and vertex points — what a vertex (or object) level answers from.
+    const POINTS: Self = Self { lines: false, points: true };
+    /// Faces and edge lines — what an edge level answers from.
+    const LINES: Self = Self { lines: true, points: false };
+    /// Everything: the click pass, whose hits the caller filters per level.
+    const EVERYTHING: Self = Self { lines: true, points: true };
+}
+
 /// The multi-sample count [`GpuRenderer`] prefers when the adapter supports it.
 pub const PREFERRED_SAMPLES: u32 = 4;
 
@@ -333,6 +357,7 @@ pub struct GpuRenderer {
     /// ID-pass pipelines: faces as triangles, mesh vertices as points.
     pick_pipeline: wgpu::RenderPipeline,
     pick_point_pipeline: wgpu::RenderPipeline,
+    pick_line_pipeline: wgpu::RenderPipeline,
     /// The ID pass's own uniform block (just `view_proj`) and bind group,
     /// kept apart from the frame's so a pick never disturbs a rendered frame.
     pick_uniforms: wgpu::Buffer,
@@ -664,6 +689,15 @@ impl GpuRenderer {
             None,
             wgpu::CompareFunction::LessEqual,
         );
+        // Edges: lines drawn after the faces, one pixel wide, and coincident
+        // with the surface whose border they are — `LessEqual` again, so an
+        // edge wins its own pixels without beating a face in front of it.
+        let pick_line_pipeline = build_pick_pipeline(
+            "openforge-pick-edges",
+            wgpu::PrimitiveTopology::LineList,
+            None,
+            wgpu::CompareFunction::LessEqual,
+        );
 
         let grid = grid_vertices(GRID_HALF_EXTENT);
         let grid_vertex_count = grid.len() as u32;
@@ -729,6 +763,7 @@ impl GpuRenderer {
             gizmo_pipeline,
             pick_pipeline,
             pick_point_pipeline,
+            pick_line_pipeline,
             pick_uniforms,
             pick_bind_group,
             pick_target: None,
@@ -913,6 +948,11 @@ impl GpuRenderer {
     /// `radius` is clamped to [`MAX_PICK_RADIUS`]; an empty scene — or one
     /// whose every mesh is hidden or frozen — resolves to nothing without
     /// touching the GPU.
+    ///
+    /// Every element kind the pass can draw — faces, edges and vertices — is
+    /// drawn, so hits can name any of them; filtering to the level being
+    /// edited is the caller's job (the app's `chosen_hit` scans the hits for
+    /// the first one the level accepts).
     pub fn pick(
         &mut self,
         device: &wgpu::Device,
@@ -933,7 +973,8 @@ impl GpuRenderer {
             (cx + radius + 1).min(self.size[0]),
             (cy + radius + 1).min(self.size[1]),
         ];
-        let Some((geometry, ids)) = self.read_id_rect(device, queue, scene, camera, rect, true)
+        let Some((geometry, ids)) =
+            self.read_id_rect(device, queue, scene, camera, rect, PickDraw::EVERYTHING)
         else {
             return Vec::new();
         };
@@ -959,11 +1000,13 @@ impl GpuRenderer {
     /// filtered to what the level can select, exactly like [`Self::pick`]'s
     /// hits are: vertex elements for `Vertex`, face elements (and the vertex
     /// pixels that put a node in the rectangle) for `Object`, face elements
-    /// alone for `Face`, nothing for `Edge`.
+    /// alone for `Face`, edge elements for `Edge`.
     ///
-    /// A face rectangle draws no vertex points: they are 1-pixel dots sitting
-    /// on their own face, and a pixel hole in the face at every vertex would
-    /// be the one way the picture and the pick could disagree.
+    /// A face rectangle draws no vertex points and no edge lines: they sit
+    /// exactly on their own face, and a one-pixel hole or notch in the face at
+    /// every vertex or edge would be the one way the picture and the pick
+    /// could disagree. An edge rectangle draws no vertex points for the same
+    /// reason — the faces and the lines are what it answers from.
     pub fn pick_rect(
         &mut self,
         device: &wgpu::Device,
@@ -973,19 +1016,20 @@ impl GpuRenderer {
         rect: [u32; 4],
         level: SelectLevel,
     ) -> Vec<PickElement> {
-        // No edge pass exists, so an edge rectangle is empty by definition.
-        if matches!(level, SelectLevel::Edge) {
-            return Vec::new();
-        }
         let rect = [
             rect[0].min(self.size[0]),
             rect[1].min(self.size[1]),
             rect[2].min(self.size[0]),
             rect[3].min(self.size[1]),
         ];
-        let with_points = !matches!(level, SelectLevel::Face);
-        let Some((geometry, ids)) =
-            self.read_id_rect(device, queue, scene, camera, rect, with_points)
+        let draw = match level {
+            SelectLevel::Face => PickDraw::FACES,
+            SelectLevel::Edge => PickDraw::LINES,
+            // A node is in the rectangle when any of its pixels is, vertices
+            // included — the CPU fallback answers with positions too.
+            SelectLevel::Vertex | SelectLevel::Object => PickDraw::POINTS,
+        };
+        let Some((geometry, ids)) = self.read_id_rect(device, queue, scene, camera, rect, draw)
         else {
             return Vec::new();
         };
@@ -994,11 +1038,11 @@ impl GpuRenderer {
             .into_iter()
             .filter(|element| match level {
                 SelectLevel::Vertex => matches!(element, PickElement::Vertex { .. }),
-                // An object rectangle keeps both kinds: the app only needs the
+                SelectLevel::Edge => matches!(element, PickElement::Edge { .. }),
+                // An object rectangle keeps every kind: the app only needs the
                 // node, and the CPU fallback answers with positions too.
                 SelectLevel::Object => true,
                 SelectLevel::Face => matches!(element, PickElement::Face { .. }),
-                SelectLevel::Edge => false,
             })
             .collect()
     }
@@ -1007,7 +1051,8 @@ impl GpuRenderer {
     /// `[x0, y0, x1, y1]` back out of it as tightly packed ids.
     ///
     /// `None` when the scene has nothing to pick or the rectangle is empty:
-    /// neither is worth touching the GPU for.
+    /// neither is worth touching the GPU for. `draw` decides which element
+    /// geometry goes on top of the faces (see [`PickDraw`]).
     fn read_id_rect(
         &mut self,
         device: &wgpu::Device,
@@ -1015,7 +1060,7 @@ impl GpuRenderer {
         scene: &mut Scene,
         camera: &OrbitCamera,
         rect: [u32; 4],
-        with_points: bool,
+        draw: PickDraw,
     ) -> Option<(PickGeometry, Vec<u32>)> {
         let (x0, y0, x1, y1) = (rect[0], rect[1], rect[2], rect[3]);
         if x1 <= x0 || y1 <= y0 {
@@ -1052,10 +1097,17 @@ impl GpuRenderer {
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
-        let points = with_points.then(|| {
+        let points = (draw.points && !geometry.points.is_empty()).then(|| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("openforge-pick-point-vertices"),
                 contents: bytemuck::cast_slice(&geometry.points),
+                usage: wgpu::BufferUsages::VERTEX,
+            })
+        });
+        let lines = (draw.lines && !geometry.lines.is_empty()).then(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("openforge-pick-line-vertices"),
+                contents: bytemuck::cast_slice(&geometry.lines),
                 usage: wgpu::BufferUsages::VERTEX,
             })
         });
@@ -1093,7 +1145,14 @@ impl GpuRenderer {
                 pass.set_vertex_buffer(0, buffer.slice(..));
                 pass.draw(0..geometry.triangles.len() as u32, 0..1);
             }
-            // Points come last, so a vertex pixel wins over the face under it.
+            // Lines come after the faces so an edge wins the pixels it lies
+            // on, and points come last of all, so a vertex pixel wins over
+            // both the face and the edges under it.
+            if let Some(buffer) = &lines {
+                pass.set_pipeline(&self.pick_line_pipeline);
+                pass.set_vertex_buffer(0, buffer.slice(..));
+                pass.draw(0..geometry.lines.len() as u32, 0..1);
+            }
             if let Some(buffer) = &points {
                 pass.set_pipeline(&self.pick_point_pipeline);
                 pass.set_vertex_buffer(0, buffer.slice(..));
@@ -2421,9 +2480,15 @@ mod tests {
         let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Face);
         assert_eq!(hits, vec![PickElement::Face { node: back, face: 0 }]);
 
-        // There is no edge pass, so an edge rectangle is empty by definition.
+        // With the near quad hidden, an edge rectangle finds the far quad's
+        // four edges — the lines the frame draws there, and nothing else.
         let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
-        assert!(hits.is_empty());
+        assert_eq!(hits, vec![
+            PickElement::Edge { node: back, edge: 0 },
+            PickElement::Edge { node: back, edge: 1 },
+            PickElement::Edge { node: back, edge: 2 },
+            PickElement::Edge { node: back, edge: 3 },
+        ]);
     }
 
     #[test]
@@ -2504,6 +2569,101 @@ mod tests {
         assert!(
             hits.contains(&PickElement::Vertex { node: loose, vertex: 0 }),
             "a visible vertex must be selected: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn an_edge_rectangle_finds_the_edges_the_frame_shows() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU rectangle test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let front = scene.create_mesh("front", unit_quad());
+        let back = scene.create_mesh("back", unit_quad());
+        scene.get_mut(front).unwrap().set_translation(Vec3::new(0.0, 0.0, 0.5));
+        scene.get_mut(back).unwrap().set_translation(Vec3::new(0.0, 0.0, -0.5));
+        let camera = front_camera();
+
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let all = [0, 0, TARGET, TARGET];
+
+        // The near quad hides the far one completely, and what the frame shows
+        // is its four edges. Finding exactly them is also the proof that a
+        // line wins the pixels it lies on: the face underneath is at the same
+        // depth, and would otherwise swallow every edge pixel.
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
+        assert_eq!(hits, vec![
+            PickElement::Edge { node: front, edge: 0 },
+            PickElement::Edge { node: front, edge: 1 },
+            PickElement::Edge { node: front, edge: 2 },
+            PickElement::Edge { node: front, edge: 3 },
+        ]);
+
+        // Hiding the near node lets the far one's edges answer instead.
+        scene.get_mut(front).unwrap().visible = false;
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
+        assert_eq!(hits, vec![
+            PickElement::Edge { node: back, edge: 0 },
+            PickElement::Edge { node: back, edge: 1 },
+            PickElement::Edge { node: back, edge: 2 },
+            PickElement::Edge { node: back, edge: 3 },
+        ]);
+
+        // Line pixels are no vertex pixels: a vertex rectangle answers with
+        // vertices alone everywhere the lines run.
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
+        assert!(!hits.is_empty());
+        assert!(
+            hits.iter().all(|e| matches!(e, PickElement::Vertex { .. })),
+            "a vertex rectangle must not answer with edges: {hits:?}"
+        );
+
+        // A corner rectangle clear of the quad, and one with no width at all,
+        // select no edges.
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, [0, 0, 8, 8], SelectLevel::Edge);
+        assert!(hits.is_empty(), "empty space selected {hits:?}");
+        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, [30, 30, 30, 40], SelectLevel::Edge);
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn a_click_on_an_edge_finds_it_in_the_patch() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU edge pick test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let quad = scene.create_mesh("quad", unit_quad());
+        let camera = front_camera();
+
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let size = renderer.size();
+
+        // The middle of the quad's top side (positions 2 → 3): the line pass
+        // draws the edge over the face at the same depth, so the nearest hit
+        // is that edge — edge 2 of the quad's four.
+        let cursor = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, cursor, 2);
+        assert_eq!(
+            hits.first(),
+            Some(&PickElement::Edge { node: quad, edge: 2 }),
+            "an edge on its own pixel must win over its face: {hits:?}"
+        );
+        assert!(
+            hits.contains(&PickElement::Face { node: quad, face: 0 }),
+            "the face behind the edge should still resolve: {hits:?}"
+        );
+
+        // The middle of the quad is its face, well clear of every edge.
+        let cursor = pixel_of(&camera, size, Vec3::ZERO);
+        let hits = renderer.pick(&device, &queue, &mut scene, &camera, cursor, 2);
+        assert_eq!(hits.first(), Some(&PickElement::Face { node: quad, face: 0 }));
+        assert!(
+            hits.iter().all(|e| !matches!(e, PickElement::Edge { .. })),
+            "no edge runs near the patch: {hits:?}"
         );
     }
 }

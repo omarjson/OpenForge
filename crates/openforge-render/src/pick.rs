@@ -44,28 +44,35 @@ pub enum PickElement {
     Face { node: NodeId, face: u32 },
     /// One vertex of a node's mesh, as an index into `mesh.positions`.
     Vertex { node: NodeId, vertex: u32 },
+    /// One edge of a node's mesh, as an index into [`Mesh::edges`].
+    ///
+    /// [`Mesh::edges`]: openforge_core::mesh::Mesh::edges
+    Edge { node: NodeId, edge: u32 },
 }
 
 impl PickElement {
     /// The node this element belongs to.
     pub fn node(&self) -> NodeId {
         match *self {
-            PickElement::Face { node, .. } | PickElement::Vertex { node, .. } => node,
+            PickElement::Face { node, .. }
+            | PickElement::Vertex { node, .. }
+            | PickElement::Edge { node, .. } => node,
         }
     }
 
-    /// The element's index inside its node's mesh — a face index or a vertex
-    /// index, depending on the variant.
+    /// The element's index inside its node's mesh — a face index, a vertex
+    /// index or an edge index, depending on the variant.
     pub fn index(&self) -> u32 {
         match *self {
             PickElement::Face { face, .. } => face,
             PickElement::Vertex { vertex, .. } => vertex,
+            PickElement::Edge { edge, .. } => edge,
         }
     }
 }
 
-/// The ID pass for a whole scene: face triangles, vertex points, and the
-/// element table their ids index into.
+/// The ID pass for a whole scene: face triangles, edge lines, vertex points,
+/// and the element table their ids index into.
 ///
 /// Vertices are deliberately *not* deduplicated and triangles are a plain
 /// list (no index buffer): the pass runs once per click, and keeping every
@@ -77,6 +84,8 @@ pub struct PickGeometry {
     pub triangles: Vec<PickVertex>,
     /// Point-list vertices, one per mesh vertex.
     pub points: Vec<PickVertex>,
+    /// Line-list vertices, two per mesh edge, both carrying the edge's id.
+    pub lines: Vec<PickVertex>,
     /// The element table: id `i + 1` is `elements[i]` (`0` is "nothing").
     pub elements: Vec<PickElement>,
 }
@@ -87,9 +96,13 @@ impl PickGeometry {
     ///
     /// Faces are fan-triangulated like the visible pass and invalid ones
     /// (fewer than three corners, out-of-range positions) are skipped, so the
-    /// triangles are exactly the ones the frame drew. A frozen node is left
-    /// out even though it renders: it is not selectable, and the CPU pickers
-    /// already let a click fall through it.
+    /// triangles are exactly the ones the frame drew; edges come from
+    /// [`Mesh::edges`], which skips the same faces, and vertices from the
+    /// position array. A frozen node is left out even though it renders: it is
+    /// not selectable, and the CPU pickers already let a click fall through
+    /// it.
+    ///
+    /// [`Mesh::edges`]: openforge_core::mesh::Mesh::edges
     pub fn build(scene: &mut Scene) -> Self {
         let ids: Vec<NodeId> = scene
             .iter()
@@ -121,6 +134,17 @@ impl PickGeometry {
                 let element = geo.push_element(PickElement::Vertex { node: id, vertex: vi as u32 });
                 let p = world.transform_point3(mesh.positions[vi]);
                 geo.points.push(PickVertex::new(p, element));
+            }
+            // Edges come last, so a node's face and vertex ids keep the values
+            // they had before edges existed. `edges()` skips what the visible
+            // pass skips and never names a position outside the mesh, so every
+            // pair here is safe to transform.
+            for (ei, [a, b]) in mesh.edges().iter().enumerate() {
+                let element = geo.push_element(PickElement::Edge { node: id, edge: ei as u32 });
+                for &vi in &[*a, *b] {
+                    let p = world.transform_point3(mesh.positions[vi as usize]);
+                    geo.lines.push(PickVertex::new(p, element));
+                }
             }
         }
         geo
@@ -256,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quad_gives_two_triangles_four_points_and_five_elements() {
+    fn a_quad_gives_two_triangles_four_points_four_edges_and_nine_elements() {
         let mut scene = Scene::new();
         let node = scene.create_mesh("quad", unit_quad());
         let geo = PickGeometry::build(&mut scene);
@@ -265,13 +289,41 @@ mod tests {
         assert_eq!(geo.triangles.len(), 6);
         // One point per mesh position.
         assert_eq!(geo.points.len(), 4);
-        // One face element plus one vertex element per position.
-        assert_eq!(geo.elements.len(), 5);
+        // Two line vertices per edge, four edges around the quad.
+        assert_eq!(geo.lines.len(), 8);
+        // One face element, one vertex element per position, one per edge.
+        assert_eq!(geo.elements.len(), 9);
         assert_eq!(geo.elements[0], PickElement::Face { node, face: 0 });
-        for (vi, element) in geo.elements[1..].iter().enumerate() {
+        for (vi, element) in geo.elements[1..5].iter().enumerate() {
             assert_eq!(*element, PickElement::Vertex { node, vertex: vi as u32 });
         }
+        for (ei, element) in geo.elements[5..].iter().enumerate() {
+            assert_eq!(*element, PickElement::Edge { node, edge: ei as u32 });
+        }
         assert!(!geo.is_empty());
+    }
+
+    #[test]
+    fn an_edge_carries_its_id_on_both_of_its_endpoints() {
+        let mut scene = Scene::new();
+        let node = scene.create_mesh("quad", unit_quad());
+        let geo = PickGeometry::build(&mut scene);
+
+        // Edge ids run on from the vertices: face 1, vertices 2..5, edges 6..9.
+        let ids: Vec<u32> = geo.lines.iter().map(|v| v.id).collect();
+        assert_eq!(ids, vec![6, 6, 7, 7, 8, 8, 9, 9]);
+        // Edge 0 is the quad's (0, 0, 0)–(1, 0, 0) side, in world space.
+        assert_eq!(geo.lines[0].position, [0.0, 0.0, 0.0]);
+        assert_eq!(geo.lines[1].position, [1.0, 0.0, 0.0]);
+        for v in &geo.lines {
+            assert!(geo.element(v.id).is_some());
+        }
+        // The last edge closes the quad, stored lower index first, so its
+        // line runs position 0 → position 3 rather than the way the face
+        // walks it.
+        assert_eq!(geo.lines[6].position, [0.0, 0.0, 0.0]);
+        assert_eq!(geo.lines[7].position, [0.0, 1.0, 0.0]);
+        assert_eq!(geo.element(9), Some(PickElement::Edge { node, edge: 3 }));
     }
 
     #[test]
@@ -314,7 +366,7 @@ mod tests {
         scene.get_mut(frozen).unwrap().frozen = true;
 
         let geo = PickGeometry::build(&mut scene);
-        assert_eq!(geo.elements.len(), 5, "only the visible node");
+        assert_eq!(geo.elements.len(), 9, "only the visible node");
         assert!(geo.elements.iter().all(|e| e.node() == visible));
     }
 
@@ -324,13 +376,15 @@ mod tests {
         let node = scene.create_mesh("quad", unit_quad());
         {
             let mesh = scene.get_mut(node).unwrap().mesh_mut().unwrap();
-            // Out-of-range position: not drawn, so not picked either.
+            // Out-of-range position: not drawn, so not picked either — and
+            // none of its sides exist as edges.
             mesh.add_face(&[0, 1, 99]);
         }
         let geo = PickGeometry::build(&mut scene);
-        // Still one face element and four vertices: the bogus face added none.
-        assert_eq!(geo.elements.len(), 5);
+        // Still one face and four vertices plus the quad's four edges.
+        assert_eq!(geo.elements.len(), 9);
         assert_eq!(geo.triangles.len(), 6);
+        assert_eq!(geo.lines.len(), 8);
     }
 
     #[test]
@@ -347,7 +401,8 @@ mod tests {
         let geo = PickGeometry::build(&mut scene);
         assert_eq!(geo.triangles.len(), 9, "three fan triangles");
         assert!(geo.triangles.iter().all(|v| v.id == 1));
-        assert_eq!(geo.elements.len(), 6, "one face + five vertices");
+        assert_eq!(geo.elements.len(), 11, "one face + five vertices + five edges");
+        assert_eq!(geo.lines.len(), 10);
     }
 
     #[test]
@@ -358,7 +413,7 @@ mod tests {
         scene.create_group("group");
         let geo = PickGeometry::build(&mut scene);
         assert!(geo.is_empty());
-        assert!(geo.triangles.is_empty() && geo.points.is_empty());
+        assert!(geo.triangles.is_empty() && geo.points.is_empty() && geo.lines.is_empty());
     }
 
     #[test]
@@ -458,7 +513,7 @@ mod tests {
         scene.create_mesh("quad", unit_quad());
         let geo = PickGeometry::build(&mut scene);
 
-        // 0 is the clear value; 99 is past the five-element table.
+        // 0 is the clear value; 99 is past the nine-element table.
         let patch = [0u32; 9];
         assert!(geo.elements_in_patch(&patch, 3, 3).is_empty());
         let patch = [99, 0, 99, 0, 99, 0, 99, 0, 99];
@@ -475,6 +530,22 @@ mod tests {
         assert!(geo.elements_in_patch(&[], 2, 2).is_empty(), "short buffer");
         assert!(geo.elements_in_patch(&[1, 1, 1], 2, 2).is_empty(), "short buffer");
         assert!(PickGeometry::default().elements_in_patch(&[1], 1, 1).is_empty());
+    }
+
+    #[test]
+    fn a_rectangle_finds_edge_ids_like_any_other_element() {
+        let mut scene = Scene::new();
+        let node = scene.create_mesh("quad", unit_quad());
+        let geo = PickGeometry::build(&mut scene);
+
+        // Edge ids 6..9, seen in reverse order; they come back ascending,
+        // normalised to the lower position index first.
+        let patch = [9u32, 0, 6];
+        let found = geo.elements_in_patch(&patch, 3, 1);
+        assert_eq!(found, vec![
+            PickElement::Edge { node, edge: 0 },
+            PickElement::Edge { node, edge: 3 },
+        ]);
     }
 
     #[test]
