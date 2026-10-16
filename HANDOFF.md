@@ -23,7 +23,7 @@ deepening the host (dynamic plugin loading, behaviour-carrying services).
 - **Clean-room only.** Never decompile, reverse, or bypass the `zmStoneGuard.dll`
   DRM. Never copy proprietary ZModeler code. Inspiration from public behavior/
   architecture is fine; transliterating protected code is not.
-- **Standard formats only.** Support OBJ, glTF/GLB, PLY, STL (and other open
+- **Standard formats only.** Support OBJ, glTF/GLB, PLY, STL, COLLADA and OFF (and other open
   formats). Do **not** implement the proprietary `.z3d` format.
 - **Cross-platform.** Must build and test on Windows, macOS, and Linux. CI runs
   all three.
@@ -42,12 +42,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (596 `#[test]` fns; 598 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (607 `#[test]` fns; 609 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
 | `openforge-core` | 50 | `Mesh`, `Scene`, nodes, selection, undo (a stack generic over its snapshot, so the app restores a scene and its clip library together), tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). |
-| `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
+| `openforge-io` | 23 | Import/export: OBJ, glTF/GLB, PLY, STL, COLLADA (a hand-written XML subset reader) and OFF. |
 | `openforge-ops` | 19 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**, and **grid-cluster decimation** (`decimate_clustered`) for LOD chains. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
 | `openforge-render` | 102 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking — faces as triangles, edges as lines, vertices as points, through a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
@@ -479,7 +479,7 @@ progress report:
   (named capabilities), a tool registry of **factories** (`fn() -> Box<dyn Tool>`,
   because a `Tool` carries an in-progress drag and sharing it would leak that
   state) and a `FilterRegistry` that dispatches import/export on a file's
-  extension. The engine's own four tools and four formats are ordinary plugins
+  extension. The engine's own four tools and six formats are ordinary plugins
   (`CoreToolsPlugin`, `InterchangePlugin`) registered by `builtin_host()`, so
   the app never names a tool or a format again: `active_tool()` asks
   `host.make_tool(name)` and `import_file`/`export_selected` call
@@ -506,7 +506,7 @@ progress report:
   import until one plugin is registered and works afterwards, a plugin trying to
   steal `obj` being rejected with the host unchanged, the active tool coming
   from `make_tool`, and the Plugins panel's report listing exactly the two
-  built-ins, three services, four tools and four formats.
+  built-ins, three services, four tools and six formats.
 
 - **Materials are wired through to the pixels.** `openforge-materials` already
   had `Material`, `MaterialLibrary` and textures; nothing used them, and
@@ -993,11 +993,11 @@ progress report:
   - **Formats come from the registry** in the UI as well as in the plumbing:
     the open dialog carries one filter group per registered format, **Export
     selected as ▸** lists them by label (Wavefront OBJ, glTF 2.0, Stanford PLY,
-    STL) and saves with a matching default file name, so a plugin's format
+    STL, COLLADA, OFF) and saves with a matching default file name, so a plugin's format
     appears in the menus with no app change.
   - **Refusals name what would have worked**: a path no filter knows is turned
     down before anything is read or written — "Skipped a.foo — no filter knows
-    it (glb, gltf, obj, ply, stl)." / "Can't export to a.foo — …" — and every
+    it (dae, glb, gltf, obj, off, ply, stl)." / "Can't export to a.foo — …" — and every
     status names the file and the format ("Imported 2 mesh(es) from scene.obj
     (Wavefront OBJ).", "Exported Cube to cube.obj (Wavefront OBJ).").
   - **Export refuses ambiguity**: more than one selected mesh node is "Select
@@ -1249,9 +1249,39 @@ progress report:
   halved blend and a smoothing pass that pulls it into a neighbour, with undo
   restoring the weights and the blend surviving.
 
+- **COLLADA and OFF** (work-stream #29). The IO crate shipped four formats;
+  two more joined it behind the same registry, so the app gained no format
+  naming — only its tests' counts:
+  - **`openforge-io` grew a hand-written XML subset reader** (elements,
+    attributes, text, comments, processing instructions, the five standard
+    entities, numeric character references and namespace prefixes) and the
+    parts of the COLLADA schema a mesh needs: `<source>` float arrays,
+    `<vertices>`, `<triangles>`, `<polylist>` and `<polygons>` with their
+    input offsets walked, so strided index arrays read correctly. A `Z_UP`
+    asset turns onto Y with the app's own rule (`(x,y,z)` → `(x,z,-y)`);
+    per-vertex normals are kept when primitives index them like positions,
+    and node transforms, effects and animation stay out of scope.
+  - **OFF reads line-based**, so the color values some writers append
+    (COFF-style vertices, per-face colors) are ignored rather than fatal;
+    faces stay the n-gons the file wrote, and the counts sit on the magic
+    line or exactly one line of their own.
+  - **Export writes what each format carries best**: COLLADA one Y-up
+    geometry as index triangles (a normals source when they are
+    per-vertex), OFF the mesh's own n-gons.
+  - **`openforge-plugin` registers both as ordinary engine filters**
+    (`dae`, `off`), so the dialogs, the extension dispatch and the Plugins
+    panel pick them up at once.
+- **11 new tests**: OFF's n-gon round trip, its tolerated extras and eight
+  broken documents; COLLADA's export/import round trip with normals and
+  materials, a hand-written Z-up polylist with entities and comments, a
+  strided normal input beside `<polygons>`, seven broken documents and
+  exported-id/attribute escaping; the app round (export a box, import it
+  back through both labels), and both formats through the integration
+  test's real filesystem.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **598 pass, 0 failures**
+build too); `cargo test --workspace` → **609 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -1315,7 +1345,9 @@ plugin goes, the full list when it returns. And a key edit is a step of the
 scene's own stack now: the snapshot carries the clip library, so undo after a
 retime or a delete puts the *clip* back, not just the scene. The weight tools
 are measured the same way: assign, blend and smooth in the rig crate, the
-app's refusals and counts, and undo restoring the weights.
+app's refusals and counts, and undo restoring the weights. The six formats are
+measured through the registry and the filesystem: both new ones round-trip the
+app's own export/import statuses and the integration test's real files.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1381,7 +1413,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **72.3%**, shown as 72%). The engine
+16 curated areas is **73.0%**, shown as 73%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1402,8 +1434,9 @@ the file boundary) as of #24 and the LOD generator (cluster decimation into
 hidden LOD 1–3 copies) as of #25 and the registry-driven tool list (the
 toolbar and hotkeys walk the host's tools) as of #26 and the key-editing
 timeline (key rows, drag-to-retime, Key/Delete Key, clips on the undo stack)
-as of #27 and the weight tools (assign/blend/smooth over the vertex
-selection, undoable) as of #28.
+as of #27, the weight tools (assign/blend/smooth over the vertex
+selection, undoable) as of #28 and COLLADA and OFF (import/export through
+the same registry, six formats) as of #29.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1434,8 +1467,9 @@ Prioritized next steps:
    behaviour, and plugins are compiled in rather than *loaded* — a
    `cdylib`/WASM filter discovered at runtime is the real prize. That is the
    long road to true parity.
-5. **IO expansion.** Add COLLADA/DAE, OFF, or ASCII FBX (open subsets) to widen
-   format coverage beyond the current 4.
+5. **IO expansion.** COLLADA/DAE and OFF landed in #29; ASCII FBX, USDZ and
+   more of the COLLADA schema (node transforms, effects, animation) widen
+   coverage next.
 6. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
    The GPU scene pass now samples a **diffuse** map (#11); normal, specular and
    emissive maps, per-face map assignment and mipmapped/anisotropic sampling are
@@ -1447,7 +1481,8 @@ dictionaries, per-game export paths — the generic half, LOD tags, dummies,
 their triangle budget and the LOD generator, landed in #21/#25), the full
 panel/dialog surface, animation *authoring* beyond the key row (per-key
 easing edits, a curve view, clip-level tools), and exact format breadth
-remain the largest deltas and are many
+(six formats, none proprietary; COLLADA is the geometry subset, without
+node transforms, effects or animation) remain the largest deltas and are many
 work-streams, not one push.
 
 ## 8. Known gotchas when using AI subagents here

@@ -40,7 +40,7 @@ rust_loc=$(find crates -name '*.rs' -print0 | xargs -0 cat | wc -l | tr -d ' ')
 
 AREAS=$(cat <<'DATA'
 Data model (nodes, mesh, selection, undo, tools)|85|Engine
-Standard format IO (OBJ, glTF/GLB, PLY, STL)|65|Engine
+Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF)|73|Engine
 Modeling ops (extrude, inset, bevel, mirror, weld, deformers)|80|Engine
 Boolean CSG|65|Engine
 Generators & algorithms (primitives, Catmull-Clark, noise, L-systems)|80|Engine
@@ -52,7 +52,7 @@ GPU viewport (depth, shading, grid, gizmo)|88|UI
 Viewport editing UX (gizmos, wireframe, outlines, picking)|96|UI
 UV editor UI|70|UI
 Panels & dialogs (outliner, properties, toolbars)|53|UI
-Import/export UX|62|UI
+Import/export UX|66|UI
 Plugin / service host|64|UI
 Game tooling (LOD, dummies/TXD, vehicles)|40|UI
 DATA
