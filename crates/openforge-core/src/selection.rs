@@ -83,6 +83,21 @@ impl Selection {
         self.elements.get(&id)
     }
 
+    /// The selected *face* indices of `id`, when the face level is the one
+    /// being edited.
+    ///
+    /// Element indices only mean anything at the level they were picked at, so
+    /// a caller asking about faces gets nothing while another level is active:
+    /// an edge index is not a face index, however much the number looks like
+    /// one.
+    pub fn selected_faces(&self, id: NodeId) -> Option<&BTreeSet<u32>> {
+        if self.level == SelectLevel::Face {
+            self.selected_elements(id)
+        } else {
+            None
+        }
+    }
+
     pub fn element_count(&self, id: NodeId) -> usize {
         self.elements.get(&id).map(|s| s.len()).unwrap_or(0)
     }
@@ -114,6 +129,25 @@ mod tests {
         s.select_elements(id, [0u32, 2, 4]);
         assert_eq!(s.element_count(id), 3);
         assert_eq!(s.total_element_count(), 3);
+    }
+
+    #[test]
+    fn face_indices_only_read_as_faces_at_the_face_level() {
+        let mut s = Selection::new();
+        let id = NodeId(7);
+        assert!(s.selected_faces(id).is_none(), "nothing is selected yet");
+        s.select_elements(id, [0u32, 2, 4]);
+        assert_eq!(
+            s.selected_faces(id).map(|f| f.len()),
+            Some(3),
+            "the default level is the face level"
+        );
+        s.level = SelectLevel::Edge;
+        assert!(
+            s.selected_faces(id).is_none(),
+            "an edge index must not read as a face"
+        );
+        assert_eq!(s.element_count(id), 3, "the indices themselves are untouched");
     }
 
     #[test]

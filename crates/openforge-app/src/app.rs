@@ -95,6 +95,30 @@ enum ActiveTool {
     Rotate,
 }
 
+/// The colour of a directly selected sub-object, as an egui colour.
+fn element_selected_color() -> egui::Color32 {
+    egui::Color32::from_rgb(
+        viewport::ELEMENT_SELECTED_SRGB[0],
+        viewport::ELEMENT_SELECTED_SRGB[1],
+        viewport::ELEMENT_SELECTED_SRGB[2],
+    )
+}
+
+/// The overlay mode a frame actually draws.
+///
+/// Edge level is where edges are picked, and a pick has a tolerance but a line
+/// nobody can see is a line nobody can aim at: an *off* overlay falls back to
+/// the selected meshes' outline there, the same context the vertex level gets
+/// from its dots. The setting itself is untouched — the Z key still cycles it
+/// and the View menu still reports it.
+fn overlay_mode(level: SelectLevel, wireframe: viewport::Wireframe) -> viewport::Wireframe {
+    if level == SelectLevel::Edge && wireframe == viewport::Wireframe::Off {
+        viewport::Wireframe::Selection
+    } else {
+        wireframe
+    }
+}
+
 pub struct OpenForgeApp {
     scene: Scene,
     selection: Selection,
@@ -344,9 +368,13 @@ impl OpenForgeApp {
     }
 
     /// The selected face indices (as `usize`) for a node.
+    ///
+    /// Empty unless the face level is the one being edited: element indices
+    /// belong to the level that produced them (`Selection::selected_faces`),
+    /// so the modeling ops that ask for faces refuse at any other level.
     fn selected_faces(&self, id: NodeId) -> Vec<usize> {
         self.selection
-            .selected_elements(id)
+            .selected_faces(id)
             .map(|s| s.iter().map(|&x| x as usize).collect())
             .unwrap_or_default()
     }
@@ -816,7 +844,7 @@ impl OpenForgeApp {
         let mut materials = NodeMaterials::new();
         for node in self.scene.iter().filter(|n| n.is_mesh()) {
             let selected = self.selection.is_node_selected(node.id);
-            let sel_faces = self.selection.selected_elements(node.id).cloned();
+            let sel_faces = self.selection.selected_faces(node.id).cloned();
             let Some(mesh) = node.mesh() else { continue };
             let faces: Vec<FaceShading> = (0..mesh.faces.len())
                 .map(|face| {
@@ -1703,6 +1731,9 @@ impl OpenForgeApp {
         // Overlay selected vertices as small dots (vertex level editing aid).
         self.paint_vertex_dots(&painter, rect);
         self.paint_wireframe(&painter, rect);
+        // The picked edges over that, in the element highlight (edge level
+        // editing aid): drawn last so the bold line wins where they overlap.
+        self.paint_selected_edges(&painter, rect);
         // The transform gizmo sits above the geometry so its handles stay
         // grabbable even when they overlap the mesh.
         self.paint_gizmo(&painter);
@@ -2643,16 +2674,13 @@ impl OpenForgeApp {
                         // the renderer draws it as depth-tested lines, so the
                         // app does not repaint it on top (the CPU fallback
                         // below still does).
-                        let edge_vertices = if self.wireframe == viewport::Wireframe::Off {
+                        let mode = overlay_mode(self.selection.level, self.wireframe);
+                        let edge_vertices = if mode == viewport::Wireframe::Off {
                             Vec::new()
                         } else {
                             let eye = self.camera.eye();
-                            let edges = viewport::collect_edges(
-                                &mut self.scene,
-                                &self.selection,
-                                self.wireframe,
-                                eye,
-                            );
+                            let edges =
+                                viewport::collect_edges(&mut self.scene, &self.selection, mode, eye);
                             gpu_viewport::edge_vertices(&edges)
                         };
                         Some(gpu.render(
@@ -2697,6 +2725,7 @@ impl OpenForgeApp {
         painter.image(texture_id, rect, uv, egui::Color32::WHITE);
 
         self.paint_vertex_dots(&painter, rect);
+        self.paint_selected_edges(&painter, rect);
         self.paint_gizmo(&painter);
         self.paint_marquee(&painter);
 
@@ -2742,11 +2771,57 @@ impl OpenForgeApp {
                     .unwrap_or(false);
                 let center = egui::pos2(rect.left() + x, rect.top() + y);
                 let (rad, color) = if is_sel {
-                    (dot + 1.0, egui::Color32::from_rgb(255, 170, 60))
+                    (dot + 1.0, element_selected_color())
                 } else {
                     (dot, egui::Color32::from_rgb(120, 200, 255))
                 };
                 painter.circle_filled(center, rad, color);
+            }
+        }
+    }
+
+    /// Edge-level editing aid: a bold line over every edge in the selection.
+    ///
+    /// Shared by both viewports, like the vertex dots: each projects to the
+    /// same normalized device coordinates, so the line lands in the same place
+    /// either way. It is drawn over the shading, unoccluded — an editing aid
+    /// rather than part of the shaded image, exactly like the dots.
+    fn paint_selected_edges(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.selection.level != SelectLevel::Edge {
+            return;
+        }
+        let size = [rect.width(), rect.height()];
+        let aspect = size[0] / size[1].max(1.0);
+        let vp = self.camera.view_proj(aspect);
+        for id in self.selection.selected_nodes() {
+            let selected = self.selection.selected_elements(id).cloned();
+            let Some(selected) = selected else { continue };
+            let Ok(world) = self.scene.world_matrix(id) else { continue };
+            let Ok(node) = self.scene.get(id) else { continue };
+            let Some(mesh) = node.mesh() else { continue };
+            for index in selected {
+                let Some([a, b]) = mesh.edges().get(index as usize).copied() else {
+                    continue;
+                };
+                let (Some(pa), Some(pb)) = (
+                    mesh.positions.get(a as usize),
+                    mesh.positions.get(b as usize),
+                ) else {
+                    continue;
+                };
+                let (Some(pa), Some(pb)) = (
+                    viewport::project(vp, world.transform_point3(*pa), size),
+                    viewport::project(vp, world.transform_point3(*pb), size),
+                ) else {
+                    continue;
+                };
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + pa.0, rect.top() + pa.1),
+                        egui::pos2(rect.left() + pb.0, rect.top() + pb.1),
+                    ],
+                    egui::Stroke::new(3.0_f32, element_selected_color()),
+                );
             }
         }
     }
@@ -2761,14 +2836,15 @@ impl OpenForgeApp {
     /// draws the same collected edges as depth-tested line geometry instead
     /// (see `gpu_viewport::edge_vertices`).
     fn paint_wireframe(&mut self, painter: &egui::Painter, rect: egui::Rect) {
-        if self.wireframe == viewport::Wireframe::Off {
+        let mode = overlay_mode(self.selection.level, self.wireframe);
+        if mode == viewport::Wireframe::Off {
             return;
         }
         let size = [rect.width(), rect.height()];
         let aspect = size[0] / size[1].max(1.0);
         let vp = self.camera.view_proj(aspect);
         let eye = self.camera.eye();
-        let edges = viewport::collect_edges(&mut self.scene, &self.selection, self.wireframe, eye);
+        let edges = viewport::collect_edges(&mut self.scene, &self.selection, mode, eye);
         for edge in edges {
             let (Some(a), Some(b)) = (
                 viewport::project(vp, edge.a, size),
@@ -4037,6 +4113,112 @@ mod tests {
     }
 
     #[test]
+    fn the_overlay_falls_back_to_the_outline_only_at_the_edge_level() {
+        use viewport::Wireframe;
+        assert_eq!(
+            overlay_mode(SelectLevel::Edge, Wireframe::Off),
+            Wireframe::Selection,
+            "an off overlay still shows what an edge pick aims at"
+        );
+        assert_eq!(overlay_mode(SelectLevel::Face, Wireframe::Off), Wireframe::Off);
+        assert_eq!(overlay_mode(SelectLevel::Vertex, Wireframe::Off), Wireframe::Off);
+        assert_eq!(
+            overlay_mode(SelectLevel::Edge, Wireframe::All),
+            Wireframe::All,
+            "a chosen mode is drawn as chosen"
+        );
+        assert_eq!(
+            overlay_mode(SelectLevel::Edge, Wireframe::Selection),
+            Wireframe::Selection
+        );
+    }
+
+    #[test]
+    fn edge_level_draws_the_outline_and_marks_the_picked_edges() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Quad", centred_quad());
+        let centre = face_quad(&ctx, &mut app, id);
+        app.tool = ActiveTool::Select;
+        app.selection.level = SelectLevel::Edge;
+        let highlight = egui::Color32::from_rgb(
+            viewport::ELEMENT_SELECTED_SRGB[0],
+            viewport::ELEMENT_SELECTED_SRGB[1],
+            viewport::ELEMENT_SELECTED_SRGB[2],
+        );
+        let outline = egui::Color32::from_rgb(
+            viewport::EDGE_NODE_SELECTED_SRGB[0],
+            viewport::EDGE_NODE_SELECTED_SRGB[1],
+            viewport::EDGE_NODE_SELECTED_SRGB[2],
+        );
+
+        // Nothing picked yet: no node is being edited, so the fallback
+        // outline has nothing to outline and nothing is highlighted.
+        let shapes = paint_once(&ctx, &mut app, frame(0.0, egui::pos2(60.0, 60.0), None));
+        assert!(painted_strokes(&shapes, highlight).is_empty());
+        assert!(painted_strokes(&shapes, outline).is_empty());
+
+        // A rectangle over the upper-left corner takes the top and left edges.
+        drag_rectangle(
+            &ctx,
+            &mut app,
+            1.0,
+            centre + egui::vec2(-110.0, -110.0),
+            centre + egui::vec2(-10.0, -10.0),
+            false,
+        );
+        assert_eq!(selected_indices(&app, id), vec![2, 3]);
+        assert_eq!(
+            app.wireframe,
+            viewport::Wireframe::Off,
+            "the fallback is the frame's, not the setting's"
+        );
+
+        let shapes = paint_once(&ctx, &mut app, frame(2.0, egui::pos2(60.0, 60.0), None));
+        assert_eq!(
+            painted_strokes(&shapes, outline).len(),
+            4,
+            "the quad's edges, outlined through the off overlay"
+        );
+        let picked = painted_strokes(&shapes, highlight);
+        assert_eq!(picked.len(), 2, "the two picked edges are marked");
+        assert!(picked.iter().all(|(_, width)| *width == 3.0), "boldly: {picked:?}");
+
+        // And the marks land on the edges themselves: the top edge joins the
+        // corners (1,1,0) and (-1,1,0), the left edge (-1,-1,0) and (-1,1,0).
+        let size = [SCREEN[0], SCREEN[1]];
+        let vp = app.camera.view_proj(size[0] / size[1]);
+        let at = |p: Vec3| {
+            let (x, y, _) = viewport::project(vp, p, size).expect("the quad faces the camera");
+            egui::pos2(x, y)
+        };
+        let fits = |seg: &[egui::Pos2; 2], want: [egui::Pos2; 2]| {
+            (seg[0].distance(want[0]) < 1.5 && seg[1].distance(want[1]) < 1.5)
+                || (seg[0].distance(want[1]) < 1.5 && seg[1].distance(want[0]) < 1.5)
+        };
+        let top = [at(Vec3::new(1.0, 1.0, 0.0)), at(Vec3::new(-1.0, 1.0, 0.0))];
+        let left = [at(Vec3::new(-1.0, -1.0, 0.0)), at(Vec3::new(-1.0, 1.0, 0.0))];
+        assert!(
+            picked.iter().any(|(seg, _)| fits(seg, top)),
+            "the top edge is marked: {picked:?}"
+        );
+        assert!(
+            picked.iter().any(|(seg, _)| fits(seg, left)),
+            "the left edge is marked: {picked:?}"
+        );
+
+        // Face level has no edge highlight to draw: the aid belongs to the
+        // level that picked the edges.
+        app.selection.level = SelectLevel::Face;
+        let shapes = paint_once(&ctx, &mut app, frame(3.0, egui::pos2(60.0, 60.0), None));
+        assert!(
+            painted_strokes(&shapes, highlight).is_empty(),
+            "no edge highlight away from the edge level"
+        );
+    }
+
+    #[test]
     fn grid_snapping_lands_a_move_on_a_grid_value() {
         let ctx = egui::Context::default();
 
@@ -4507,6 +4689,37 @@ mod tests {
         out
     }
 
+    /// The stroked segments of one colour a frame painted, with their widths.
+    fn painted_strokes(
+        shapes: &[egui::epaint::ClippedShape],
+        color: egui::Color32,
+    ) -> Vec<([egui::Pos2; 2], f32)> {
+        fn walk(
+            shape: &egui::Shape,
+            color: egui::Color32,
+            out: &mut Vec<([egui::Pos2; 2], f32)>,
+        ) {
+            match shape {
+                egui::Shape::LineSegment { points, stroke } => {
+                    if stroke.color == egui::epaint::ColorMode::Solid(color) {
+                        out.push((*points, stroke.width));
+                    }
+                }
+                egui::Shape::Vec(inner) => {
+                    for s in inner {
+                        walk(s, color, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, color, &mut out);
+        }
+        out
+    }
+
     /// How many stroked segments the frame drew in the face-highlight colour.
     fn painted_face_edge_count(ctx: &egui::Context, app: &mut OpenForgeApp) -> usize {
         let highlight = egui::Color32::from_rgb(255, 170, 60);
@@ -4788,6 +5001,43 @@ mod tests {
         assert!(app.undo.can_undo());
         app.undo_edit();
         assert_eq!(app.scene.get(id).unwrap().face_material_slot(0), 0);
+    }
+
+    #[test]
+    fn an_edge_selection_does_not_shade_a_face_as_selected() {
+        // Element indices are per level. At the edge level the whole-node tint
+        // is the strongest the mesh may take, however its edges are numbered;
+        // at the face level the same index really does tint.
+        let (mut app, id) = app_ready_to_move();
+        let node_only = viewport::material_base(app.materials.resolve(0), true, false);
+        let face_too = viewport::material_base(app.materials.resolve(0), true, true);
+        assert_ne!(node_only, face_too, "the two tints must differ to be told apart");
+
+        let expected = openforge_render::gpu::linear_from_srgb_u8([
+            node_only[0],
+            node_only[1],
+            node_only[2],
+        ]);
+        app.selection.level = SelectLevel::Edge;
+        app.selection.select_node(id);
+        app.selection.select_elements(id, [0u32]);
+        for shading in app.node_materials().faces(id).expect("the node's colours") {
+            for (a, b) in shading.color.iter().zip(&expected) {
+                assert!((a - b).abs() < 1e-6, "edge 0 shaded face 0: {shading:?}");
+            }
+        }
+
+        app.selection.level = SelectLevel::Face;
+        let face_tint = openforge_render::gpu::linear_from_srgb_u8([
+            face_too[0],
+            face_too[1],
+            face_too[2],
+        ]);
+        assert_eq!(
+            app.node_materials().faces(id).expect("the node's colours")[0].color,
+            face_tint,
+            "face 0 at the face level carries the face tint"
+        );
     }
 
     #[test]

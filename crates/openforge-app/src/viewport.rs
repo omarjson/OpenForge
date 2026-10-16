@@ -182,7 +182,7 @@ pub fn collect_triangles(
     for id in ids {
         let Ok(world) = scene.world_matrix(id) else { continue };
         let selected = selection.is_node_selected(id);
-        let sel_faces = selection.selected_elements(id).cloned();
+        let sel_faces = selection.selected_faces(id).cloned();
         let Ok(node) = scene.get(id) else { continue };
         let Some(mesh) = node.mesh() else { continue };
         // Resolve the node's slot list into a library slot per face.
@@ -305,6 +305,13 @@ pub const EDGE_PLAIN_SRGB: [u8; 3] = [150, 158, 172];
 /// Alpha of the plain (unselected) edge colour.
 pub const EDGE_PLAIN_ALPHA: u8 = 130;
 
+/// A directly selected sub-object: a selected vertex's dot, a picked edge's
+/// highlight.
+///
+/// Deliberately the hue a selected face's edges take, so "selected" reads as
+/// one colour at every level.
+pub const ELEMENT_SELECTED_SRGB: [u8; 3] = EDGE_FACE_SELECTED_SRGB;
+
 /// One world-space edge of the overlay, flagged for how it should be coloured.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct OverlayEdge {
@@ -371,7 +378,7 @@ pub fn collect_edges(
 
     for (id, node_selected) in ids {
         let Ok(world) = scene.world_matrix(id) else { continue };
-        let sel_faces = selection.selected_elements(id).cloned();
+        let sel_faces = selection.selected_faces(id).cloned();
         let Ok(node) = scene.get(id) else { continue };
         let Some(mesh) = node.mesh() else { continue };
 
@@ -1031,6 +1038,54 @@ mod tests {
         let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(1.0, 0.5, 5.0));
         assert_eq!(edges.len(), 8);
         assert_eq!(edges.iter().filter(|e| e.face_selected).count(), 4);
+    }
+
+    #[test]
+    fn an_edge_selection_does_not_flag_the_edges_as_face_selected() {
+        // Edge 0 and face 0 are different things: at the edge level the
+        // overlay must colour the edges by the node alone.
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let mut sel = Selection::new();
+        sel.select_node(id);
+        sel.level = SelectLevel::Edge;
+        sel.select_elements(id, [0u32]);
+
+        let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, 5.0));
+        assert_eq!(edges.len(), 4);
+        assert!(edges.iter().all(|e| e.node_selected), "the node is selected");
+        assert!(
+            edges.iter().all(|e| !e.face_selected),
+            "edge 0 must not read as face 0"
+        );
+
+        // The same index at the face level does flag the outline, so the
+        // assertion above is about the level and not about the number.
+        sel.level = SelectLevel::Face;
+        let edges = collect_edges(&mut scene, &sel, Wireframe::All, Vec3::new(0.0, 0.0, 5.0));
+        assert!(edges.iter().all(|e| e.face_selected));
+    }
+
+    #[test]
+    fn a_triangle_is_flagged_face_selected_only_at_the_face_level() {
+        let mut scene = Scene::new();
+        let id = scene.create_mesh("quad", quad(0.0));
+        let mut sel = Selection::new();
+        sel.select_node(id);
+        sel.level = SelectLevel::Edge;
+        sel.select_elements(id, [0u32]);
+
+        let tris = collect_triangles(&mut scene, &sel);
+        assert!(!tris.is_empty(), "the quad triangulates");
+        assert!(tris.iter().all(|t| t.selected), "the node is selected");
+        assert!(
+            tris.iter().all(|t| !t.face_selected),
+            "edge 0 must not tint face 0"
+        );
+
+        sel.level = SelectLevel::Face;
+        let tris = collect_triangles(&mut scene, &sel);
+        assert!(tris.iter().all(|t| t.face_selected));
     }
 
     #[test]
