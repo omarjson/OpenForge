@@ -77,6 +77,34 @@ impl<T> Track<T> {
         }
     }
 
+    /// The index of a key sitting at exactly `time`, or `None` when no key
+    /// holds it.
+    pub fn index_at(&self, time: f64) -> Option<usize> {
+        self.keys.iter().position(|k| k.time == time)
+    }
+
+    /// Move the key at `index` to `time`, keeping the track sorted.
+    ///
+    /// Returns the index the key now occupies, or `None` when `index` is out
+    /// of range or `time` is not finite (a NaN would poison every sample). A
+    /// key already sitting at `time` is displaced — retiming onto a key is a
+    /// deliberate overwrite, the same rule [`Track::add_key`] applies — so a
+    /// move can shrink the track by one.
+    pub fn retime_key(&mut self, index: usize, time: f64) -> Option<usize> {
+        if !time.is_finite() || index >= self.keys.len() {
+            return None;
+        }
+        let mut key = self.keys.remove(index);
+        key.time = time;
+        let at = self.keys.partition_point(|k| k.time <= time);
+        if at > 0 && self.keys[at - 1].time == time {
+            self.keys[at - 1] = key;
+            return Some(at - 1);
+        }
+        self.keys.insert(at, key);
+        Some(at)
+    }
+
     /// Remove every key from the track.
     pub fn clear(&mut self) {
         self.keys.clear();
@@ -358,5 +386,52 @@ mod tests {
 
         let held = track.sample(0.75).expect("value exists");
         assert!(held.angle_between(start) < 1e-5);
+    }
+
+    #[test]
+    fn retiming_slides_a_key_and_keeps_the_track_sorted() {
+        let mut track: Track<f32> = Track::new();
+        track.add_key(0.0, 0.0, Interp::Linear);
+        track.add_key(1.0, 10.0, Interp::Linear);
+        track.add_key(2.0, 20.0, Interp::Linear);
+
+        // Slide the last key back between its neighbours.
+        assert_eq!(track.retime_key(2, 0.5), Some(1));
+        let times: Vec<f64> = track.keys().iter().map(|k| k.time).collect();
+        assert_eq!(times, vec![0.0, 0.5, 1.0]);
+        assert_eq!(track.keys()[1].value, 20.0, "the value rode along");
+        assert_eq!(track.sample(0.25), Some(10.0), "the segment re-blends");
+    }
+
+    #[test]
+    fn retiming_onto_a_key_displaces_it() {
+        let mut track: Track<f32> = Track::new();
+        track.add_key(0.0, 0.0, Interp::Linear);
+        track.add_key(1.0, 10.0, Interp::Linear);
+        track.add_key(2.0, 20.0, Interp::Linear);
+
+        // Dragging the first key onto the last one wins the slot.
+        assert_eq!(track.retime_key(0, 2.0), Some(1));
+        let times: Vec<f64> = track.keys().iter().map(|k| k.time).collect();
+        assert_eq!(times, vec![1.0, 2.0], "the sitting key is gone");
+        assert_eq!(track.keys()[1].value, 0.0);
+    }
+
+    #[test]
+    fn retiming_refuses_bad_indices_and_times() {
+        let mut track: Track<f32> = Track::new();
+        track.add_key(0.0, 1.0, Interp::Linear);
+        let before = track.clone();
+
+        assert_eq!(track.retime_key(5, 1.0), None);
+        assert_eq!(track.retime_key(0, f64::NAN), None);
+        assert_eq!(track.retime_key(0, f64::INFINITY), None);
+        assert_eq!(track, before, "a refusal changes nothing");
+
+        // A key can land back on its own time: the same slot.
+        assert_eq!(track.retime_key(0, 0.0), Some(0));
+        assert_eq!(track, before);
+        assert_eq!(track.index_at(0.0), Some(0));
+        assert_eq!(track.index_at(0.5), None);
     }
 }

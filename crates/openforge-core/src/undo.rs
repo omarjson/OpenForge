@@ -1,40 +1,43 @@
-//! Undo/redo via captured scene snapshots.
+//! Undo/redo via captured snapshots.
 //!
-//! Editing commands capture the scene state before and after they run. This is
+//! Editing commands capture the state before and after they run. This is
 //! simple, robust, and adequate for a foundation; a production editor would
-//! switch to fine-grained commands for memory efficiency.
+//! switch to fine-grained commands for memory efficiency. The stack is
+//! generic over the snapshot type, so an app can restore whatever an edit can
+//! touch — a scene, or a scene plus its clip library — in one step.
 
 use crate::scene::Scene;
 
-/// A recorded undo step.
-pub struct UndoEntry {
+/// A recorded undo step: the snapshot taken before and after one edit.
+pub struct UndoEntry<T> {
     pub label: String,
-    before: Scene,
-    after: Scene,
+    before: T,
+    after: T,
 }
 
-/// An undo/redo stack.
-pub struct UndoStack {
-    entries: Vec<UndoEntry>,
+/// An undo/redo stack over snapshots of `T` (the default payload is a
+/// [`Scene`], the app's is the scene plus its clip library).
+pub struct UndoStack<T = Scene> {
+    entries: Vec<UndoEntry<T>>,
     /// Number of entries that are currently applied (the "redo" tail starts here).
     applied: usize,
     limit: usize,
 }
 
-impl Default for UndoStack {
+impl<T> Default for UndoStack<T> {
     fn default() -> Self {
         Self::new(100)
     }
 }
 
-impl UndoStack {
+impl<T> UndoStack<T> {
     pub fn new(limit: usize) -> Self {
         Self { entries: Vec::new(), applied: 0, limit: limit.max(1) }
     }
 
     /// Record a completed edit. `before` is the state prior to the edit and
     /// `after` is the current state.
-    pub fn push(&mut self, label: impl Into<String>, before: Scene, after: Scene) {
+    pub fn push(&mut self, label: impl Into<String>, before: T, after: T) {
         // Drop the redo tail.
         self.entries.truncate(self.applied);
         self.entries.push(UndoEntry { label: label.into(), before, after });
@@ -65,25 +68,6 @@ impl UndoStack {
         self.entries.get(self.applied).map(|e| e.label.as_str())
     }
 
-    /// Step backward, returning the scene to restore.
-    pub fn undo(&mut self) -> Option<Scene> {
-        if !self.can_undo() {
-            return None;
-        }
-        self.applied -= 1;
-        Some(self.entries[self.applied].before.clone())
-    }
-
-    /// Step forward, returning the scene to restore.
-    pub fn redo(&mut self) -> Option<Scene> {
-        if !self.can_redo() {
-            return None;
-        }
-        let scene = self.entries[self.applied].after.clone();
-        self.applied += 1;
-        Some(scene)
-    }
-
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -95,6 +79,27 @@ impl UndoStack {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.applied = 0;
+    }
+}
+
+impl<T: Clone> UndoStack<T> {
+    /// Step backward, returning the snapshot to restore.
+    pub fn undo(&mut self) -> Option<T> {
+        if !self.can_undo() {
+            return None;
+        }
+        self.applied -= 1;
+        Some(self.entries[self.applied].before.clone())
+    }
+
+    /// Step forward, returning the snapshot to restore.
+    pub fn redo(&mut self) -> Option<T> {
+        if !self.can_redo() {
+            return None;
+        }
+        let snapshot = self.entries[self.applied].after.clone();
+        self.applied += 1;
+        Some(snapshot)
     }
 }
 

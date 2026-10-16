@@ -10,7 +10,7 @@ use crate::viewport::{self, Camera};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
 use glam::{Mat4, Vec2, Vec3, Vec4};
-use openforge_animation::{Clip, Interp, Player, TransformTrack};
+use openforge_animation::{Clip, ClipLibrary, Interp, Player, TransformTrack};
 use openforge_core::math::Transform;
 use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
@@ -243,10 +243,28 @@ fn overlay_mode(level: SelectLevel, wireframe: viewport::Wireframe) -> viewport:
     }
 }
 
+/// One undo snapshot: everything a single edit can touch.
+///
+/// Scene edits were once the whole story; clip edits (keying, retiming,
+/// deleting) are the second surface, so both ride every step and Edit ▸ Undo
+/// puts back whichever one moved.
+#[derive(Clone)]
+struct AppSnapshot {
+    scene: Scene,
+    clips: ClipLibrary,
+}
+
+impl AppSnapshot {
+    /// Same content? The scene compares structurally; clips derive equality.
+    fn same(&self, other: &Self) -> bool {
+        self.scene.content_eq(&other.scene) && self.clips == other.clips
+    }
+}
+
 pub struct OpenForgeApp {
     scene: Scene,
     selection: Selection,
-    undo: UndoStack,
+    undo: UndoStack<AppSnapshot>,
     camera: Camera,
     tool: ActiveTool,
     /// Scene state captured at the start of the current edit (for undo).
@@ -264,6 +282,11 @@ pub struct OpenForgeApp {
     anim: Player,
     /// Whether the timeline panel is open.
     anim_open: bool,
+    /// The key time picked in the timeline's key row, if any.
+    key_selected: Option<f64>,
+    /// While a key is being dragged, its time as started and the live spot it
+    /// would land on — the release commits them as one edit.
+    key_drag: Option<(f64, f64)>,
     /// Whether the viewport was interacted with this frame (drives repaint).
     dirty: bool,
     show_outliner: bool,
@@ -365,6 +388,8 @@ impl OpenForgeApp {
             uv: UvEditor::default(),
             anim: Player::new(),
             anim_open: false,
+            key_selected: None,
+            key_drag: None,
             dirty: true,
             show_outliner: true,
             show_properties: true,
@@ -444,15 +469,37 @@ impl OpenForgeApp {
         true
     }
 
-    /// Run a closure that may edit the scene, capturing undo state around it.
+    /// Run a closure that may edit the scene or the clips, capturing undo
+    /// state around it.
     fn with_edit(&mut self, label: &str, f: impl FnOnce(&mut Self)) {
-        let before = self.scene.clone();
+        let before = self.snapshot();
         f(self);
+        let after = self.snapshot();
         // Only record if something actually changed.
-        if !self.scene.content_eq(&before) {
-            self.undo.push(label, before, self.scene.clone());
+        if !after.same(&before) {
+            self.undo.push(label, before, after);
             self.dirty = true;
         }
+    }
+
+    /// The current undo snapshot: the scene and the clip library.
+    fn snapshot(&self) -> AppSnapshot {
+        AppSnapshot {
+            scene: self.scene.clone(),
+            clips: self.anim.library().clone(),
+        }
+    }
+
+    /// Push a scene-only edit: `before` is the scene captured where the
+    /// gesture started. A gesture cannot span a clip edit, so today's library
+    /// is the same one it began with.
+    fn push_scene_edit(&mut self, label: impl Into<String>, before: Scene) {
+        let after = self.snapshot();
+        let before = AppSnapshot {
+            scene: before,
+            clips: after.clips.clone(),
+        };
+        self.undo.push(label, before, after);
     }
 
     // --- Commands -----------------------------------------------------------------
@@ -937,9 +984,12 @@ impl OpenForgeApp {
     }
 
     fn undo_edit(&mut self) {
-        if let Some(scene) = self.undo.undo() {
-            self.scene = scene;
+        if let Some(snapshot) = self.undo.undo() {
+            self.scene = snapshot.scene;
+            *self.anim.library_mut() = snapshot.clips;
             self.selection.clear();
+            self.key_selected = None;
+            self.key_drag = None;
             self.dirty = true;
             self.status = format!(
                 "Undo{}",
@@ -949,9 +999,12 @@ impl OpenForgeApp {
     }
 
     fn redo_edit(&mut self) {
-        if let Some(scene) = self.undo.redo() {
-            self.scene = scene;
+        if let Some(snapshot) = self.undo.redo() {
+            self.scene = snapshot.scene;
+            *self.anim.library_mut() = snapshot.clips;
             self.selection.clear();
+            self.key_selected = None;
+            self.key_drag = None;
             self.dirty = true;
             self.status = format!(
                 "Redo{}",
@@ -2346,7 +2399,7 @@ impl OpenForgeApp {
         // same stack — and a gesture that moved nothing leaves no entry.
         for (label, before) in [gizmo_undo, pending_undo].into_iter().flatten() {
             if !self.scene.content_eq(&before) {
-                self.undo.push(label, before, self.scene.clone());
+                self.push_scene_edit(label, before);
             }
         }
 
@@ -3825,7 +3878,7 @@ impl OpenForgeApp {
                 if response.lost_focus() {
                     if let Some(before) = self.rename_before.take() {
                         if !self.scene.content_eq(&before) {
-                            self.undo.push("Rename", before, self.scene.clone());
+                            self.push_scene_edit("Rename", before);
                         }
                     }
                 }
@@ -3845,7 +3898,7 @@ impl OpenForgeApp {
                 }
             }
             if changed {
-                self.undo.push("Move", before, self.scene.clone());
+                self.push_scene_edit("Move", before);
                 self.dirty = true;
             }
         }
@@ -4342,6 +4395,143 @@ impl OpenForgeApp {
         self.dirty = true;
     }
 
+    /// The clip and node the timeline's key commands work on: the current
+    /// clip, the one selected node, and a track in the clip that drives it.
+    ///
+    /// Every refusal says which of the three is missing.
+    fn key_edit_target(&self) -> Result<(String, NodeId), String> {
+        let Some(clip_name) = self.anim.current_clip_name().map(str::to_string) else {
+            return Err("No clip — Animate ▸ Spin Selected to make one.".into());
+        };
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if ids.len() != 1 {
+            return Err("Select one node to edit its keys.".into());
+        }
+        let id = ids[0];
+        let driven = self
+            .anim
+            .current_clip()
+            .map(|clip| clip.tracks().iter().any(|t| t.target == Some(id)))
+            .unwrap_or(false);
+        if !driven {
+            return Err("The clip does not drive the selected node — key it first.".into());
+        }
+        Ok((clip_name, id))
+    }
+
+    /// Key the selected node's current transform at the playhead: records
+    /// position, rotation and scale into its track, making the track when the
+    /// clip does not drive the node yet.
+    ///
+    /// A key already sitting at that exact time is overwritten, the rule
+    /// `Track::add_key` always applies. One undo step.
+    fn key_transform(&mut self) {
+        let Some(clip_name) = self.anim.current_clip_name().map(str::to_string) else {
+            self.status = "No clip — Animate ▸ Spin Selected to make one.".into();
+            return;
+        };
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if ids.len() != 1 {
+            self.status = "Select one node to key.".into();
+            return;
+        }
+        let id = ids[0];
+        let Ok(node) = self.scene.get(id) else {
+            self.status = "Select one node to key.".into();
+            return;
+        };
+        let transform = node.transform;
+        let name = node.name.clone();
+        let time = self.anim.time;
+        let mut made_track = false;
+        self.with_edit("Key Transform", |app| {
+            let Some(clip) = app.anim.library_mut().clip_mut(&clip_name) else {
+                return;
+            };
+            let index = match clip.tracks().iter().position(|t| t.target == Some(id)) {
+                Some(index) => index,
+                None => {
+                    made_track = true;
+                    clip.add_track(TransformTrack::targeting(id));
+                    clip.tracks().len() - 1
+                }
+            };
+            if let Some(track) = clip.track_mut(index) {
+                track.add_position_key(time, transform.translation, Interp::Linear);
+                track.add_rotation_key(time, transform.rotation, Interp::Linear);
+                track.add_scale_key(time, transform.scale, Interp::Linear);
+            }
+        });
+        self.status = format!(
+            "Keyed {name} at {time:.2} s — 3 component(s){}.",
+            if made_track { ", new track" } else { "" }
+        );
+    }
+
+    /// Move the selected node's key column from `from` to `to`. One undo
+    /// step; a time with no key is refused by name.
+    fn retime_key_column(&mut self, from: f64, to: f64) {
+        let (clip_name, id) = match self.key_edit_target() {
+            Ok(target) => target,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        if from == to {
+            self.status = format!("Key already sits at {to:.2} s.");
+            return;
+        }
+        let mut moved = 0usize;
+        self.with_edit("Retime Key", |app| {
+            let Some(clip) = app.anim.library_mut().clip_mut(&clip_name) else {
+                return;
+            };
+            let index = clip.tracks().iter().position(|t| t.target == Some(id));
+            if let Some(index) = index {
+                if let Some(track) = clip.track_mut(index) {
+                    moved = track.retime_keys(from, to);
+                }
+            }
+        });
+        if moved == 0 {
+            self.status = format!("No key at {from:.2} s.");
+            return;
+        }
+        self.key_selected = Some(to);
+        self.status = format!("Key retimed {from:.2} s → {to:.2} s ({moved} component(s)).");
+    }
+
+    /// Remove the selected node's key column at `time`. One undo step; a time
+    /// with no key is refused by name.
+    fn delete_key_at(&mut self, time: f64) {
+        let (clip_name, id) = match self.key_edit_target() {
+            Ok(target) => target,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        let mut removed = 0usize;
+        self.with_edit("Delete Key", |app| {
+            let Some(clip) = app.anim.library_mut().clip_mut(&clip_name) else {
+                return;
+            };
+            let index = clip.tracks().iter().position(|t| t.target == Some(id));
+            if let Some(index) = index {
+                if let Some(track) = clip.track_mut(index) {
+                    removed = track.remove_keys_at(time);
+                }
+            }
+        });
+        if removed == 0 {
+            self.status = format!("No key at {time:.2} s.");
+            return;
+        }
+        self.key_selected = None;
+        self.status = format!("Deleted the key at {time:.2} s ({removed} component(s)).");
+    }
+
     /// The timeline panel: the clip picker, the transport buttons, and the
     /// scrub slider with the selected clip's key times under it.
     fn handle_timeline(&mut self, ctx: &egui::Context) {
@@ -4392,6 +4582,24 @@ impl OpenForgeApp {
                     self.anim.looping = looping;
                 }
                 ui.separator();
+                if ui
+                    .button("Key")
+                    .on_hover_text("Record the selected node's transform at the playhead")
+                    .clicked()
+                {
+                    self.key_transform();
+                }
+                let picked = self.key_selected;
+                if ui
+                    .add_enabled(picked.is_some(), egui::Button::new("Delete Key"))
+                    .on_hover_text("Remove the key column picked in the row below")
+                    .clicked()
+                {
+                    if let Some(time) = picked {
+                        self.delete_key_at(time);
+                    }
+                }
+                ui.separator();
                 ui.label(self.transport_readout());
             });
 
@@ -4406,12 +4614,138 @@ impl OpenForgeApp {
             if changed {
                 self.scrub_to(time as f64);
             }
-            let keys = self.clip_key_times();
-            if !keys.is_empty() {
-                let ticks: Vec<String> = keys.iter().map(|t| format!("{t:.2}")).collect();
-                ui.label(format!("keys: {}", ticks.join(", ")));
-            }
+            self.handle_key_row(ui, duration);
         });
+    }
+
+    /// The timeline's key row: one diamond per key time of the selected
+    /// node's track in the current clip — the clip's own times, dimmed and
+    /// inert, when no single driven node is selected.
+    ///
+    /// Click a diamond to pick it and scrub there; drag one to slide its whole
+    /// position/rotation/scale column, the release committing one undo step. A
+    /// landing under 5 ms from where the key sits reads as picking it, not as
+    /// a move.
+    fn handle_key_row(&mut self, ui: &mut egui::Ui, duration: f32) {
+        if duration <= 0.0 {
+            self.key_selected = None;
+            self.key_drag = None;
+            return;
+        }
+        let (times, editable) = match self.key_edit_target() {
+            Ok((_, id)) => (
+                self.anim
+                    .current_clip()
+                    .and_then(|clip| clip.tracks().iter().find(|t| t.target == Some(id)))
+                    .map(|track| track.key_times())
+                    .unwrap_or_default(),
+                true,
+            ),
+            Err(_) => (
+                self.clip_key_times().into_iter().map(f64::from).collect(),
+                false,
+            ),
+        };
+        if times.is_empty() && !editable {
+            return;
+        }
+        let (rect, response) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), 24.0),
+            egui::Sense::click_and_drag(),
+        );
+        let painter = ui.painter_at(rect);
+        painter.rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
+        let x_of = |t: f64| rect.left() + (t as f32 / duration) * rect.width();
+        let time_at = |x: f32| {
+            (((x - rect.left()) / rect.width()).clamp(0.0, 1.0) as f64) * f64::from(duration)
+        };
+
+        // The playhead over the row, then the keys: the dragged one fades at
+        // its old time while the accent diamond previews where it will land.
+        let head = x_of(self.anim.time);
+        painter.line_segment(
+            [
+                egui::pos2(head, rect.top()),
+                egui::pos2(head, rect.bottom()),
+            ],
+            egui::Stroke::new(1.0_f32, ui.visuals().weak_text_color()),
+        );
+        let accent = ui.visuals().selection.bg_fill;
+        let normal = ui.visuals().strong_text_color();
+        let dim = ui.visuals().weak_text_color();
+        let landed = self.key_drag.map(|(_, to)| to);
+        let diamond = |painter: &egui::Painter, x: f32, color: egui::Color32| {
+            let r = 4.5;
+            let centre = egui::pos2(x, rect.center().y);
+            painter.add(egui::Shape::convex_polygon(
+                vec![
+                    egui::pos2(centre.x, centre.y - r),
+                    egui::pos2(centre.x + r, centre.y),
+                    egui::pos2(centre.x, centre.y + r),
+                    egui::pos2(centre.x - r, centre.y),
+                ],
+                color,
+                egui::Stroke::new(0.5_f32, color.gamma_multiply(0.6)),
+            ));
+        };
+        for &t in &times {
+            let lifted = self.key_drag.map(|(from, _)| from == t).unwrap_or(false);
+            let color = if lifted {
+                dim
+            } else if self.key_selected == Some(t) {
+                accent
+            } else {
+                normal
+            };
+            diamond(&painter, x_of(t), color);
+        }
+        if let Some(to) = landed {
+            diamond(&painter, x_of(to), accent);
+        }
+        if !editable {
+            self.key_selected = None;
+            self.key_drag = None;
+            return;
+        }
+
+        let grab = |x: f32| {
+            times
+                .iter()
+                .copied()
+                .find(|&t| (x_of(t) - x).abs() <= 6.0)
+        };
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                if let Some(t) = grab(pos.x) {
+                    self.key_drag = Some((t, t));
+                    self.key_selected = Some(t);
+                }
+            }
+        } else if response.dragged() {
+            if let (Some(pos), Some((from, _))) = (response.interact_pointer_pos(), self.key_drag)
+            {
+                self.key_drag = Some((from, time_at(pos.x)));
+                self.dirty = true;
+            }
+        } else if response.drag_stopped() {
+            if let Some((from, to)) = self.key_drag.take() {
+                if (to - from).abs() < 0.005 {
+                    self.scrub_to(from);
+                } else {
+                    self.retime_key_column(from, to);
+                }
+            }
+        } else if response.clicked() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                match grab(pos.x) {
+                    Some(t) => {
+                        self.key_selected = Some(t);
+                        self.scrub_to(t);
+                    }
+                    None => self.key_selected = None,
+                }
+            }
+        }
     }
 
     // --- Game asset prep --------------------------------------------------------
@@ -4901,7 +5235,7 @@ impl OpenForgeApp {
             // A finished move becomes exactly one undo entry.
             if let Some(drag) = self.uv.drag.take() {
                 if !self.scene.content_eq(&drag.before) {
-                    self.undo.push("UV Move", drag.before, self.scene.clone());
+                    self.push_scene_edit("UV Move", drag.before);
                     self.dirty = true;
                     self.status = "Moved UVs.".to_string();
                 }
@@ -8190,5 +8524,88 @@ mod tests {
         assert_eq!(app.tool_entries().len(), 4);
         assert!(app.activate_tool(ActiveTool::Rotate));
         assert_eq!(app.tool, ActiveTool::Rotate);
+    }
+
+    #[test]
+    fn keys_are_recorded_retimed_and_deleted_and_undo_covers_the_clip() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+
+        // The refusals name what is missing, in order.
+        app.key_transform();
+        assert_eq!(app.status, "No clip — Animate ▸ Spin Selected to make one.");
+        let id = app.scene.create_mesh("Cube", primitive_box(1.0));
+        app.selection.select_node(id);
+        app.add_spin_clip();
+        app.selection.clear();
+        app.key_transform();
+        assert_eq!(app.status, "Select one node to key.");
+
+        // The spin's turn is five rotation keys; keying at 0.0 adds the
+        // position and scale components beside them.
+        app.selection.select_node(id);
+        app.key_transform();
+        let track = |app: &OpenForgeApp| -> TransformTrack {
+            app.anim
+                .current_clip()
+                .expect("a clip")
+                .tracks()
+                .iter()
+                .find(|t| t.target == Some(id))
+                .expect("the node's track")
+                .clone()
+        };
+        assert_eq!(app.status, "Keyed Cube at 0.00 s — 3 component(s).");
+        assert_eq!(track(&app).key_times(), vec![0.0, 0.5, 1.0, 1.5, 2.0]);
+        assert_eq!(track(&app).position.len(), 1);
+        assert_eq!(track(&app).rotation.len(), 5);
+        assert_eq!(track(&app).scale.len(), 1);
+
+        // Scrub into the middle, pose the node, key it: a new column appears,
+        // and the clip rides the same undo stack as the scene does.
+        app.scrub_to(0.25);
+        if let Ok(node) = app.scene.get_mut(id) {
+            node.transform.translation = Vec3::new(1.0, 0.5, 0.0);
+        }
+        app.key_transform();
+        assert!(track(&app).key_times().contains(&0.25));
+        assert_eq!(track(&app).position.len(), 2);
+        assert!(app.undo.can_undo());
+        app.undo_edit();
+        assert!(
+            !track(&app).key_times().contains(&0.25),
+            "undo puts the clip back, not just the scene"
+        );
+        app.redo_edit();
+        assert!(track(&app).key_times().contains(&0.25), "redo brings it back");
+
+        // Retime a column: a time with no key is refused by name and leaves
+        // the stack alone; a real move is one step.
+        app.selection.select_node(id);
+        let depth = app.undo.len();
+        app.retime_key_column(0.75, 1.0);
+        assert_eq!(app.status, "No key at 0.75 s.");
+        assert_eq!(app.undo.len(), depth, "a refusal is not an edit");
+
+        app.retime_key_column(0.25, 0.75);
+        assert_eq!(app.status, "Key retimed 0.25 s → 0.75 s (3 component(s)).");
+        assert_eq!(app.key_selected, Some(0.75));
+        assert!(track(&app).key_times().contains(&0.75));
+        assert!(!track(&app).key_times().contains(&0.25));
+        app.undo_edit();
+        assert!(
+            track(&app).key_times().contains(&0.25),
+            "undo slides the column back"
+        );
+
+        // Deleting the column takes all three components out in one step.
+        app.selection.select_node(id);
+        app.delete_key_at(0.25);
+        assert_eq!(app.status, "Deleted the key at 0.25 s (3 component(s)).");
+        assert!(app.key_selected.is_none());
+        assert!(!track(&app).key_times().contains(&0.25));
+        assert_eq!(track(&app).rotation.len(), 5, "the rotation key went too");
+        app.undo_edit();
+        assert!(track(&app).key_times().contains(&0.25));
     }
 }

@@ -67,6 +67,73 @@ impl TransformTrack {
         self.scale.add_key(time, value, interp)
     }
 
+    /// Every time a key sits at, across the three sub-tracks: ascending, no
+    /// duplicates — the columns a key editor moves and deletes as one.
+    pub fn key_times(&self) -> Vec<f64> {
+        let mut times: Vec<f64> = self
+            .position
+            .keys()
+            .iter()
+            .map(|key| key.time)
+            .chain(self.rotation.keys().iter().map(|key| key.time))
+            .chain(self.scale.keys().iter().map(|key| key.time))
+            .collect();
+        times.sort_by(f64::total_cmp);
+        times.dedup();
+        times
+    }
+
+    /// Move every component key sitting at `from` to `to`, returning how many
+    /// moved.
+    ///
+    /// A component without a key at `from` stays put; a key already at `to` in
+    /// that component is displaced, exactly as [`Track::retime_key`]. A
+    /// non-finite `to` moves nothing.
+    pub fn retime_keys(&mut self, from: f64, to: f64) -> usize {
+        if !to.is_finite() {
+            return 0;
+        }
+        let mut moved = 0;
+        if let Some(i) = self.position.index_at(from) {
+            if self.position.retime_key(i, to).is_some() {
+                moved += 1;
+            }
+        }
+        if let Some(i) = self.rotation.index_at(from) {
+            if self.rotation.retime_key(i, to).is_some() {
+                moved += 1;
+            }
+        }
+        if let Some(i) = self.scale.index_at(from) {
+            if self.scale.retime_key(i, to).is_some() {
+                moved += 1;
+            }
+        }
+        moved
+    }
+
+    /// Remove the position, rotation and scale key sitting at `time`,
+    /// returning how many went.
+    pub fn remove_keys_at(&mut self, time: f64) -> usize {
+        let mut removed = 0;
+        if let Some(i) = self.position.index_at(time) {
+            if self.position.remove_key(i).is_some() {
+                removed += 1;
+            }
+        }
+        if let Some(i) = self.rotation.index_at(time) {
+            if self.rotation.remove_key(i).is_some() {
+                removed += 1;
+            }
+        }
+        if let Some(i) = self.scale.index_at(time) {
+            if self.scale.remove_key(i).is_some() {
+                removed += 1;
+            }
+        }
+        removed
+    }
+
     /// Sample the combined transform at `time`.
     ///
     /// Returns `None` only when every sub-track is empty. Empty sub-tracks
@@ -131,6 +198,11 @@ impl Clip {
         self.tracks.get(index)
     }
 
+    /// The transform track at `index`, mutably, or `None` if out of range.
+    pub fn track_mut(&mut self, index: usize) -> Option<&mut TransformTrack> {
+        self.tracks.get_mut(index)
+    }
+
     /// Append a transform track to the clip.
     pub fn add_track(&mut self, track: TransformTrack) {
         self.tracks.push(track);
@@ -169,7 +241,7 @@ impl Clip {
 ///
 /// Clips keep their insertion order. Adding a clip whose name already exists
 /// replaces the previous one in place.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClipLibrary {
     clips: Vec<Clip>,
 }
@@ -394,5 +466,39 @@ mod tests {
 
         library.clear();
         assert!(library.is_empty());
+    }
+
+    #[test]
+    fn key_columns_retime_and_delete_across_the_components() {
+        let mut track = TransformTrack::targeting(node(1));
+        track.add_position_key(0.0, Vec3::ZERO, Interp::Linear);
+        track.add_position_key(1.0, Vec3::X, Interp::Linear);
+        track.add_rotation_key(1.0, Quat::IDENTITY, Interp::Linear);
+        track.add_scale_key(1.0, Vec3::ONE, Interp::Linear);
+        assert_eq!(track.key_times(), vec![0.0, 1.0]);
+
+        // The column at 1.0 moves as one.
+        assert_eq!(track.retime_keys(1.0, 2.0), 3);
+        assert_eq!(track.key_times(), vec![0.0, 2.0]);
+        assert_eq!(
+            track.position.key(1).unwrap().time,
+            2.0,
+            "the position key rode along"
+        );
+        // Mid-way between the moved key and the one left at 0.0 the position
+        // now blends towards X, and the untouched components still sample.
+        let mid = track.sample(1.0).expect("the track samples");
+        assert!(
+            (mid.translation - Vec3::X * 0.5).length() < 1e-6,
+            "{:?}",
+            mid.translation
+        );
+
+        // A time with no key moves nothing; deleting the column takes all
+        // three components back out.
+        assert_eq!(track.retime_keys(0.5, 3.0), 0);
+        assert_eq!(track.remove_keys_at(2.0), 3);
+        assert_eq!(track.key_times(), vec![0.0]);
+        assert_eq!(track.remove_keys_at(2.0), 0, "already gone");
     }
 }
