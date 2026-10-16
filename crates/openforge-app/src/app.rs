@@ -1241,6 +1241,59 @@ impl OpenForgeApp {
         self.status = self.selection_status(if grow { "Grow" } else { "Shrink" });
     }
 
+    /// Add the edge loop through every selected edge (edge level only).
+    fn select_edge_loops(&mut self) {
+        self.walk_edge_selection(true);
+    }
+
+    /// Add the edge ring through every selected edge.
+    fn select_edge_rings(&mut self) {
+        self.walk_edge_selection(false);
+    }
+
+    /// Add the loop (or ring) of every selected edge to the selection.
+    ///
+    /// An edge-level walk, so it refuses at the other levels; each selected
+    /// edge contributes its chain and the picked edges stay picked, which
+    /// makes a second press a no-op.
+    fn walk_edge_selection(&mut self, loop_walk: bool) {
+        let name = if loop_walk { "Loop" } else { "Ring" };
+        if self.selection.level != SelectLevel::Edge {
+            self.status = format!("{name} is an edge-level walk — switch to the edge level first.");
+            return;
+        }
+        let ids = self.selected_mesh_nodes();
+        if ids.is_empty() {
+            self.status = "Select a mesh first.".into();
+            return;
+        }
+        let mut walked = false;
+        for id in ids {
+            let current = self.selection.selected_elements(id).cloned().unwrap_or_default();
+            if current.is_empty() {
+                continue;
+            }
+            walked = true;
+            if let Some(mesh) = self.mesh_copy(id) {
+                let mut out = current.clone();
+                for &edge in &current {
+                    let chain = if loop_walk {
+                        subselect::edge_loop(&mesh, edge)
+                    } else {
+                        subselect::edge_ring(&mesh, edge)
+                    };
+                    out.extend(chain);
+                }
+                self.selection.set_elements(id, out);
+            }
+        }
+        if !walked {
+            self.status = "Select an edge to walk from.".into();
+            return;
+        }
+        self.status = self.selection_status(name);
+    }
+
     /// Hide every selected node and drop it from the selection.
     ///
     /// Hiding is a scene edit — the undo stack records it — and the hidden
@@ -2139,6 +2192,25 @@ impl OpenForgeApp {
                         self.shrink_element_selection();
                         ui.close_menu();
                     }
+                    ui.separator();
+                    let edge_walk = self.selection.level == SelectLevel::Edge
+                        && self.selection.total_element_count() > 0;
+                    if ui
+                        .add_enabled(edge_walk, egui::Button::new("Edge Loop (L)"))
+                        .on_hover_text("Add the loop through every selected edge")
+                        .clicked()
+                    {
+                        self.select_edge_loops();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(edge_walk, egui::Button::new("Edge Ring (Shift+L)"))
+                        .on_hover_text("Add the ring through every selected edge")
+                        .clicked()
+                    {
+                        self.select_edge_rings();
+                        ui.close_menu();
+                    }
                 });
                 ui.menu_button("View", |ui| {
                     if ui.button("Frame All (F)").clicked() {
@@ -2225,6 +2297,13 @@ impl OpenForgeApp {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus)) {
             self.shrink_element_selection();
+        }
+        // Edge walks: the loop through the picked edges, the ring with Shift.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::L)) {
+            self.select_edge_rings();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::L)) {
+            self.select_edge_loops();
         }
         // Visibility.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::H)) {
@@ -2379,6 +2458,8 @@ impl OpenForgeApp {
                 ui.label("Select:");
                 let sub_level = self.selection.level != SelectLevel::Object;
                 let has_mesh = self.active_mesh_node().is_some();
+                let edge_walk = self.selection.level == SelectLevel::Edge
+                    && self.selection.total_element_count() > 0;
                 if ui
                     .button("All")
                     .on_hover_text("Select everything at the current level (Ctrl+A)")
@@ -2413,6 +2494,20 @@ impl OpenForgeApp {
                     .clicked()
                 {
                     self.shrink_element_selection();
+                }
+                if ui
+                    .add_enabled(edge_walk, egui::Button::new("Loop"))
+                    .on_hover_text("Add the edge loop through the selected edges (L)")
+                    .clicked()
+                {
+                    self.select_edge_loops();
+                }
+                if ui
+                    .add_enabled(edge_walk, egui::Button::new("Ring"))
+                    .on_hover_text("Add the edge ring through the selected edges (Shift+L)")
+                    .clicked()
+                {
+                    self.select_edge_rings();
                 }
             });
             // Third row: sub-object modeling operations.
@@ -5102,6 +5197,56 @@ mod tests {
         app.selection.set_elements(id, [0u32, 1]);
         app.shrink_element_selection();
         assert_eq!(app.selection.total_element_count(), 0);
+    }
+
+    #[test]
+    fn the_edge_walks_extend_the_selection_to_the_loop_and_the_ring() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Grid", face_grid());
+        app.selection.level = SelectLevel::Edge;
+        app.selection.select_node(id);
+        app.selection.set_elements(id, [1u32]);
+
+        // The loop carries on straight through four-edge vertices, so from the
+        // middle vertical it is the middle column.
+        app.select_edge_loops();
+        assert_eq!(selected_indices(&app, id), vec![1, 7]);
+        assert_eq!(app.status, "Loop — 2 edge(s) selected.");
+        app.select_edge_loops();
+        assert_eq!(selected_indices(&app, id), vec![1, 7], "a second press changes nothing");
+
+        // The ring is the parallel band the walk crosses quads into.
+        app.selection.set_elements(id, [1u32]);
+        app.select_edge_rings();
+        assert_eq!(selected_indices(&app, id), vec![1, 3, 5]);
+        assert_eq!(app.status, "Ring — 3 edge(s) selected.");
+
+        // Two edges contribute both bands.
+        app.selection.set_elements(id, [1u32, 7]);
+        app.select_edge_rings();
+        assert_eq!(selected_indices(&app, id), vec![1, 3, 5, 7, 9, 10]);
+
+        // The hotkeys drive the same walks.
+        app.selection.set_elements(id, [1u32]);
+        step_with_keys(&ctx, &mut app, key_frame_mods(0.0, egui::Key::L, egui::Modifiers::NONE));
+        assert_eq!(selected_indices(&app, id), vec![1, 7], "L takes the loop");
+        step_with_keys(&ctx, &mut app, key_frame_mods(1.0, egui::Key::L, egui::Modifiers::SHIFT));
+        assert_eq!(
+            selected_indices(&app, id),
+            vec![1, 3, 5, 7, 9, 10],
+            "Shift+L adds the rings of everything picked"
+        );
+
+        // It is an edge-level walk, and it needs an edge to walk from.
+        app.selection.level = SelectLevel::Face;
+        app.select_edge_loops();
+        assert!(app.status.contains("edge-level"), "{}", app.status);
+        app.selection.level = SelectLevel::Edge;
+        app.selection.clear_elements();
+        app.select_edge_rings();
+        assert_eq!(app.status, "Select an edge to walk from.");
     }
 
     #[test]

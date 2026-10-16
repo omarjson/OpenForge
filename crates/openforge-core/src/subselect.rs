@@ -8,7 +8,7 @@
 //! list is [`Mesh::edges`], the one enumeration every picker numbers by, so an
 //! element the visible pass skips contributes no adjacency either.
 
-use crate::mesh::Mesh;
+use crate::mesh::{Face, Mesh};
 use crate::selection::SelectLevel;
 use std::collections::{BTreeSet, HashMap};
 
@@ -72,6 +72,144 @@ pub fn shrink_selection(mesh: &Mesh, level: SelectLevel, current: &BTreeSet<u32>
         })
         .copied()
         .collect()
+}
+
+/// The ring through `start`: the edges parallel to it, walked across the quads
+/// that share it.
+///
+/// A step crosses a quad face to its opposite side; from there the walk
+/// carries on through the face it did not just cross — so it runs around the
+/// mesh rather than straight back — and it stops at a face that is not a quad
+/// or an edge with no further side to cross (a boundary edge has one face).
+pub fn edge_ring(mesh: &Mesh, start: u32) -> BTreeSet<u32> {
+    let edges = mesh.edges();
+    let id_of = edge_ids(&edges);
+    let users = edge_users(mesh, &edges, &id_of);
+    let mut out = BTreeSet::new();
+    let mut frontier: Vec<(u32, Option<usize>)> = vec![(start, None)];
+    while let Some((id, came_from)) = frontier.pop() {
+        if !out.insert(id) {
+            continue;
+        }
+        for &(fi, k) in users.get(id as usize).into_iter().flatten() {
+            if Some(fi) == came_from {
+                continue;
+            }
+            let face = &mesh.faces[fi];
+            if face.corners.len() != 4 {
+                continue;
+            }
+            if let Some(next) = face_edge_id(face, k + 2, &id_of) {
+                frontier.push((next, Some(fi)));
+            }
+        }
+    }
+    out
+}
+
+/// The loop through `start`: the chain that carries on straight through
+/// four-edge vertices.
+///
+/// At an endpoint of the current edge the walk continues only when exactly
+/// four edges meet there, along the one that is neither the current edge nor
+/// one of its two fan neighbours (the other edges of the faces the current
+/// edge borders) — the straight continuation. Any other valence ends the walk,
+/// so a grid's border stops a loop and a cube's three-edge corner does too.
+pub fn edge_loop(mesh: &Mesh, start: u32) -> BTreeSet<u32> {
+    let edges = mesh.edges();
+    let id_of = edge_ids(&edges);
+    let users = edge_users(mesh, &edges, &id_of);
+    let mut by_vertex: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (i, [a, b]) in edges.iter().enumerate() {
+        by_vertex.entry(*a).or_default().push(i as u32);
+        by_vertex.entry(*b).or_default().push(i as u32);
+    }
+    let mut out = BTreeSet::new();
+    let mut frontier = vec![start];
+    while let Some(id) = frontier.pop() {
+        if !out.insert(id) {
+            continue;
+        }
+        let [a, b] = edges[id as usize];
+        for v in [a, b] {
+            let Some(incident) = by_vertex.get(&v) else {
+                continue;
+            };
+            if incident.len() != 4 {
+                continue;
+            }
+            // The current edge's fan neighbours at `v`: the other edges of the
+            // faces it borders that also touch `v`.
+            let mut blocked: BTreeSet<u32> = BTreeSet::new();
+            for &(fi, k) in users.get(id as usize).into_iter().flatten() {
+                let face = &mesh.faces[fi];
+                let n = face.corners.len();
+                let p = face.corners[k].position;
+                let q = face.corners[(k + 1) % n].position;
+                let neighbour = if p == v {
+                    face_edge_id(face, (k + n - 1) % n, &id_of)
+                } else if q == v {
+                    face_edge_id(face, (k + 1) % n, &id_of)
+                } else {
+                    None
+                };
+                if let Some(neighbour) = neighbour {
+                    blocked.insert(neighbour);
+                }
+            }
+            for &other in incident {
+                if other != id && !blocked.contains(&other) {
+                    frontier.push(other);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The edge id of every canonical position pair, so a side found by walking a
+/// face comes back as the id [`Mesh::edges`] gave it.
+fn edge_ids(edges: &[[u32; 2]]) -> HashMap<(u32, u32), u32> {
+    edges
+        .iter()
+        .enumerate()
+        .map(|(i, [a, b])| ((*a, *b), i as u32))
+        .collect()
+}
+
+/// The side at corner `k` of a face (from corner `k` to `k + 1`, wrapping) as
+/// an edge id — `None` for a degenerate pair or one `edges` does not hold.
+fn face_edge_id(face: &Face, k: usize, id_of: &HashMap<(u32, u32), u32>) -> Option<u32> {
+    let n = face.corners.len();
+    let a = face.corners[k % n].position;
+    let b = face.corners[(k + 1) % n].position;
+    if a == b {
+        return None;
+    }
+    let key = if a < b { (a, b) } else { (b, a) };
+    id_of.get(&key).copied()
+}
+
+/// Every `(face index, corner index)` whose side is that edge: the faces an
+/// edge borders and where in each the side sits.
+fn edge_users(
+    mesh: &Mesh,
+    edges: &[[u32; 2]],
+    id_of: &HashMap<(u32, u32), u32>,
+) -> Vec<Vec<(usize, usize)>> {
+    let mut users = vec![Vec::new(); edges.len()];
+    for (fi, face) in mesh.faces.iter().enumerate() {
+        if !mesh.face_is_valid(face) {
+            continue;
+        }
+        let n = face.corners.len();
+        for k in 0..n {
+            if let Some(id) = face_edge_id(face, k, id_of) {
+                users[id as usize].push((fi, k));
+            }
+        }
+    }
+    users
 }
 
 /// The neighbour list of every element at a level, indexed the way the level
@@ -154,7 +292,7 @@ fn dedup(adj: &mut [Vec<u32>]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mesh::{Corner, Face};
+    use crate::mesh::Corner;
     use glam::Vec3;
 
     /// A 2×2 grid of quads on the XY plane: 9 vertices (`y * 3 + x`), four
@@ -279,5 +417,97 @@ mod tests {
         assert_eq!(three, set([0, 1, 2, 3, 4, 5, 6, 7]), "the far corner is four edges away");
         let four = grow_selection(&m, SelectLevel::Vertex, &three);
         assert_eq!(four, all_elements(&m, SelectLevel::Vertex), "four steps cover the grid");
+    }
+
+    /// A unit cube: eight corners (index `z * 4 + y * 2 + x`) and six quads,
+    /// one per side, so every edge borders exactly two faces and every corner
+    /// carries three edges.
+    fn cube() -> Mesh {
+        let mut m = Mesh::new();
+        for z in [0.0f32, 1.0] {
+            for y in [0.0f32, 1.0] {
+                for x in [0.0f32, 1.0] {
+                    m.add_vertex(Vec3::new(x, y, z));
+                }
+            }
+        }
+        m.add_face(&[0, 1, 3, 2]); // bottom (z = 0)
+        m.add_face(&[4, 6, 7, 5]); // top (z = 1)
+        m.add_face(&[0, 4, 5, 1]); // front (y = 0)
+        m.add_face(&[2, 3, 7, 6]); // back (y = 1)
+        m.add_face(&[0, 2, 6, 4]); // left (x = 0)
+        m.add_face(&[1, 5, 7, 3]); // right (x = 1)
+        m
+    }
+
+    #[test]
+    fn a_ring_walks_the_parallel_edges_across_quads() {
+        let m = grid();
+        // Edge 1 is [1, 4], the middle vertical of the lower band: its ring is
+        // that whole band — x = 0, 1, 2 between y = 0 and 1 — because the walk
+        // runs perpendicular to the edge and stops where the grid does.
+        let band = set([1, 3, 5]);
+        assert_eq!(edge_ring(&m, 1), band);
+        // Every member of a ring gives the same ring back: the walk closes.
+        for &e in &[1u32, 3, 5] {
+            assert_eq!(edge_ring(&m, e), band, "from edge {e}");
+        }
+        // Edge 2 ([3, 4]) is a horizontal of the left band: the horizontals at
+        // x = 0..1, and the upper verticals ring the same way.
+        assert_eq!(edge_ring(&m, 2), set([0, 2, 8]));
+        assert_eq!(edge_ring(&m, 7), set([7, 9, 10]));
+    }
+
+    #[test]
+    fn a_loop_runs_straight_through_four_edge_vertices_only() {
+        let m = grid();
+        // Edge 1 ([1, 4]) has four-edge vertex 4 at one end — straight on to
+        // edge 7 ([4, 7]) — and border vertex 1 at the other, which stops it.
+        assert_eq!(edge_loop(&m, 1), set([1, 7]));
+        assert_eq!(edge_loop(&m, 7), set([1, 7]));
+        // The horizontal middle row through vertices 4 and 5.
+        assert_eq!(edge_loop(&m, 2), set([2, 6]));
+        // A border edge runs off the mesh at both ends.
+        assert_eq!(edge_loop(&m, 0), set([0]));
+        // A triangle with one four-edge vertex still ends the walk: the chain
+        // is a property of the vertex fan, not of the edge count alone.
+        assert_eq!(edge_loop(&cube(), 0).len(), 1, "a cube corner carries three edges");
+    }
+
+    #[test]
+    fn every_cube_edge_rings_around_the_cube_and_closes() {
+        let m = cube();
+        let edges = m.edges();
+        assert_eq!(edges.len(), 12, "a cube has twelve edges");
+        for e in 0..edges.len() as u32 {
+            let ring = edge_ring(&m, e);
+            assert_eq!(ring.len(), 4, "a cube ring is four edges: {ring:?} from {e}");
+            assert!(ring.contains(&e));
+            for &member in &ring {
+                assert_eq!(edge_ring(&m, member), ring, "the walk closes through {member}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_ring_stops_at_a_face_that_is_not_a_quad() {
+        let mut m = Mesh::new();
+        for (x, y) in [(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (0.0, 1.0), (1.0, 1.0)] {
+            m.add_vertex(Vec3::new(x, y, 0.0));
+        }
+        m.add_face(&[0, 1, 4, 3]); // a quad
+        m.add_face(&[1, 2, 4]); // a triangle sharing the side [1, 4]
+        let edges = m.edges();
+        let side = |pair: [u32; 2]| {
+            edges
+                .iter()
+                .position(|e| *e == pair)
+                .expect("the side exists") as u32
+        };
+        let shared = side([1, 4]);
+        let opposite = side([0, 3]);
+        // Across the quad the walk lands on the opposite side and stops at the
+        // triangle's other face; through the triangle it never starts.
+        assert_eq!(edge_ring(&m, shared), set([shared, opposite]));
     }
 }
