@@ -4,6 +4,7 @@
 use crate::file_options::{self, FileOptions, UpAxis};
 use crate::gizmo;
 use crate::gpu_viewport::{self, GpuViewport};
+use crate::settings::{Settings, Theme, SHORTCUTS};
 use crate::snap::{self, SnapMode};
 use crate::uv_editor::{self, UvEditor};
 use crate::viewport::{self, Camera};
@@ -369,15 +370,27 @@ pub struct OpenForgeApp {
     rename_before: Option<Scene>,
     /// In-progress free-form tool drag, held here because a drag spans frames.
     tool_drag: Option<DragState>,
+    /// Preferences: the theme, the ground grid and the camera speed
+    /// multipliers, as the Preferences window edits them.
+    settings: Settings,
+    /// The theme the egui context currently carries, so a changed one is
+    /// applied once rather than re-styling every frame.
+    applied_theme: Option<Theme>,
+    /// Whether the Preferences, Keyboard Shortcuts or About window is open.
+    preferences_open: bool,
+    shortcuts_open: bool,
+    about_open: bool,
 }
 
 impl OpenForgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // Dark theme by default; egui respects the native theme otherwise.
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
         // eframe hands us a live wgpu device when it runs the wgpu backend;
         // otherwise `gpu` stays `None` and the CPU painter takes over.
-        Self::with_gpu(cc.wgpu_render_state.as_ref().map(GpuViewport::new))
+        let mut app = Self::with_gpu(cc.wgpu_render_state.as_ref().map(GpuViewport::new));
+        // The default theme is part of the settings now; put it on the real
+        // context (tests apply it to a bare one).
+        app.apply_settings(&cc.egui_ctx);
+        app
     }
 
     /// The initial application state for a given viewport backend.
@@ -441,6 +454,11 @@ impl OpenForgeApp {
             current_material: 0,
             rename_before: None,
             tool_drag: None,
+            settings: Settings::default(),
+            applied_theme: None,
+            preferences_open: false,
+            shortcuts_open: false,
+            about_open: false,
         }
     }
 
@@ -2317,19 +2335,13 @@ impl OpenForgeApp {
         // Camera controls: middle mouse orbits, shift+middle pans, scroll zooms.
         let middle = response.dragged_by(egui::PointerButton::Middle);
         if middle {
-            let d = response.drag_delta();
-            if ui.input(|i| i.modifiers.shift) {
-                self.camera.pan(d.x, d.y);
-            } else {
-                self.camera.orbit(d.x, d.y);
-            }
-            self.dirty = true;
+            let delta = response.drag_delta();
+            self.drag_camera(delta, ui.input(|i| i.modifiers.shift));
         }
         if response.hovered() {
             let scroll = ui.input(|i| i.raw_scroll_delta.y);
             if scroll.abs() > 0.0 {
-                self.camera.zoom(scroll * 0.01);
-                self.dirty = true;
+                self.scroll_camera(scroll);
             }
         }
 
@@ -2721,49 +2733,80 @@ impl OpenForgeApp {
         );
     }
 
-    fn paint_grid(&self, painter: &egui::Painter, vp: glam::Mat4, rect: egui::Rect) {
+    /// Middle-drag on the viewport: orbit, or pan with Shift. The settings'
+    /// multipliers apply, so Preferences can slow the camera down.
+    fn drag_camera(&mut self, delta: egui::Vec2, shift: bool) {
+        if shift {
+            let speed = self.settings.pan_step();
+            self.camera.pan(delta.x * speed, delta.y * speed);
+        } else {
+            let speed = self.settings.orbit_step();
+            self.camera.orbit(delta.x * speed, delta.y * speed);
+        }
+        self.dirty = true;
+    }
+
+    /// Scroll on the viewport: zoom, through the settings' multiplier.
+    fn scroll_camera(&mut self, scroll: f32) {
+        self.camera.zoom(scroll * 0.01 * self.settings.zoom_step());
+        self.dirty = true;
+    }
+
+    /// Paint the ground grid from the settings, returning how many lines were
+    /// drawn (a line with an end off screen draws nothing). Zero while the
+    /// grid is turned off.
+    fn paint_grid(&self, painter: &egui::Painter, vp: glam::Mat4, rect: egui::Rect) -> usize {
+        if !self.settings.show_grid {
+            return 0;
+        }
         let size = [rect.width(), rect.height()];
-        let half = 10;
-        let step = 1.0f32;
         let grid_color = egui::Color32::from_gray(45);
         let axis_x = egui::Color32::from_rgb(180, 70, 70);
         let axis_z = egui::Color32::from_rgb(70, 120, 180);
-        for i in -half..=half {
-            let f = i as f32 * step;
-            // Line parallel to X (varying z).
-            if let (Some(a), Some(b)) = (
-                viewport::project(vp, Vec3::new(-half as f32, 0.0, f), size),
-                viewport::project(vp, Vec3::new(half as f32, 0.0, f), size),
-            ) {
-                let color = if i == 0 { axis_z } else { grid_color };
-                painter.line_segment(
-                    [
-                        egui::pos2(rect.left() + a.0, rect.top() + a.1),
-                        egui::pos2(rect.left() + b.0, rect.top() + b.1),
-                    ],
-                    egui::Stroke::new(if i == 0 { 1.5_f32 } else { 1.0_f32 }, color),
-                );
-            }
-            // Line parallel to Z (varying x).
-            if let (Some(a), Some(b)) = (
-                viewport::project(vp, Vec3::new(f, 0.0, -half as f32), size),
-                viewport::project(vp, Vec3::new(f, 0.0, half as f32), size),
-            ) {
-                let color = if i == 0 { axis_x } else { grid_color };
-                painter.line_segment(
-                    [
-                        egui::pos2(rect.left() + a.0, rect.top() + a.1),
-                        egui::pos2(rect.left() + b.0, rect.top() + b.1),
-                    ],
-                    egui::Stroke::new(if i == 0 { 1.5_f32 } else { 1.0_f32 }, color),
-                );
-            }
+        let mut drawn = 0;
+        for line in self.settings.grid_lines() {
+            let (Some(a), Some(b)) = (
+                viewport::project(vp, line.start, size),
+                viewport::project(vp, line.end, size),
+            ) else {
+                continue;
+            };
+            let color = if line.axis {
+                if line.along_x {
+                    axis_z
+                } else {
+                    axis_x
+                }
+            } else {
+                grid_color
+            };
+            painter.line_segment(
+                [
+                    egui::pos2(rect.left() + a.0, rect.top() + a.1),
+                    egui::pos2(rect.left() + b.0, rect.top() + b.1),
+                ],
+                egui::Stroke::new(if line.axis { 1.5_f32 } else { 1.0_f32 }, color),
+            );
+            drawn += 1;
+        }
+        drawn
+    }
+
+    /// Put the settings that reach the egui context (the theme) in place when
+    /// they changed — not every frame.
+    fn apply_settings(&mut self, ctx: &egui::Context) {
+        if self.applied_theme != Some(self.settings.theme) {
+            self.settings.apply(ctx);
+            self.applied_theme = Some(self.settings.theme);
         }
     }
 }
 
 impl eframe::App for OpenForgeApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // Preferences first: the theme has to be on the context before
+        // anything styles itself this frame.
+        self.apply_settings(ctx);
         // The transport advances on the frame's own clock, before anything
         // paints, so the picture shows the pose it lands on. A hitch (a
         // dragged window, a sleeping machine) must not jump the clip, so the
@@ -2781,6 +2824,9 @@ impl eframe::App for OpenForgeApp {
         self.handle_timeline(ctx);
         self.handle_file_dialog(ctx);
         self.handle_side_panels(ctx);
+        self.handle_preferences(ctx);
+        self.handle_shortcuts_window(ctx);
+        self.handle_about_window(ctx);
         self.handle_central_viewport(ctx, frame.wgpu_render_state());
         self.import_dropped_files(ctx);
         if self.dirty {
@@ -2849,6 +2895,11 @@ impl OpenForgeApp {
                         .clicked()
                     {
                         self.delete_selected();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Preferences…").clicked() {
+                        self.open_preferences();
                         ui.close_menu();
                     }
                 });
@@ -3016,6 +3067,18 @@ impl OpenForgeApp {
                         self.dirty = true;
                         ui.close_menu();
                     }
+                    if ui
+                        .button(format!(
+                            "Ground Grid: {}",
+                            if self.settings.show_grid { "on" } else { "off" }
+                        ))
+                        .on_hover_text("The ground grid's step and reach live in Preferences")
+                        .clicked()
+                    {
+                        self.settings.show_grid = !self.settings.show_grid;
+                        self.dirty = true;
+                        ui.close_menu();
+                    }
                     if ui.button("Reset Camera").clicked() {
                         self.camera = Camera::default();
                         self.dirty = true;
@@ -3038,6 +3101,15 @@ impl OpenForgeApp {
                 ui.menu_button("Help", |ui| {
                     ui.label("OpenForge — clean-room open-source 3D modeler.");
                     ui.label("A from-scratch reimplementation of a node/scene editing model.");
+                    ui.separator();
+                    if ui.button("Keyboard Shortcuts…").clicked() {
+                        self.open_shortcuts();
+                        ui.close_menu();
+                    }
+                    if ui.button("About OpenForge").clicked() {
+                        self.open_about();
+                        ui.close_menu();
+                    }
                 });
             });
         });
@@ -3117,18 +3189,13 @@ impl OpenForgeApp {
             self.duplicate_selected();
         }
         // Tool hotkeys — through the registry, so a hotkey for a disabled
-        // tool refuses out loud rather than leaving a dead selection.
-        if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
-            self.activate_tool(ActiveTool::Select);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::W)) {
-            self.activate_tool(ActiveTool::Move);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::E)) {
-            self.activate_tool(ActiveTool::Scale);
-        }
-        if ctx.input(|i| i.key_pressed(egui::Key::R)) {
-            self.activate_tool(ActiveTool::Rotate);
+        // tool refuses out loud rather than leaving a dead selection. The keys
+        // are the same `ActiveTool::hotkey` the toolbar prints and the
+        // shortcuts window lists, so the three cannot drift apart.
+        for tool in ActiveTool::all() {
+            if ctx.input(|i| i.key_pressed(tool.hotkey())) {
+                self.activate_tool(tool);
+            }
         }
         // Modeling hotkeys (sub-object ops).
         if ctx.input(|i| i.key_pressed(egui::Key::X)) {
@@ -3607,6 +3674,166 @@ impl OpenForgeApp {
         } else if cancelled {
             self.cancel_pending();
         }
+    }
+
+    /// Open the Preferences window (Edit ▸ Preferences…).
+    fn open_preferences(&mut self) {
+        self.preferences_open = true;
+    }
+
+    /// The Preferences window: theme, ground grid, camera speeds, reset.
+    fn handle_preferences(&mut self, ctx: &egui::Context) {
+        if !self.preferences_open {
+            return;
+        }
+        let mut open = self.preferences_open;
+        egui::Window::new("Preferences")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Theme:");
+                    for theme in Theme::all() {
+                        ui.selectable_value(&mut self.settings.theme, theme, theme.label());
+                    }
+                });
+                ui.separator();
+                ui.checkbox(&mut self.settings.show_grid, "Show the ground grid");
+                ui.horizontal(|ui| {
+                    ui.label("Grid step:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.grid_step)
+                            .speed(0.1)
+                            .range(0.1..=10.0)
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text("World units between grid lines");
+                    ui.label("lines each way:");
+                    ui.add(egui::DragValue::new(&mut self.settings.grid_half).range(1..=64));
+                });
+                ui.separator();
+                ui.label("Camera");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Orbit ×");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.orbit_speed)
+                            .speed(0.05)
+                            .range(0.1..=4.0),
+                    );
+                    ui.label("Pan ×");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.pan_speed)
+                            .speed(0.05)
+                            .range(0.1..=4.0),
+                    );
+                    ui.label("Zoom ×");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.zoom_speed)
+                            .speed(0.05)
+                            .range(0.1..=4.0),
+                    );
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Reset to defaults").clicked() {
+                        self.settings.reset();
+                        self.status = "Preferences reset to their defaults.".into();
+                        self.dirty = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        self.preferences_open = false;
+                    }
+                });
+            });
+        self.preferences_open = self.preferences_open && open;
+    }
+
+    /// Every shortcut the Keyboard Shortcuts window lists: the fixed table,
+    /// then one row per tool, keyed the way the frame reads them (the same
+    /// `ActiveTool` the toolbar and the registry names share).
+    fn shortcut_rows(&self) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = SHORTCUTS
+            .iter()
+            .map(|(keys, action)| ((*keys).to_string(), (*action).to_string()))
+            .collect();
+        for tool in ActiveTool::all() {
+            rows.push((
+                format!("{:?}", tool.hotkey()),
+                format!("{} tool", tool.registry_name()),
+            ));
+        }
+        rows
+    }
+
+    /// Open the Keyboard Shortcuts window (Help ▸ Keyboard Shortcuts…).
+    fn open_shortcuts(&mut self) {
+        self.shortcuts_open = true;
+    }
+
+    /// The Keyboard Shortcuts window: the table `shortcut_rows` builds.
+    fn handle_shortcuts_window(&mut self, ctx: &egui::Context) {
+        if !self.shortcuts_open {
+            return;
+        }
+        let mut open = self.shortcuts_open;
+        egui::Window::new("Keyboard Shortcuts")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(380.0)
+            .show(ctx, |ui| {
+                let rows = self.shortcut_rows();
+                egui::Grid::new("shortcut_rows")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        for (keys, action) in rows {
+                            ui.monospace(keys);
+                            ui.label(action);
+                            ui.end_row();
+                        }
+                    });
+            });
+        self.shortcuts_open = self.shortcuts_open && open;
+    }
+
+    /// What the About window says: name, version, licence, and the one
+    /// promise that matters (nothing proprietary is shipped).
+    fn about_lines(&self) -> Vec<String> {
+        vec![
+            format!("OpenForge {}", env!("CARGO_PKG_VERSION")),
+            "A clean-room, open-source 3D modeler.".to_string(),
+            "Open source under MIT OR Apache-2.0.".to_string(),
+            "Only standard, openly-documented formats — no proprietary formats, assets or code."
+                .to_string(),
+        ]
+    }
+
+    /// Open the About window (Help ▸ About OpenForge).
+    fn open_about(&mut self) {
+        self.about_open = true;
+    }
+
+    /// The About window: the lines `about_lines` builds.
+    fn handle_about_window(&mut self, ctx: &egui::Context) {
+        if !self.about_open {
+            return;
+        }
+        let mut open = self.about_open;
+        egui::Window::new("About OpenForge")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(360.0)
+            .show(ctx, |ui| {
+                for line in self.about_lines() {
+                    ui.label(line);
+                }
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    self.about_open = false;
+                }
+            });
+        self.about_open = self.about_open && open;
     }
 
     fn handle_side_panels(&mut self, ctx: &egui::Context) {
@@ -8980,5 +9207,135 @@ mod tests {
             "undo restores the weights"
         );
         assert_eq!(influences(&app, target), target_before, "and the blend stays");
+    }
+
+    #[test]
+    fn the_theme_and_the_grid_settings_reach_the_frame() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+
+        // The theme lands on the context, once per change.
+        app.apply_settings(&ctx);
+        assert!(ctx.style().visuals.dark_mode, "dark by default");
+        app.settings.theme = Theme::Light;
+        app.apply_settings(&ctx);
+        assert!(!ctx.style().visuals.dark_mode, "Light is applied");
+        app.settings.theme = Theme::Dark;
+        app.apply_settings(&ctx);
+        assert!(ctx.style().visuals.dark_mode, "and Dark comes back");
+
+        // The ground grid follows the settings: count the lines the painter
+        // actually draws through a real view-projection.
+        app.settings.grid_half = 2;
+        let vp = app.camera.view_proj(800.0 / 600.0);
+        let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
+        let mut drawn = 0;
+        let _ = ctx.run(frame(0.0, egui::pos2(10.0, 10.0), None), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("grid-test"),
+            ));
+            drawn = app.paint_grid(&painter, vp, rect);
+        });
+        assert_eq!(drawn, 10, "five lines each way");
+
+        app.settings.show_grid = false;
+        let mut off = 1;
+        let _ = ctx.run(frame(0.1, egui::pos2(10.0, 10.0), None), |ctx| {
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Background,
+                egui::Id::new("grid-test"),
+            ));
+            off = app.paint_grid(&painter, vp, rect);
+        });
+        assert_eq!(off, 0, "turned off, nothing is drawn");
+    }
+
+    #[test]
+    fn the_camera_speed_multipliers_scale_the_drag() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let base = app.camera;
+
+        app.drag_camera(egui::vec2(10.0, 0.0), false);
+        let single = app.camera.yaw - base.yaw;
+        assert!(single > 0.0, "the drag orbited");
+
+        app.camera = base;
+        app.settings.orbit_speed = 2.0;
+        app.drag_camera(egui::vec2(10.0, 0.0), false);
+        let doubled = app.camera.yaw - base.yaw;
+        assert!((doubled - single * 2.0).abs() < 1e-5, "{doubled} vs {single}");
+
+        // Pan moves the target, through its own multiplier.
+        app.camera = base;
+        app.settings.orbit_speed = 1.0;
+        app.drag_camera(egui::vec2(0.0, 8.0), true);
+        let slow = (app.camera.target - base.target).length();
+        app.camera = base;
+        app.settings.pan_speed = 3.0;
+        app.drag_camera(egui::vec2(0.0, 8.0), true);
+        let fast = (app.camera.target - base.target).length();
+        assert!((fast - slow * 3.0).abs() < 1e-4, "{fast} vs {slow}");
+
+        // Zoom: the faster wheel takes a bigger step, and silly values are
+        // ignored rather than stranding the camera.
+        app.settings.pan_speed = 1.0;
+        app.camera = base;
+        app.scroll_camera(1.0);
+        let slow_step = base.distance - app.camera.distance;
+        app.camera = base;
+        app.settings.zoom_speed = 2.0;
+        app.scroll_camera(1.0);
+        let fast_step = base.distance - app.camera.distance;
+        assert!(fast_step > slow_step, "{fast_step} vs {slow_step}");
+        app.settings.zoom_speed = 0.0;
+        assert_eq!(app.settings.zoom_step(), 1.0, "a zero speed reads as the default");
+        assert!(app.dirty, "a camera move asks for another frame");
+    }
+
+    #[test]
+    fn the_shortcut_rows_come_from_the_table_and_the_tool_hotkeys() {
+        let app = OpenForgeApp::with_gpu(None);
+        let rows = app.shortcut_rows();
+        assert_eq!(rows.len(), SHORTCUTS.len() + ActiveTool::all().len());
+        for (keys, action) in SHORTCUTS {
+            let row = rows.iter().find(|(row_keys, _)| row_keys == keys).expect("a table row");
+            assert_eq!(&row.1, action);
+        }
+        for tool in ActiveTool::all() {
+            let key = format!("{:?}", tool.hotkey());
+            let action = format!("{} tool", tool.registry_name());
+            assert!(
+                rows.iter().any(|(row_keys, row_action)| *row_keys == key && *row_action == action),
+                "{key} / {action} is missing"
+            );
+        }
+        let tool_keys: Vec<String> =
+            ActiveTool::all().iter().map(|tool| format!("{:?}", tool.hotkey())).collect();
+        assert_eq!(tool_keys, vec!["Q", "W", "E", "R"], "the hotkeys the frame reads");
+    }
+
+    #[test]
+    fn the_help_windows_paint_without_a_display() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.open_preferences();
+        app.open_shortcuts();
+        app.open_about();
+        let output = ctx.run(frame(0.0, egui::pos2(500.0, 350.0), None), |ctx| {
+            app.handle_preferences(ctx);
+            app.handle_shortcuts_window(ctx);
+            app.handle_about_window(ctx);
+        });
+        assert!(!output.shapes.is_empty(), "the three windows painted");
+
+        let lines = app.about_lines();
+        assert_eq!(
+            lines[0],
+            format!("OpenForge {}", env!("CARGO_PKG_VERSION")),
+            "{lines:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("MIT OR Apache-2.0")));
+        assert!(lines.iter().any(|line| line.contains("no proprietary")));
     }
 }

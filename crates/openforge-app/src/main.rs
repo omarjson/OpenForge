@@ -6,6 +6,7 @@ mod app;
 mod file_options;
 mod gizmo;
 mod gpu_viewport;
+mod settings;
 mod snap;
 mod uv_editor;
 mod viewport;
