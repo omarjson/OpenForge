@@ -79,6 +79,16 @@ impl Selection {
         self.elements.entry(id).or_default().extend(idx);
     }
 
+    /// Replace the element selection of one node.
+    ///
+    /// Unlike [`select_elements`](Self::select_elements), which adds, this is
+    /// for whole-set operations — invert, grow, select-all — where the old
+    /// indices must not survive.
+    pub fn set_elements(&mut self, id: NodeId, idx: impl IntoIterator<Item = u32>) {
+        self.nodes.insert(id);
+        self.elements.insert(id, idx.into_iter().collect());
+    }
+
     pub fn selected_elements(&self, id: NodeId) -> Option<&BTreeSet<u32>> {
         self.elements.get(&id)
     }
@@ -148,6 +158,20 @@ mod tests {
             "an edge index must not read as a face"
         );
         assert_eq!(s.element_count(id), 3, "the indices themselves are untouched");
+    }
+
+    #[test]
+    fn set_elements_replaces_rather_than_adds() {
+        let mut s = Selection::new();
+        let id = NodeId(7);
+        s.select_elements(id, [0u32, 1, 2]);
+        s.set_elements(id, [3u32]);
+        assert_eq!(
+            s.selected_elements(id).map(|e| e.iter().copied().collect::<Vec<_>>()),
+            Some(vec![3]),
+            "the old indices are gone"
+        );
+        assert!(s.is_node_selected(id), "the node stays the one being edited");
     }
 
     #[test]

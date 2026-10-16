@@ -194,10 +194,10 @@ impl Mesh {
         let mut out: Vec<[u32; 2]> = Vec::new();
         let mut seen: HashSet<(u32, u32)> = HashSet::new();
         for face in &self.faces {
-            let n = face.corners.len();
-            if n < 3 || face.corners.iter().any(|c| c.position as usize >= self.positions.len()) {
+            if !self.face_is_valid(face) {
                 continue;
             }
+            let n = face.corners.len();
             for k in 0..n {
                 let a = face.corners[k].position;
                 let b = face.corners[(k + 1) % n].position;
@@ -211,6 +211,21 @@ impl Mesh {
             }
         }
         out
+    }
+
+    /// Whether a face is one the visible pass draws at all.
+    ///
+    /// A face with fewer than three corners, or with a corner outside
+    /// [`positions`](Self::positions), is skipped whole: none of its sides
+    /// exist and none of its corners counts. [`edges`](Self::edges) and the
+    /// selection maths ([`crate::subselect`]) both go through this, so what
+    /// cannot be drawn cannot be selected either.
+    pub fn face_is_valid(&self, face: &Face) -> bool {
+        face.corners.len() >= 3
+            && face
+                .corners
+                .iter()
+                .all(|c| (c.position as usize) < self.positions.len())
     }
 
     /// Delete faces whose index is in `faces`, then drop unreferenced

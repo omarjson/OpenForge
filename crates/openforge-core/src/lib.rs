@@ -11,6 +11,7 @@ pub mod mesh;
 pub mod node;
 pub mod scene;
 pub mod selection;
+pub mod subselect;
 pub mod undo;
 pub mod tool;
 

@@ -13,6 +13,7 @@ use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
 use openforge_core::scene::Scene;
 use openforge_core::selection::{SelectLevel, Selection};
+use openforge_core::subselect;
 use openforge_core::tool::{
     DragState, Pointer, SelectTool, Tool, ToolContext, TransformMode,
 };
@@ -1078,6 +1079,236 @@ impl OpenForgeApp {
         }
     }
 
+    // --- Selection tools -------------------------------------------------------
+
+    /// The word the selection statuses use for a level's elements.
+    fn element_word(level: SelectLevel) -> &'static str {
+        match level {
+            SelectLevel::Object => "node",
+            SelectLevel::Vertex => "vertex",
+            SelectLevel::Edge => "edge",
+            SelectLevel::Face => "face",
+        }
+    }
+
+    /// The mesh nodes a Select action applies to: every selected mesh node.
+    ///
+    /// Sub-object selections belong to a node, so the actions that step one
+    /// run on the meshes being edited, exactly like the modeling ops.
+    fn selected_mesh_nodes(&self) -> Vec<NodeId> {
+        self.selection
+            .selected_nodes()
+            .filter(|id| self.scene.get(*id).map(|n| n.is_mesh()).unwrap_or(false))
+            .collect()
+    }
+
+    /// The node's mesh, cloned, for maths that reads it while the selection is
+    /// updated.
+    fn mesh_copy(&self, id: NodeId) -> Option<openforge_core::mesh::Mesh> {
+        self.scene.get(id).ok().and_then(|n| n.mesh().cloned())
+    }
+
+    /// "Select All — 12 face(s) selected."
+    fn selection_status(&self, action: &str) -> String {
+        format!(
+            "{action} — {} {}(s) selected.",
+            self.selection.total_element_count(),
+            Self::element_word(self.selection.level)
+        )
+    }
+
+    /// Select every element of the current level.
+    ///
+    /// At the object level that is every visible node; at a sub-object level
+    /// every element of the meshes being edited, through
+    /// [`openforge_core::subselect::all_elements`] — the same lists the
+    /// pickers answer from, so "all" is exactly what can be picked.
+    fn select_all_elements(&mut self) {
+        if self.selection.level == SelectLevel::Object {
+            let ids: Vec<NodeId> = self
+                .scene
+                .iter()
+                .filter(|n| n.visible)
+                .map(|n| n.id)
+                .collect();
+            for id in ids {
+                self.selection.select_node(id);
+            }
+            self.status = format!("Select All — {} node(s) selected.", self.selection.node_count());
+            return;
+        }
+        let ids = self.selected_mesh_nodes();
+        if ids.is_empty() {
+            self.status = "Select a mesh first.".into();
+            return;
+        }
+        let level = self.selection.level;
+        for id in ids {
+            let all = self.mesh_copy(id).map(|m| subselect::all_elements(&m, level));
+            if let Some(all) = all {
+                self.selection.set_elements(id, all);
+            }
+        }
+        self.status = self.selection_status("Select All");
+    }
+
+    /// Drop the element selection, keeping the nodes being edited.
+    fn clear_element_selection(&mut self) {
+        if self.selection.level == SelectLevel::Object {
+            self.selection.clear();
+            self.status = "Select None — nothing selected.".into();
+            return;
+        }
+        self.selection.clear_elements();
+        self.status = format!(
+            "Select None — no {}(s) selected.",
+            Self::element_word(self.selection.level)
+        );
+    }
+
+    /// Flip the element selection at the current level.
+    fn invert_element_selection(&mut self) {
+        if self.selection.level == SelectLevel::Object {
+            let ids: Vec<NodeId> = self
+                .scene
+                .iter()
+                .filter(|n| n.visible)
+                .map(|n| n.id)
+                .collect();
+            for id in ids {
+                self.selection.toggle_node(id);
+            }
+            self.status = format!("Invert — {} node(s) selected.", self.selection.node_count());
+            return;
+        }
+        let ids = self.selected_mesh_nodes();
+        if ids.is_empty() {
+            self.status = "Select a mesh first.".into();
+            return;
+        }
+        let level = self.selection.level;
+        for id in ids {
+            let current = self.selection.selected_elements(id).cloned().unwrap_or_default();
+            let flipped = self
+                .mesh_copy(id)
+                .map(|m| subselect::invert_selection(&m, level, &current));
+            if let Some(flipped) = flipped {
+                self.selection.set_elements(id, flipped);
+            }
+        }
+        self.status = self.selection_status("Invert");
+    }
+
+    /// Grow the element selection to everything adjacent to it.
+    fn grow_element_selection(&mut self) {
+        self.step_element_selection(true);
+    }
+
+    /// Shrink the element selection to what no outside neighbour touches.
+    fn shrink_element_selection(&mut self) {
+        self.step_element_selection(false);
+    }
+
+    /// One grow or shrink step on every mesh being edited.
+    ///
+    /// The object level has no topology to step along, and an empty element
+    /// selection has no seed, so both are status messages rather than an
+    /// error: the frame simply keeps showing what it showed.
+    fn step_element_selection(&mut self, grow: bool) {
+        if self.selection.level == SelectLevel::Object {
+            self.status = "Growing and shrinking work at the vertex, edge and face levels.".into();
+            return;
+        }
+        let ids = self.selected_mesh_nodes();
+        if ids.is_empty() {
+            self.status = "Select a mesh first.".into();
+            return;
+        }
+        let level = self.selection.level;
+        for id in ids {
+            let current = self.selection.selected_elements(id).cloned().unwrap_or_default();
+            let next = self.mesh_copy(id).map(|m| {
+                if grow {
+                    subselect::grow_selection(&m, level, &current)
+                } else {
+                    subselect::shrink_selection(&m, level, &current)
+                }
+            });
+            if let Some(next) = next {
+                self.selection.set_elements(id, next);
+            }
+        }
+        self.status = self.selection_status(if grow { "Grow" } else { "Shrink" });
+    }
+
+    /// Hide every selected node and drop it from the selection.
+    ///
+    /// Hiding is a scene edit — the undo stack records it — and the hidden
+    /// node leaves the selection, so the gizmo does not sit on something the
+    /// frame no longer draws.
+    fn hide_selected_nodes(&mut self) {
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if ids.is_empty() {
+            self.status = "Select a node to hide.".into();
+            return;
+        }
+        self.with_edit("Hide Selected", |app| {
+            for id in &ids {
+                if let Ok(node) = app.scene.get_mut(*id) {
+                    node.visible = false;
+                }
+            }
+        });
+        for id in &ids {
+            self.selection.deselect_node(*id);
+        }
+        self.status = format!("Hidden {} node(s).", ids.len());
+    }
+
+    /// Show only the selected nodes: everything else is hidden.
+    ///
+    /// The selection is kept — this is the "work on this one piece" view — and
+    /// the whole thing is one undo step.
+    fn isolate_selected_nodes(&mut self) {
+        let keep: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if keep.is_empty() {
+            self.status = "Select a node to isolate.".into();
+            return;
+        }
+        let all: Vec<NodeId> = self.scene.iter().map(|n| n.id).collect();
+        self.with_edit("Isolate", |app| {
+            for id in &all {
+                if let Ok(node) = app.scene.get_mut(*id) {
+                    node.visible = keep.contains(id);
+                }
+            }
+        });
+        let hidden = all.len() - keep.len();
+        self.status = format!("Isolate — {} node(s) visible, {hidden} hidden.", keep.len());
+    }
+
+    /// Make every hidden node visible again.
+    fn unhide_all_nodes(&mut self) {
+        let hidden: Vec<NodeId> = self
+            .scene
+            .iter()
+            .filter(|n| !n.visible)
+            .map(|n| n.id)
+            .collect();
+        if hidden.is_empty() {
+            self.status = "Every node is already visible.".into();
+            return;
+        }
+        self.with_edit("Unhide All", |app| {
+            for id in &hidden {
+                if let Ok(node) = app.scene.get_mut(*id) {
+                    node.visible = true;
+                }
+            }
+        });
+        self.status = format!("Unhidden {} node(s).", hidden.len());
+    }
+
     /// Whether any mesh node in the scene uses `slot`.
     fn material_in_use(&self, slot: u32) -> bool {
         self.scene.iter().filter(|n| n.is_mesh()).any(|n| {
@@ -1877,6 +2108,38 @@ impl OpenForgeApp {
                         }
                     }
                 });
+                ui.menu_button("Select", |ui| {
+                    let sub_level = self.selection.level != SelectLevel::Object;
+                    if ui.button("All (Ctrl+A)").clicked() {
+                        self.select_all_elements();
+                        ui.close_menu();
+                    }
+                    if ui.button("None (Ctrl+Shift+A)").clicked() {
+                        self.clear_element_selection();
+                        ui.close_menu();
+                    }
+                    if ui.button("Invert (Ctrl+I)").clicked() {
+                        self.invert_element_selection();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(sub_level, egui::Button::new("Grow (Ctrl+Plus)"))
+                        .on_hover_text("Add everything adjacent to the selection")
+                        .clicked()
+                    {
+                        self.grow_element_selection();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(sub_level, egui::Button::new("Shrink (Ctrl+Minus)"))
+                        .on_hover_text("Drop what touches an unselected neighbour")
+                        .clicked()
+                    {
+                        self.shrink_element_selection();
+                        ui.close_menu();
+                    }
+                });
                 ui.menu_button("View", |ui| {
                     if ui.button("Frame All (F)").clicked() {
                         self.frame_all();
@@ -1898,6 +2161,19 @@ impl OpenForgeApp {
                     if ui.button("Reset Camera").clicked() {
                         self.camera = Camera::default();
                         self.dirty = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Hide Selected (H)").clicked() {
+                        self.hide_selected_nodes();
+                        ui.close_menu();
+                    }
+                    if ui.button("Isolate Selected (Shift+H)").clicked() {
+                        self.isolate_selected_nodes();
+                        ui.close_menu();
+                    }
+                    if ui.button("Unhide All (U)").clicked() {
+                        self.unhide_all_nodes();
                         ui.close_menu();
                     }
                 });
@@ -1930,6 +2206,35 @@ impl OpenForgeApp {
         if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
             self.wireframe = self.wireframe.next();
             self.dirty = true;
+        }
+        // Selection tools. Ctrl+Shift+A is checked on its own: egui's
+        // `consume_key` matches modifiers exactly, so the two never collide.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::A)) {
+            self.clear_element_selection();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::A)) {
+            self.select_all_elements();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::I)) {
+            self.invert_element_selection();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Plus))
+            || ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Equals))
+        {
+            self.grow_element_selection();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Minus)) {
+            self.shrink_element_selection();
+        }
+        // Visibility.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::H)) {
+            self.isolate_selected_nodes();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::H)) {
+            self.hide_selected_nodes();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::U)) {
+            self.unhide_all_nodes();
         }
         // Snapping: G cycles Off → Grid → Vertex.
         if ctx.input(|i| i.key_pressed(egui::Key::G)) {
@@ -2068,7 +2373,49 @@ impl OpenForgeApp {
                     .on_hover_text("Scale factor step");
                 }
             });
-            // Second row: sub-object modeling operations.
+            // Second row: selection tools, at every level.
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label("Select:");
+                let sub_level = self.selection.level != SelectLevel::Object;
+                let has_mesh = self.active_mesh_node().is_some();
+                if ui
+                    .button("All")
+                    .on_hover_text("Select everything at the current level (Ctrl+A)")
+                    .clicked()
+                {
+                    self.select_all_elements();
+                }
+                if ui
+                    .add_enabled(!self.selection.is_empty(), egui::Button::new("None"))
+                    .on_hover_text("Drop the selection (Ctrl+Shift+A)")
+                    .clicked()
+                {
+                    self.clear_element_selection();
+                }
+                if ui
+                    .add_enabled(!self.selection.is_empty(), egui::Button::new("Invert"))
+                    .on_hover_text("Flip the selection (Ctrl+I)")
+                    .clicked()
+                {
+                    self.invert_element_selection();
+                }
+                if ui
+                    .add_enabled(has_mesh && sub_level, egui::Button::new("Grow"))
+                    .on_hover_text("Add everything adjacent to the selection (Ctrl+Plus)")
+                    .clicked()
+                {
+                    self.grow_element_selection();
+                }
+                if ui
+                    .add_enabled(has_mesh && sub_level, egui::Button::new("Shrink"))
+                    .on_hover_text("Drop what touches an unselected neighbour (Ctrl+Minus)")
+                    .clicked()
+                {
+                    self.shrink_element_selection();
+                }
+            });
+            // Third row: sub-object modeling operations.
             ui.separator();
             ui.horizontal(|ui| {
                 ui.label("Model:");
@@ -2160,7 +2507,7 @@ impl OpenForgeApp {
                     self.mirror_selected(Vec3::Z);
                 }
             });
-            // Third row: deformers and boolean operations.
+            // Fourth row: deformers and boolean operations.
             ui.separator();
             ui.horizontal(|ui| {
                 let has_mesh = self.active_mesh_node().is_some();
@@ -3621,6 +3968,21 @@ mod tests {
         input
     }
 
+    /// A frame carrying one key press with modifiers (egui's `consume_key`
+    /// matches modifiers exactly, so Ctrl+A and Ctrl+Shift+A arrive apart).
+    fn key_frame_mods(time: f64, key: egui::Key, modifiers: egui::Modifiers) -> egui::RawInput {
+        let mut input = frame(time, egui::pos2(500.0, 350.0), None);
+        input.modifiers = modifiers;
+        input.events.push(egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        });
+        input
+    }
+
     /// A frame with Ctrl held down, for the snapping tests.
     fn ctrl_frame(time: f64, pointer: egui::Pos2, click: Option<bool>) -> egui::RawInput {
         let mut input = frame(time, pointer, click);
@@ -3870,6 +4232,23 @@ mod tests {
         m.add_vertex(Vec3::new(1.0, 1.0, 0.0));
         m.add_vertex(Vec3::new(-1.0, 1.0, 0.0));
         m.add_face(&[0, 1, 2, 3]);
+        m
+    }
+
+    /// A 2×2 grid of quads on the XY plane: 9 vertices and four faces — 0
+    /// lower left, 1 lower right, 2 upper left, 3 upper right — so face 0's
+    /// edge neighbours are 1 and 2 while 3 touches it only at a corner.
+    fn face_grid() -> Mesh {
+        let mut m = Mesh::new();
+        for y in 0..3 {
+            for x in 0..3 {
+                m.add_vertex(Vec3::new(x as f32, y as f32, 0.0));
+            }
+        }
+        m.add_face(&[0, 1, 4, 3]);
+        m.add_face(&[1, 2, 5, 4]);
+        m.add_face(&[3, 4, 7, 6]);
+        m.add_face(&[4, 5, 8, 7]);
         m
     }
 
@@ -4606,6 +4985,214 @@ mod tests {
             9,
             "All adds the unselected box's visible edges: {selection} -> {all}"
         );
+    }
+
+    #[test]
+    fn select_all_fills_every_level_and_none_empties_it() {
+        let (mut app, id) = app_ready_to_move();
+        let mesh = app.scene.get(id).unwrap().mesh().unwrap().clone();
+        for (level, count) in [
+            (SelectLevel::Vertex, mesh.positions.len() as u32),
+            (SelectLevel::Edge, mesh.edges().len() as u32),
+            (SelectLevel::Face, mesh.faces.len() as u32),
+        ] {
+            app.selection.level = level;
+            app.selection.clear_elements();
+            app.select_all_elements();
+            assert_eq!(
+                app.selection.total_element_count(),
+                count as usize,
+                "{level:?} level takes every one of its own elements"
+            );
+            assert_eq!(
+                app.status,
+                format!(
+                    "Select All — {count} {}(s) selected.",
+                    OpenForgeApp::element_word(level)
+                )
+            );
+            assert!(app.selection.is_node_selected(id), "the node stays the one edited");
+
+            app.clear_element_selection();
+            assert_eq!(app.selection.total_element_count(), 0, "{level:?} cleared");
+            assert!(app.selection.is_node_selected(id), "clearing elements keeps the node");
+        }
+
+        // The object level selects every visible node, and clears them too.
+        app.selection.level = SelectLevel::Object;
+        app.selection.clear();
+        app.scene.create_mesh("Box", primitive_box(1.0));
+        app.select_all_elements();
+        assert_eq!(app.selection.node_count(), 2, "both meshes");
+        app.clear_element_selection();
+        assert_eq!(app.selection.node_count(), 0, "and none clears the nodes");
+        assert_eq!(app.status, "Select None — nothing selected.");
+    }
+
+    #[test]
+    fn the_select_tools_ask_for_a_mesh_and_the_level() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.selection.level = SelectLevel::Face;
+        app.selection.clear();
+        app.select_all_elements();
+        assert_eq!(app.status, "Select a mesh first.");
+        assert_eq!(app.selection.total_element_count(), 0);
+        app.invert_element_selection();
+        assert_eq!(app.status, "Select a mesh first.");
+        app.grow_element_selection();
+        assert_eq!(app.status, "Select a mesh first.");
+        app.hide_selected_nodes();
+        assert_eq!(app.status, "Select a node to hide.");
+        app.isolate_selected_nodes();
+        assert_eq!(app.status, "Select a node to isolate.");
+        app.unhide_all_nodes();
+        assert_eq!(app.status, "Every node is already visible.");
+
+        // Growing works at the sub-object levels only: there is no topology
+        // between nodes.
+        let (mut app, _id) = app_ready_to_move();
+        app.selection.level = SelectLevel::Object;
+        app.grow_element_selection();
+        assert!(
+            app.status.contains("vertex, edge and face"),
+            "the object level is told where growing works: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn invert_flips_the_element_selection() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Grid", face_grid());
+        app.selection.level = SelectLevel::Face;
+        app.selection.select_node(id);
+        app.selection.set_elements(id, [0u32]);
+
+        app.invert_element_selection();
+        assert_eq!(selected_indices(&app, id), vec![1, 2, 3]);
+        assert_eq!(app.status, "Invert — 3 face(s) selected.");
+        app.invert_element_selection();
+        assert_eq!(selected_indices(&app, id), vec![0], "inverting twice is where it began");
+    }
+
+    #[test]
+    fn grow_and_shrink_step_the_face_selection_on_the_edited_mesh() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Grid", face_grid());
+        app.selection.level = SelectLevel::Face;
+        app.selection.select_node(id);
+        app.selection.set_elements(id, [0u32]);
+
+        app.grow_element_selection();
+        assert_eq!(
+            selected_indices(&app, id),
+            vec![0, 1, 2],
+            "the edge neighbours join; the corner one does not"
+        );
+        assert_eq!(app.status, "Grow — 3 face(s) selected.");
+
+        app.shrink_element_selection();
+        assert_eq!(selected_indices(&app, id), vec![0], "shrink gives the seed back");
+        assert_eq!(app.status, "Shrink — 1 face(s) selected.");
+
+        // Two neighbours of each other still touch unselected faces, so one
+        // step cuts both away.
+        app.selection.set_elements(id, [0u32, 1]);
+        app.shrink_element_selection();
+        assert_eq!(app.selection.total_element_count(), 0);
+    }
+
+    #[test]
+    fn the_selection_hotkeys_drive_the_same_actions() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        let faces = app.scene.get(id).unwrap().mesh().unwrap().faces.len() as u32;
+        app.selection.level = SelectLevel::Face;
+        app.selection.clear_elements();
+
+        step_with_keys(&ctx, &mut app, key_frame_mods(0.0, egui::Key::A, egui::Modifiers::COMMAND));
+        assert_eq!(app.selection.total_element_count(), faces as usize, "Ctrl+A selects all");
+
+        step_with_keys(
+            &ctx,
+            &mut app,
+            key_frame_mods(1.0, egui::Key::A, egui::Modifiers::COMMAND | egui::Modifiers::SHIFT),
+        );
+        assert_eq!(app.selection.total_element_count(), 0, "Ctrl+Shift+A clears");
+
+        step_with_keys(&ctx, &mut app, key_frame_mods(2.0, egui::Key::I, egui::Modifiers::COMMAND));
+        assert_eq!(
+            app.selection.total_element_count(),
+            faces as usize,
+            "Ctrl+I flips the empty set into the whole mesh"
+        );
+
+        // One face, grown and shrunk by key.
+        app.selection.set_elements(id, [0u32]);
+        step_with_keys(&ctx, &mut app, key_frame_mods(3.0, egui::Key::Plus, egui::Modifiers::COMMAND));
+        let grown = app.selection.total_element_count();
+        assert!(grown > 1, "Ctrl+Plus adds the neighbours ({grown})");
+        step_with_keys(&ctx, &mut app, key_frame_mods(4.0, egui::Key::Minus, egui::Modifiers::COMMAND));
+        assert_eq!(selected_indices(&app, id), vec![0], "Ctrl+Minus gives the seed back");
+    }
+
+    #[test]
+    fn hiding_drops_the_node_from_the_selection_and_undo_brings_it_back() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        let box_id = app
+            .scene
+            .create_mesh("Box", primitive_box(1.0));
+        app.selection.clear();
+        app.selection.select_node(box_id);
+        app.wireframe = viewport::Wireframe::All;
+        let before = stroked(&paint_once(&ctx, &mut app, frame(0.0, egui::pos2(60.0, 60.0), None))).0;
+
+        app.hide_selected_nodes();
+        assert!(!app.scene.get(box_id).unwrap().visible, "the box is hidden");
+        assert!(!app.selection.is_node_selected(box_id), "and out of the selection");
+        assert_eq!(app.status, "Hidden 1 node(s).");
+        let after = stroked(&paint_once(&ctx, &mut app, frame(1.0, egui::pos2(60.0, 60.0), None))).0;
+        assert!(
+            after < before,
+            "the frame stops drawing its edges: {before} -> {after}"
+        );
+
+        app.undo_edit();
+        assert!(app.scene.get(box_id).unwrap().visible, "undo shows it again");
+        // Hiding took the node out of the selection (and with it the gizmo);
+        // select it again so the two frames differ in nothing else.
+        app.selection.select_node(box_id);
+        let restored = stroked(&paint_once(&ctx, &mut app, frame(2.0, egui::pos2(60.0, 60.0), None))).0;
+        assert_eq!(restored, before, "and draws it exactly as before");
+    }
+
+    #[test]
+    fn isolate_shows_only_the_selection_and_unhide_restores_everything() {
+        let (mut app, id) = app_ready_to_move();
+        let box_id = app.scene.create_mesh("Box", primitive_box(1.0));
+        app.selection.clear();
+        app.selection.select_node(id);
+
+        app.isolate_selected_nodes();
+        assert!(app.scene.get(id).unwrap().visible, "the selection stays shown");
+        assert!(!app.scene.get(box_id).unwrap().visible, "everything else hides");
+        assert_eq!(app.status, "Isolate — 1 node(s) visible, 1 hidden.");
+
+        app.unhide_all_nodes();
+        assert!(app.scene.get(box_id).unwrap().visible);
+        assert_eq!(app.status, "Unhidden 1 node(s).");
+
+        // Both steps are undoable scene edits.
+        app.undo_edit();
+        assert!(
+            !app.scene.get(box_id).unwrap().visible,
+            "undo puts the isolation back"
+        );
+        app.undo_edit();
+        assert!(app.scene.get(box_id).unwrap().visible, "and undo shows it again");
     }
 
     #[test]
