@@ -42,22 +42,22 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (509 `#[test]` fns; 511 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (534 `#[test]` fns; 536 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 32 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs. |
+| `openforge-core` | 38 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by. |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
-| `openforge-render` | 98 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking — a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
+| `openforge-render` | 102 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking — faces as triangles, edges as lines, vertices as points, through a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 53 | Planar/cylindrical/spherical/box projections, unwrap, pack, **UV islands by continuity with per-island atlas packing** (`islands.rs`), plus per-selection affine edits for the UV editor. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 138 (bin) | eframe/egui GUI. `app.rs` (~4600 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). |
+| `openforge-app` | 153 (bin) | eframe/egui GUI. `app.rs` (~4700 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -123,17 +123,22 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   the same convention wgpu samples. Only the **UV editor** flips (`v = 0` at the
   *bottom* of the tile), because it draws the UV space v-up.
 - **Sub-object picking is a GPU ID pass first, the CPU raycast second.** A
-  face/vertex-level click in the wgpu viewport goes through `GpuRenderer::pick`
-  (`pick.rs` owns the geometry, the element table and the patch maths — no wgpu
-  types, so all of it is headless-testable; the pass itself lives in `gpu.rs`)
-  and only falls back to `viewport::pick_face` / `viewport::pick_vertex` when
-  there is no wgpu backend or the patch holds nothing the current level can use
-  (`gpu_viewport::chosen_hit`). The pass draws the frame's own geometry with the
-  frame's culling and depth test into a separate, single-sampled `R32Uint`
-  target, so a click can never land on something the image does not show — an
-  occluded vertex stays unpicked and a back-culled face is gone. Ids are
-  1-based (`0` is the clear value), a patch is clipped at the viewport edges,
-  and its readback rows are padded to wgpu's 256-byte copy alignment. See §8.
+  face/vertex/edge-level click in the wgpu viewport goes through
+  `GpuRenderer::pick` (`pick.rs` owns the geometry, the element table and the
+  patch maths — no wgpu types, so all of it is headless-testable; the pass
+  itself lives in `gpu.rs`) and only falls back to `viewport::pick_face` /
+  `viewport::pick_vertex` / `viewport::pick_edge` when there is no wgpu backend
+  or the patch holds nothing the current level can use
+  (`gpu_viewport::chosen_hit` scans the nearest-first hits for the first one
+  the level accepts, so a vertex point sitting on its face never stops a face
+  click). The pass draws the frame's own geometry with the frame's culling and
+  depth test into a separate, single-sampled `R32Uint` target, so a click can
+  never land on something the image does not show — an occluded vertex stays
+  unpicked and a back-culled face is gone. Ids are 1-based (`0` is the clear
+  value) and **per node run face, then vertices, then edges** — edges were
+  appended last on purpose, so ids older streams pinned never moved. A patch is
+  clipped at the viewport edges, and its readback rows are padded to wgpu's
+  256-byte copy alignment. See §8.
 - **Rectangle selection is the Select tool's primary drag** (`app.rs`). The
   tool's own work is click-driven, so a primary drag never reaches it: the app
   keeps a live `marquee` rectangle in *absolute screen* positions, paints it
@@ -146,6 +151,23 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   starts at the pointer's **press origin**, because egui only calls a press a
   drag after movement. Nothing here changes the scene, so nothing here is
   undoable. See §8.
+- **Edges are numbered by `Mesh::edges()` and nothing else** (`openforge-core`).
+  The mesh keeps no edge list: `edges()` walks the faces in order, each face's
+  corners around it (the last back to the first), a pair enters the list the
+  first time it appears, each pair is stored with the lower position index
+  first, a face the visible pass would skip contributes no sides, and a pair
+  repeating one position index is no edge. An edge index is therefore a
+  function of the face list alone — stable while the faces do not move — and
+  every edge picker answers from that one list: `viewport::pick_edge`, the
+  `SelectLevel::Edge` arm of `viewport::marquee_elements`,
+  `PickGeometry::build`'s line geometry and the endpoint lookups in
+  `element_centroid` / `selected_vertices`. In the ID pass a level draws what it
+  has to answer with **on top of the faces** — vertex points, or edge lines, or
+  both for a click (`PickDraw`) — because a point or a line sitting exactly on
+  its own face would otherwise punch a one-pixel hole in the face's pixels; the
+  lines are a `LineList` pass with `CullMode::None` and `LessEqual` drawn
+  between the faces and the points, so an edge wins the pixels it lies on and
+  still loses to anything genuinely in front of it. See §8.
 - **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
   the canvas math and panel state, `app.rs` owns the wiring).
   `uv_editor::island_selection` grows a UV selection to whole islands through
@@ -663,9 +685,58 @@ progress report:
   replaces, and an object-level rectangle takes exactly the node it holds (and
   lets go of it over empty space).
 
+- **Edge-level picking** (work-stream #14). The one level neither the click nor
+  the rectangle could answer is now first class, in the same three layers:
+  - **`openforge-core` grew `Mesh::edges()`** (see §5) — the single edge
+    enumeration every layer numbers edges by. `PickGeometry` gained a `lines`
+    list (two vertices per edge, both carrying the edge's id), appended per node
+    **after** its face and vertex elements so the older ids never moved.
+  - **The ID pass draws lines.** `gpu.rs` gained a third pick pipeline
+    (`LineList`, `CullMode::None`, `LessEqual`), and `PickDraw { lines, points }`
+    now decides what each level draws on top of the faces: faces alone at Face
+    level, faces + points for Vertex and Object, faces + lines for Edge, and
+    everything for a click — whose hits the caller filters (`chosen_hit` grew
+    its `(Edge, Edge)` arm). `pick_rect`'s "no edge pass" early return is gone;
+    an Edge rectangle draws faces and lines and answers edge elements like any
+    other level.
+  - **The app picks edges by click and by rectangle.** `viewport::pick_edge` is
+    a ray-vs-segment test — the exact closed form, `s` clamped to the segment,
+    `t < 0` skipped, nearest wins — and is the CPU fallback `resolve_click` uses
+    at Edge level; the marquee's Edge rule projects both endpoints of every
+    `mesh.edges()` pair and selects an edge with an endpoint inside the
+    rectangle or a segment crossing one of its four sides (an endpoint behind
+    the camera leaves its edge out, like every position behind it);
+    `element_centroid` and `selected_vertices` read the endpoints, so a selected
+    edge and a gizmo drag move exactly its own two vertices. `apply_marquee` no
+    longer refuses the level, and the status bar counts the edges.
+
+- **25 new tests**: 6 in `openforge-core` (`mesh.rs`: corner order, the shared
+  edge entered once, triangles and n-gons, the valid-face rule, degenerate
+  corner pairs, loose positions), 2 in `pick.rs` (a quad's four edges as eight
+  line vertices with ids 6–9, and edge ids resolving out of a patch in table
+  order), 2 adapter-guarded in `gpu.rs` (an edge rectangle finds the near
+  quad's four edges over the far quad's — which is also the proof that a line
+  wins the pixels it lies on, the face underneath being at the same depth — the
+  far one's once the near is hidden, vertices alone at Vertex level, and
+  nothing over empty space or over a zero-width rectangle; a click on a quad's
+  top side finds that edge first with its face still behind it, and the quad's
+  middle is its face, not an edge), 13 net in the **`viewport.rs`** the
+  subagent wrote (7 for `pick_edge`: midpoint hit, face middle miss, nearest of
+  two parallel edges, endpoint clamping, a segment behind the origin, hidden
+  and frozen nodes, an empty scene and a mesh without faces, the tolerance
+  boundary; 6 for the rectangle: the endpoint rule and the neighbours it
+  brings, crossing without an endpoint inside, an endpoint exactly on the box,
+  an endpoint behind the camera, hidden/frozen, determinism with each edge once
+  and indices ascending; plus the centroid and dragged-vertices test, which
+  replaced the old "edge level selects nothing" test), and 2 in `app.rs`
+  driving the real gestures: a click on the projected bottom edge selects edge
+  0 (and the middle of the face selects nothing at Edge level), and a rectangle
+  over the quad's upper-left corner selects exactly the top and left edges, the
+  whole quad all four of them, with the status counting them.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **511 pass, 0 failures**
+build too); `cargo test --workspace` → **536 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -686,7 +757,13 @@ resolution in `pick.rs`, the pass itself through adapter-guarded readbacks
 points and that a vertex rectangle excludes what a face hides), the pixel
 mapping and per-level filtering in `gpu_viewport`, and the gesture end to end
 in `app.rs` — press, drag, painted rectangle, release, selection — on the CPU
-path.
+path. Edge picking is covered the same way: the enumeration and the line
+element table headless in `pick.rs`, the line pass through adapter-guarded
+readbacks (an edge rectangle finds exactly the near quad's four edges — which
+is also the proof that a line beats the face at the same depth — and a click on
+a quad's top side finds that edge first while the face still resolves behind
+it), the ray-vs-segment and segment-rectangle rules in `viewport.rs`, and both
+gestures end to end in `app.rs`.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -703,7 +780,11 @@ Islands should leave each island in its own cell with a gutter) and the
 **rectangle selection in the live app** (drag a box in the Select tool: the
 rectangle should follow the pointer, Shift should add to the selection rather
 than replace it, and the wgpu path's answer — which the headless tests can only
-prove through a readback — should match what the image shows) — the agent has no
+prove through a readback — should match what the image shows), and the
+**edge-level picking in the live app** (click an edge, drag a box at the Edge
+level: the pass answers from one-pixel lines, and a selected edge is *not* yet
+highlighted in the frame — the status bar counts it, the picture does not show
+it, which is the natural next stream) — the agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -714,22 +795,23 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **62.8%**, shown as 62%). The engine
+16 curated areas is **63.2%**, shown as 63%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
 gizmo snapping as of #10, textures sampling on both paths as of #11,
-sub-object picking that matches the drawn frame (plus UV islands) as of #12 and
-rectangle selection through that same pass as of #13.
+sub-object picking that matches the drawn frame (plus UV islands) as of #12,
+rectangle selection through that same pass as of #13 and edge-level picking by
+click and rectangle as of #14.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
    material shading (#9), texture sampling (#11), occlusion-exact sub-object
-   picking (#12) and rectangle selection (#13) are in. What remains of the
-   editor surface: **edge-level picking** (line geometry in the ID pass, on top
-   of a stable per-node edge enumeration — the one level the pick pass still
-   cannot answer, and therefore the one the rectangle cannot select either) and
-   the selection *tools* around it (isolate/hide, select-through toggle).
+   picking (#12), rectangle selection (#13) and edge-level picking (#14) are in.
+   What remains of the editor surface: **showing the edge selection** (a
+   selected edge is not highlighted in the frame yet — the status bar counts the
+   selection, the picture does not show it) and the selection *tools* around the
+   levels (isolate/hide, a select-through toggle, grow/shrink).
    Beyond that: shadowing / ambient occlusion and a configurable shading mode.
 2. **Extend the gizmo further** (`gizmo.rs`, all additive): plane and centre
    handles, and numeric entry for rotation/scale (translation already has
@@ -789,13 +871,45 @@ deltas and are many work-streams, not one push.
 - **The ID ("pick") pass is single-sampled on purpose, and its ids must stay
   integers.** It has its own `R32Uint` target, its own *single-sampled* depth
   buffer and 1-sample pipelines even when the frame runs MSAA — a resolve would
-  average ids into nonsense. Three more traps: the vertex-point pipeline needs
-  `LessEqual` (a point lies exactly on the surface it belongs to, so `Less`
-  would drop every vertex on its own face) while the face pipeline keeps the
-  frame's `Less` and culling (so a face genuinely in front still hides a vertex
-  behind it); the readback patch must be at least 256 bytes per row, so
-  `resolve_patch` is fed row by row with the padding stripped; and ids are
-  1-based because the target clears to `0`.
+  average ids into nonsense. The point *and line* pipelines need `LessEqual` (a
+  vertex and an edge lie exactly on the surface they belong to, so `Less` would
+  drop every vertex on its own face and every edge on the face it borders)
+  while the face pipeline keeps the frame's `Less` and culling (so a face
+  genuinely in front still hides a vertex or an edge behind it); the pass draws
+  **faces, then lines, then points** — a vertex pixel wins over the two lines
+  that end at it. An empty buffer is a wgpu error, so every per-kind buffer is
+  `Option`-guarded: a scene can have points and no lines (a visible mesh whose
+  every face is invalid has no edges). The readback patch must be at least 256
+  bytes per row, so `resolve_patch` is fed row by row with the padding
+  stripped; and ids are 1-based because the target clears to `0`.
+- **A level draws only what it must answer with, on top of the faces.** A
+  vertex *point* or an edge *line* sitting exactly on its own face punches a
+  one-pixel hole or notch into that face's pixels — the one way the picture and
+  the pick could disagree. So a rectangle pass draws per level (`PickDraw`):
+  faces alone for Face, faces + points for Vertex/Object, faces + lines for
+  Edge — and only the *click* pass draws everything, because its hits are
+  filtered by level afterwards (`chosen_hit` skips any element the level cannot
+  use). An Edge rectangle therefore draws no points: a point pixel could only
+  eat a pixel of an edge that ends there.
+- **Edge ids come from `Mesh::edges()` and nothing else** — the CPU pickers,
+  the ID pass's line table and the marquee all number edges by that one list
+  (see §5). Its rules bite: a face with an out-of-range corner is skipped
+  *whole* (the visible pass never draws it, so none of its sides exist), a pair
+  repeating one position index is no edge, and each pair is stored lower index
+  first — so a line's two vertices run in *index* order, not the order the face
+  walks its corners (a test here once asserted the walk direction and was
+  wrong). The list is derived from the face list, so editing faces renumbers
+  edges: an Edge-level selection index only means anything while the faces it
+  was picked from do not move.
+- **In `app.rs` tests the viewport rect is the whole `SCREEN` (1000×700).**
+  `CentralPanel` gets no margin in that path, so
+  `viewport::project(app.camera.view_proj(SCREEN[0] / SCREEN[1]), world, SCREEN)`
+  is a world point's exact screen position — check it against the gizmo origin
+  before relying on it (the pattern the snapping tests use). At the default
+  camera (distance 8, fov 55°) one world unit is about **84 px**, and the
+  Edge/Vertex click tolerance is `distance * 0.02` world units (~13 px). The
+  first edge tests here guessed ±40 px for a ±1 quad — half the real scale — and
+  clicked the middle of the face instead of its edge.
 - **The GPU edge overlay replaces the egui one, it does not stack with it.**
   When the GPU backend is active the edges are line geometry inside the frame
   (depth-tested, `LessEqual`, no depth write); `paint_gpu_viewport` therefore
