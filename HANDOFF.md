@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (607 `#[test]` fns; 609 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (615 `#[test]` fns; 617 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 25 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights` (with the weight *editing* maths: `assign`, `blend`, `smooth`), `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 191 (bin) | eframe/egui GUI. `app.rs` (~6400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
+| `openforge-app` | 200 (bin) | eframe/egui GUI. `app.rs` (~9300 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the shortcut table). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -332,6 +332,16 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
+- **Preferences are data the frame reads.** `settings::Settings` holds the
+  theme, the ground grid (on/off, step, reach) and the camera speed
+  multipliers; the frame paints `Settings::grid_lines()` and multiplies drags
+  and the wheel by `orbit_step()`/`pan_step()`/`zoom_step()`, so the window
+  and the frame can never read different numbers — and values a control could
+  not mean (zero, negative, non-finite) fall back to the defaults inside those
+  methods, not at every use site. The Keyboard Shortcuts window is assembled
+  the same way: the fixed table lives in `settings::SHORTCUTS`, the tool rows
+  come from `ActiveTool::all()` + `hotkey()` — the same pair the frame's
+  hotkey loop, the toolbar and the plugin registry names use.
 - **`wgpu` is pinned once**, in `[workspace.dependencies]`, and must stay in
   lockstep with the wgpu eframe re-exports — otherwise the device/texture types
   crossing between eframe and `openforge-render` stop being the same types.
@@ -1279,10 +1289,46 @@ progress report:
   back through both labels), and both formats through the integration
   test's real filesystem.
 
+- **Preferences, shortcuts and About** (work-stream #30). The panel/dialog
+  surface had no shell; it has one now, and the frame reads the same settings
+  the windows edit:
+  - **`settings.rs` holds the choices** — the theme, the ground grid (on/off,
+    step, reach) and the camera's orbit/pan/zoom multipliers — with
+    `Settings::grid_lines` building the grid's world lines and impossible
+    values (zero, negative or non-finite steps, silly multipliers) falling
+    back to the defaults, so a typed-in number can never ask the painter for
+    unbounded lines or strand the camera.
+  - **Edit ▸ Preferences…** edits all of it: the theme radio pair (applied to
+    the egui context once per change), Show the ground grid, the grid step and
+    reach, the camera speeds, and Reset to defaults.
+  - **The frame reads the same data**: `paint_grid` returns how many lines it
+    drew and walks `settings.grid_lines()`; `drag_camera`/`scroll_camera`
+    multiply the middle-drag and the wheel; the View menu gains a Ground Grid
+    toggle.
+  - **Help ▸ Keyboard Shortcuts…** lists the fixed global table from
+    `settings::SHORTCUTS` plus one row per tool, keyed by the same
+    `ActiveTool::hotkey` the toolbar prints — and the frame's four tool
+    hotkeys now walk `ActiveTool::all()`, so window, toolbar and handlers
+    cannot drift apart.
+  - **Help ▸ About OpenForge** names the version from Cargo, the licence
+    (MIT OR Apache-2.0) and the clean-room promise.
+- **8 new tests**: in the settings module the default grid is the old painter
+  constant, the step spaces the lines and impossible values fall back, speeds
+  clamp and non-finite ones are ignored, and the shortcut table is filled in;
+  in the app the theme lands on a bare egui context and comes back, the grid
+  draws its lines through a real view-projection (10 at a 5-line reach, 0
+  with the grid off), the camera multipliers scale orbit, pan and zoom while a
+  zero reads as the default, the shortcut rows match the table and the tool
+  hotkeys, and the three windows paint without a display.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **609 pass, 0 failures**
-(`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
+build too); `cargo test --workspace` → **617 pass, 0 failures**
+(`cargo build --workspace ... | grep -c warning` → 0). The #30 windows are
+measured headless too: the theme is asserted on a bare egui context, the
+grid's lines are counted through a real view-projection with the grid on and
+off, and the three windows are painted inside a `ctx.run` — so their layout
+is exercised (how they *look* is in the by-eye list below). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
 display: the `app.rs` test module runs the real
@@ -1401,7 +1447,12 @@ all-disabled message), and the **UV Tools row** by eye (Weld / Split / Mirror U
 Split should leave the neighbour's UVs standing), and the **Rig row** by eye
 (Create Rig should build a chain and auto-weight; the bone combo should list
 the bones by name; Assign / Blend / Smooth over a vertex selection should
-change the posed deformation, and Edit ▸ Undo should put the weights back) —
+change the posed deformation, and Edit ▸ Undo should put the weights back) and
+the **Preferences / Shortcuts / About windows** by eye (Light should restyle
+the whole window at once, a grid step of 2 should space the ground lines twice
+as wide, Orbit × should visibly slow or speed the middle-drag, Keyboard
+Shortcuts should list every key the app answers to, and About should show the
+version) —
 the agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
@@ -1413,7 +1464,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **73.0%**, shown as 73%). The engine
+16 curated areas is **73.7%**, shown as 73%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1435,8 +1486,9 @@ hidden LOD 1–3 copies) as of #25 and the registry-driven tool list (the
 toolbar and hotkeys walk the host's tools) as of #26 and the key-editing
 timeline (key rows, drag-to-retime, Key/Delete Key, clips on the undo stack)
 as of #27, the weight tools (assign/blend/smooth over the vertex
-selection, undoable) as of #28 and COLLADA and OFF (import/export through
-the same registry, six formats) as of #29.
+selection, undoable) as of #28, COLLADA and OFF (import/export through
+the same registry, six formats) as of #29, and the Preferences/shortcuts/About
+shell (theme, ground grid, camera speeds, the key table) as of #30.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1475,11 +1527,16 @@ Prioritized next steps:
    emissive maps, per-face map assignment and mipmapped/anisotropic sampling are
    the remaining pieces. Per-face material assignment — the reason slots exist
    per face — landed in #9.
+7. **Finish the panel/dialog surface.** Preferences, Keyboard Shortcuts and
+   About landed in #30; settings that persist across runs, an asset browser,
+   and the deeper ZModeler-style dialogs have no home yet.
 
 **Honest gap to parity:** format-specific game tooling (vehicles, TXD
 dictionaries, per-game export paths — the generic half, LOD tags, dummies,
-their triangle budget and the LOD generator, landed in #21/#25), the full
-panel/dialog surface, animation *authoring* beyond the key row (per-key
+their triangle budget and the LOD generator, landed in #21/#25), the
+panel/dialog surface beyond the new shell (settings do not persist across
+runs, there is no asset browser, and ZModeler's deeper dialogs have no home
+yet), animation *authoring* beyond the key row (per-key
 easing edits, a curve view, clip-level tools), and exact format breadth
 (six formats, none proprietary; COLLADA is the geometry subset, without
 node transforms, effects or animation) remain the largest deltas and are many

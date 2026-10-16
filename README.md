@@ -230,6 +230,10 @@ A sample GitHub Actions matrix is shown below.
   its own cell of the `grid × grid` atlas with its aspect preserved (the other
   **Pack** groups by coincident positions instead).
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
+- **Edit → Preferences…** edits the theme, the ground grid (on/off, step,
+  reach) and the camera's orbit/pan/zoom speeds; **Help → Keyboard
+  Shortcuts…** lists every global key and the four tool hotkeys, and **Help →
+  About OpenForge** names the version and the licence.
 - **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Ctrl+D** duplicates the selection,
   **Delete** removes, **F** frames all.
 - The **Properties** panel renames a node (one undo step per rename) and the
@@ -284,6 +288,8 @@ mostly application surface. Natural next steps:
   of the diffuse map that samples today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
+- Settings that persist across runs, an asset browser, and the deeper
+  panel/dialog surface.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) and a fuller
   COLLADA (node transforms, effects, animation) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) behind the host seam, which already
