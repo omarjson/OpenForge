@@ -6,6 +6,7 @@
 
 use crate::math::Aabb;
 use glam::{Vec2, Vec3};
+use std::collections::HashSet;
 
 /// A vertex position plus optional source data.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
@@ -176,6 +177,42 @@ impl Mesh {
         out
     }
 
+    /// Every edge of the mesh, as an unordered pair of position indices.
+    ///
+    /// The mesh keeps no edge list — an edge is simply two corners that sit
+    /// next to each other on a face, and a pair shared by two faces is one
+    /// edge. Faces are walked in order and each face's corners around it (the
+    /// last back to the first), and a pair enters the list the first time it
+    /// appears, so an edge's index is a function of the face list alone and
+    /// never moves while the faces do not. Two rules keep the list honest:
+    /// a face with fewer than three corners, or with a corner outside
+    /// [`positions`](Self::positions), is skipped whole — the visible pass
+    /// never draws it, so none of its sides exist — and a pair repeating one
+    /// position index (a degenerate corner) is no edge at all. Each pair is
+    /// stored with the lower index first.
+    pub fn edges(&self) -> Vec<[u32; 2]> {
+        let mut out: Vec<[u32; 2]> = Vec::new();
+        let mut seen: HashSet<(u32, u32)> = HashSet::new();
+        for face in &self.faces {
+            let n = face.corners.len();
+            if n < 3 || face.corners.iter().any(|c| c.position as usize >= self.positions.len()) {
+                continue;
+            }
+            for k in 0..n {
+                let a = face.corners[k].position;
+                let b = face.corners[(k + 1) % n].position;
+                if a == b {
+                    continue;
+                }
+                let key = if a < b { (a, b) } else { (b, a) };
+                if seen.insert(key) {
+                    out.push([key.0, key.1]);
+                }
+            }
+        }
+        out
+    }
+
     /// Delete faces whose index is in `faces`, then drop unreferenced
     /// positions and remap indices. Returns the number of faces removed.
     pub fn delete_faces(&mut self, faces: &[usize]) -> usize {
@@ -335,5 +372,100 @@ mod tests {
                 assert_eq!(c.uv, c.position);
             }
         }
+    }
+
+    /// A quad in the XY plane from four fresh positions.
+    fn quad_mesh() -> Mesh {
+        let mut m = Mesh::new();
+        for p in [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+        ] {
+            m.add_vertex(p);
+        }
+        m.add_face(&[0, 1, 2, 3]);
+        m
+    }
+
+    #[test]
+    fn a_quad_has_four_edges_walked_around_its_corners() {
+        let m = quad_mesh();
+        // Corners in order, the last side closing back to the first, each
+        // pair stored with the lower index first.
+        assert_eq!(m.edges(), vec![[0, 1], [1, 2], [2, 3], [0, 3]]);
+    }
+
+    #[test]
+    fn an_edge_shared_by_two_faces_is_one_edge_by_first_appearance() {
+        let mut m = quad_mesh();
+        // A second quad sharing the side (1, 2), built from two new positions.
+        m.add_vertex(Vec3::new(2.0, 0.0, 0.0));
+        m.add_vertex(Vec3::new(2.0, 1.0, 0.0));
+        m.add_face(&[1, 4, 5, 2]);
+        let edges = m.edges();
+        // 4 sides + 3 new ones; (1, 2) is one edge, entered by the first quad.
+        assert_eq!(edges.len(), 7);
+        assert_eq!(edges.iter().filter(|e| **e == [1, 2]).count(), 1);
+        assert_eq!(edges[0], [0, 1], "the first quad's sides keep their indices");
+        assert_eq!(&edges[4..], &[[1, 4], [4, 5], [2, 5]]);
+    }
+
+    #[test]
+    fn triangles_and_ngons_walk_every_side() {
+        let mut tri = Mesh::new();
+        tri.add_vertex(Vec3::ZERO);
+        tri.add_vertex(Vec3::X);
+        tri.add_vertex(Vec3::Y);
+        tri.add_face(&[0, 1, 2]);
+        assert_eq!(tri.edges(), vec![[0, 1], [1, 2], [0, 2]]);
+
+        let mut pent = Mesh::new();
+        for i in 0..5 {
+            let a = i as f32 / 5.0 * std::f32::consts::TAU;
+            pent.add_vertex(Vec3::new(a.cos(), a.sin(), 0.0));
+        }
+        pent.add_face(&[0, 1, 2, 3, 4]);
+        assert_eq!(pent.edges().len(), 5);
+    }
+
+    #[test]
+    fn a_face_the_visible_pass_would_skip_has_no_sides() {
+        let mut m = quad_mesh();
+        // Out of range: the face is never drawn, so none of its sides exist.
+        m.add_face(&[0, 1, 99]);
+        assert_eq!(m.edges().len(), 4);
+        // A face with too few corners cannot even be added through add_face,
+        // so build one by hand.
+        m.faces.push(Face {
+            corners: vec![
+                Corner { position: 0, normal: 0, uv: 0 },
+                Corner { position: 1, normal: 0, uv: 0 },
+            ],
+            material: 0,
+        });
+        assert_eq!(m.edges().len(), 4);
+    }
+
+    #[test]
+    fn a_degenerate_corner_pair_is_no_edge() {
+        let mut m = quad_mesh();
+        // A sliver face that doubles a corner: only its real sides count.
+        m.add_vertex(Vec3::new(2.0, 0.0, 0.0));
+        m.add_face(&[1, 4, 4]);
+        let edges = m.edges();
+        assert_eq!(edges.len(), 5, "the quad's four sides and (1, 4)");
+        assert_eq!(edges[4], [1, 4]);
+        assert!(!edges.iter().any(|e| e[0] == e[1]), "no self-edges");
+    }
+
+    #[test]
+    fn empty_and_loose_geometry_has_no_edges() {
+        assert!(Mesh::new().edges().is_empty());
+        let mut m = Mesh::new();
+        m.add_vertex(Vec3::ZERO);
+        m.add_vertex(Vec3::X);
+        assert!(m.edges().is_empty(), "positions without faces are no edges");
     }
 }
