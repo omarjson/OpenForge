@@ -12,7 +12,7 @@ ENGINE
   Boolean CSG                                          █████████████░░░░░░░  65%
   Generators & algorithms (primitives, Catmull-Clark, noise, L-systems) ████████████████░░░░  80%
   Materials & textures                                 ██████████████░░░░░░  72%
-  Animation (tracks, clips, playback)                  ███████████░░░░░░░░░  55%
+  Animation (tracks, clips, playback)                  █████████████░░░░░░░  65%
   Rigging & skinning                                   ████████████░░░░░░░░  60%
   UV math (project, unwrap, pack, edits)               █████████████████░░░  85%
 
@@ -25,10 +25,10 @@ APPLICATION SURFACE
   Plugin / service host                                ███████░░░░░░░░░░░░░  35%
   Game tooling (LOD, dummies/TXD, vehicles)            █░░░░░░░░░░░░░░░░░░░   5%
 
-  OVERALL (unweighted mean of 16 areas)                ████████████░░░░░░░░  64%
+  OVERALL (unweighted mean of 16 areas)                █████████████░░░░░░░  65%
 
-Measured from the repo: 12 crates · 564 test fns · 29836 lines of Rust
-Exact mean of the curated area scores: 64.3% (sum 1030 over 16 areas)
+Measured from the repo: 12 crates · 566 test fns · 30215 lines of Rust
+Exact mean of the curated area scores: 65.0% (sum 1040 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

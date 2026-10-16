@@ -145,6 +145,12 @@ A sample GitHub Actions matrix is shown below.
   rectangle everything it covers, whether the frame shows it or not. On a
   machine without wgpu the picks already answer that way, so the switch has
   nothing to change there.
+- **Animate ▸ Spin Selected (2 s)** builds a one-turn clip over the selected
+  nodes' current poses and opens the **Timeline**: the clip picker, **Space**
+  to play/pause, Stop, Loop, and a scrub slider with the clip's key times
+  listed under it. Playback poses the scene on the frame clock; it is a view
+  over the clip, not an edit, so nothing lands on the undo stack — Stop
+  rewinds to the start.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,
   camera, depth test and back-face culling as the frame, so only what the image

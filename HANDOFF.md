@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (564 `#[test]` fns; 566 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (566 `#[test]` fns; 568 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 171 (bin) | eframe/egui GUI. `app.rs` (~5300 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, and import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status. |
+| `openforge-app` | 173 (bin) | eframe/egui GUI. `app.rs` (~5500 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status, and the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -246,6 +246,16 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   **Ctrl** inverts whatever the toolbar says (Off becomes Grid, anything else
   becomes Off). Snapping covers the gizmo's axis-constrained drags; the
   free-form view-plane tool drag is deliberately unsnapped.
+- **Animation is a view over a clip, not an edit.** The transport
+  (`openforge_animation::Player`) owns the clock; the app advances it once per
+  frame before anything paints (`advance_animation`, with `stable_dt` capped at
+  0.25 s so a dragged window cannot jump the clip) and writes the sampled node
+  transforms straight into the scene. No undo entry is pushed — whatever pose
+  playback stops at is simply where the scene stands — and a scrub or a stop
+  poses the scene through the same `pose_current`. Quaternion tracks blend
+  along the shortest arc, so a 360° turn needs intermediate keys: the "Spin
+  Selected" clip carries four quarter-turn keys, not one full-turn key.
+  The timeline is another bottom panel, added after the UV editor in `update`.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -931,9 +941,36 @@ progress report:
   real write whose status names the format, and a drop driven through a frame —
   one file, then a mixed pile, with the summary counted.
 
+- **A timeline that plays the scene** (work-stream #20). `openforge-animation`
+  had tracks, shortest-arc interpolation, clips and a transport; the app had
+  never touched it. Now:
+  - **Animate ▸ Spin Selected (2 s)** builds a clip for every selected node:
+    one full turn about Y from the node's own pose, carried by **four
+    quarter-turn keys** — a single 360° end key would blend back the way it
+    came, because quaternion tracks blend along the shortest arc. The clip is
+    named around "spin" without colliding ("spin 2"), selected, and the
+    timeline opens.
+  - **The Timeline panel** is the transport: clip picker, Play/Pause
+    (**Space**), Stop, Loop, and a scrub slider with the clip's key times
+    listed under it (`clip_key_times` merges the position/rotation/scale keys,
+    sorted and deduplicated).
+  - **Playback is a view over the clip, not an edit.** `update` advances the
+    transport on the frame clock before anything paints (`stable_dt`, capped at
+    0.25 s so a dragged window cannot jump the clip) and writes the sampled
+    transforms into the scene; no undo entry is pushed, and whatever pose it
+    stops at is where the scene stands. A scrub poses the scene through the
+    same `pose_current`; Stop rewinds to the clip's start.
+
+- **2 new tests**: the spin clip scrubbed to the half turn and the full turn
+  (the double cover included), then played a quarter second — 45° of a two
+  second turn — past the end to the pause, and stopped back to the start; and
+  the refusals, the name collision, the five key times and the untouched undo
+  stack. Both run headless, like the rest: the frame seam (`advance_animation`)
+  is a method, because the painting helpers stop at the central viewport.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **566 pass, 0 failures**
+build too); `cargo test --workspace` → **568 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -976,7 +1013,10 @@ behind the face in front of it, and the outliner's box by its single undo
 step. Import and export are pinned headless too — a real file written and
 read back through the registry, the refusals with their extension lists, and
 a drop driven through a frame — so only the native dialogs themselves are
-left to the eye.
+left to the eye. The animation path is pinned at the transport: the spin
+clip's key times, the half turn, the full turn (the double cover included),
+45° after a quarter second of play, the pause at the end and the rewind on
+stop, with the undo stack provably untouched.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1010,7 +1050,10 @@ it off should bring the image's own answer back) and the **outliner's Visible
 box** by eye (it should hide and show one node with its status and one undo
 step) and the **File menu's dialogs** by eye (the import dialog's filter
 groups per format, the export submenu's default file names, and a drop of a
-real file onto the window) — the agent has no
+real file onto the window) and the **timeline** by eye (Animate ▸ Spin
+Selected: the panel should appear with the clip's five key times under the
+slider, Play and Space should turn the node smoothly, and Stop should snap it
+back to the start) — the agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -1021,7 +1064,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **64.3%**, shown as 64%). The engine
+16 curated areas is **65.0%**, shown as 65%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1031,9 +1074,9 @@ rectangle selection through that same pass as of #13, edge-level picking by
 click and rectangle as of #14, the visible sub-object selection as of #15,
 the selection tools (all / none / invert, grow / shrink, hide / isolate /
 unhide) as of #16, the edge loop / ring walks as of #17, the
-select-through switch with the outliner's undoable visibility box as of #18
-and the format-named import/export surface (dialogs, drops, refusals) as of
-#19.
+select-through switch with the outliner's undoable visibility box as of #18,
+the format-named import/export surface (dialogs, drops, refusals) as of #19
+and the animation timeline (spin clips, playback, scrub, Space) as of #20.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1072,8 +1115,9 @@ Prioritized next steps:
    per face — landed in #9.
 
 **Honest gap to parity:** game-specific tooling (vehicles, LOD, dummies/TXD),
-the full panel/dialog surface, and exact format breadth remain the largest
-deltas and are many work-streams, not one push.
+the full panel/dialog surface, animation *editing* (the timeline plays clips;
+keys are not yet drawn, dragged or recorded), and exact format breadth remain
+the largest deltas and are many work-streams, not one push.
 
 ## 8. Known gotchas when using AI subagents here
 
