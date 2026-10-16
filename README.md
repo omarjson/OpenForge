@@ -166,6 +166,10 @@ A sample GitHub Actions matrix is shown below.
   their own UV corners, **Mirror U/V** reflects the selection about its bounds,
   and the **Snap** box makes drags land on a 0.05 grid — each one undo step,
   with the status saying what it did or why it did not.
+- **Import…** and **Export selected as…** ask for the file's options before
+  touching disk: its **up-axis** (Y up as-is, Z up, X up) and a **uniform
+  scale**. Cancel reads and writes nothing, and dropped files take the
+  defaults. The status names the options only when they were not the defaults.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,
   camera, depth test and back-face culling as the frame, so only what the image

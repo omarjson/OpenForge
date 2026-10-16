@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (576 `#[test]` fns; 578 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (583 `#[test]` fns; 585 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 180 (bin) | eframe/egui GUI. `app.rs` (~6100 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status, the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
+| `openforge-app` | 187 (bin) | eframe/egui GUI. `app.rs` (~6400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -293,6 +293,19 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   *total* drag delta through `uv_editor::snap_uv` (the difference of rounded
   totals), not each frame's step — rounding steps would stall a slow drag
   before it moved at all.
+- **A file boundary gets a dialog, and the options only touch the maths.** The
+  pickers (`Import…`, `Export selected as…`) no longer commit to the file as
+  written: they park the chosen path in `PendingFile` and an options window
+  asks for the file's up-axis (Y up as-is / Z up / X up) and a uniform scale.
+  Nothing is read or written until the confirming button — Cancel drops the
+  pending file untouched — and only then does `import_file_with` /
+  `export_selected_with` apply `FileOptions` (turn every position and normal,
+  scale only positions). Each export turn is the exact inverse of its import
+  turn (`Z`: `(x, y, z) → (x, z, -y)` in, `(x, y, z) → (x, -z, y)` out), and a
+  zero, negative or non-finite scale falls back to `1.0` rather than
+  flattening a mesh. Dropped files skip the dialog by design — a drop cannot
+  wait for one — so they take the defaults; the status names the options only
+  when they were not the defaults.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -1084,9 +1097,37 @@ progress report:
   refusal and average, and the split refusal and result with the other face's
   indices intact.
 
+- **Import/export options: the file's up-axis and scale** (work-stream #24).
+  The #19 surface could name a format but not adapt to it; game pipelines
+  care that a Z-up file lands Y-up in the world:
+  - **The pickers open a dialog, not a commit.** `Import…` and
+    `Export selected as…` store the chosen path in `PendingFile` (export
+    refuses an empty selection before the dialog opens, through the same
+    `export_candidate` the immediate path uses) and draw an options window:
+    the file name, the up-axis as three selectable values, a scale
+    `DragValue`, and Import/Export or Cancel. Cancel reads and writes
+    nothing.
+  - **`file_options.rs`** is the maths: `UpAxis` turns directions between
+    file and world space with each export turn the exact inverse of its
+    import turn, `FileOptions::apply` turns positions and normals but scales
+    only positions, and a bad scale falls back to `1.0`.
+  - **`apply_loaded`** turns every mesh a filter loaded before the one
+    `with_edit("Import")` step; on export the copy turns before it becomes
+    `MeshData`. Statuses name the options only when they differ from the
+    defaults ("… (Wavefront OBJ, 2.00× scale, Z up).").
+  - **Drops keep the defaults** — a drop cannot wait for a dialog, so
+    `import_file` stays the default-options path.
+
+- **7 new tests**: the Z-up and X-up turns onto Y; the exact inverse of the
+  export turns over positions and normals; scale-moves-positions-not-normals;
+  identity and the bad-scale fallbacks; `apply_loaded` over a whole scene; and
+  the app round — begin/cancel touching nothing, an import at Z-up 2× landing
+  on (2, 6, -4), and an export at Z-up 0.5× writing the original (1, 2, 3)
+  back to disk.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **578 pass, 0 failures**
+build too); `cargo test --workspace` → **585 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -1140,7 +1181,9 @@ pinned through the host itself: the formats leaving and returning, the refusal
 wording when none is left, and the panel's rows summing to the live registry
 counts. The UV tools sit on the same seam: the weld clusters, the split's
 copied indices, the mirror's bounds reflection and the snap's rounded totals,
-plus the panel round with its one-step undo.
+plus the panel round with its one-step undo. The file options are pinned at the
+boundary: both turns, the exact inverse over a round trip, the bad-scale
+fallback, and the app-level import/export round written back to disk.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1173,8 +1216,9 @@ drag a box over hidden edges: the occluded element should answer, and turning
 it off should bring the image's own answer back) and the **outliner's Visible
 box** by eye (it should hide and show one node with its status and one undo
 step) and the **File menu's dialogs** by eye (the import dialog's filter
-groups per format, the export submenu's default file names, and a drop of a
-real file onto the window) and the **timeline** by eye (Animate ▸ Spin
+groups per format, the export submenu's default file names, a drop of a
+real file onto the window, and the new options dialog — Z up and 2× should
+land the model turned and doubled, Cancel should leave the scene alone) and the **timeline** by eye (Animate ▸ Spin
 Selected: the panel should appear with the clip's five key times under the
 slider, Play and Space should turn the node smoothly, and Stop should snap it
 back to the start), and the **Game menu** by eye (Set LOD / Isolate LOD / Add
@@ -1196,7 +1240,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **68.0%**, shown as 68%). The engine
+16 curated areas is **68.8%**, shown as 68%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1212,7 +1256,8 @@ and the animation timeline (spin clips, playback, scrub, Space) as of #20 and
 the game-prep surface (LOD tags and isolate, dummies, the triangle budget) as
 of #21 and the plugin host controls (per-built-in enable/disable with measured
 attribution) as of #22 and the island-scale UV tools (weld, split, mirror,
-grid snap) as of #23.
+grid snap) as of #23 and the import/export options dialog (up-axis and scale at
+the file boundary) as of #24.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
