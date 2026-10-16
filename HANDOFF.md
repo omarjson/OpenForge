@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (569 `#[test]` fns; 571 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (571 `#[test]` fns; 573 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 176 (bin) | eframe/egui GUI. `app.rs` (~5700 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status, the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), and the **Game menu** tags LOD levels, places dummies and reports the triangle budget (`LodReport`). |
+| `openforge-app` | 178 (bin) | eframe/egui GUI. `app.rs` (~6000 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status, the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -269,6 +269,17 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   nothing selected). The model report is `LodReport` — a fold over mesh nodes,
   triangles per level with the untagged pile first and the totals last — shown
   in the Properties panel and held nowhere else.
+- **The Plugins panel is the plugin host's one control, and a rebuild is all
+  or nothing.** Every built-in carries a checkbox; turning one off calls
+  `rebuild_plugins`, which builds a fresh `PluginHost` from the remaining
+  built-ins — so a disabled plugin's formats, tools and services leave in one
+  step and nothing half-registered is left behind. Each row's "what it brings"
+  line is measured, not guessed: `plugin_infos` registers that plugin alone
+  into a scratch host and reads its registries, so the panel cannot drift from
+  the host. The refusals follow the active set: `unknown_format_line` names the
+  formats that are known, or says every format plugin is off; and a disabled
+  `openforge.core-tools` degrades `active_tool` to the Select fallback that was
+  already there for a host without a built-in.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -1009,9 +1020,32 @@ progress report:
   nothing selected and at the selection's centre (2, 1, 0) otherwise — kind
   checked, undo entry counted.
 
+- **The plugin host gets its controls** (work-stream #22). The Plugins panel
+  was a read-only report; now it is the host's one control surface:
+  - **A checkbox per built-in** (`openforge.core-tools`, `openforge.interchange`
+    today). Toggling calls `set_plugin_enabled`, which records the name and
+    calls `rebuild_plugins`: a fresh `PluginHost` registers every remaining
+    built-in, so a plugin's formats, tools and services leave together and a
+    rejected registration cannot leave half of itself behind.
+  - **"What it brings" is measured, not guessed.** `plugin_infos` registers
+    each built-in alone into a scratch host and reads its registries, so every
+    row lists its formats by label plus service/tool counts — and keeps listing
+    them while the plugin is off, so a user sees what re-enabling restores.
+  - **The refusals follow the active set.** `unknown_format_line` (shared by
+    the import and the export path) names the known formats ("no filter knows
+    it (glb, gltf, obj, ply, stl).") or, with every format plugin off, says
+    exactly that ("Skipped x.stl — every format plugin is disabled (see the
+    Plugins panel).").
+
+- **2 new tests**: the interchange plugin's formats leaving and coming back —
+  an import refused while it is off, the same file imported while it is on —
+  and the panel rows adding up to what the host serves (4 tools, 3 services,
+  4 filters, the OBJ filter present; a disabled plugin still lists what it
+  would bring).
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **571 pass, 0 failures**
+build too); `cargo test --workspace` → **573 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -1060,7 +1094,10 @@ clip's key times, the half turn, the full turn (the double cover included),
 stop, with the undo stack provably untouched. The game-prep surface is pinned
 the same way: the tag / isolate / clear round with its single undo step and its
 refusals, the dummy at the origin and at the selection's centre (its kind
-checked), and the report's counts and lines per level.
+checked), and the report's counts and lines per level. The plugin controls are
+pinned through the host itself: the formats leaving and returning, the refusal
+wording when none is left, and the panel's rows summing to the live registry
+counts.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1099,8 +1136,11 @@ Selected: the panel should appear with the clip's five key times under the
 slider, Play and Space should turn the node smoothly, and Stop should snap it
 back to the start), and the **Game menu** by eye (Set LOD / Isolate LOD / Add
 Dummy: outliner rows should carry their `LOD n` tag, Isolate LOD 1 should
-leave only the level-1 nodes standing, and `U` should bring the rest back) —
-the agent has no
+leave only the level-1 nodes standing, and `U` should bring the rest back),
+and the **Plugins panel** by eye (uncheck `openforge.interchange`: the row
+should stay with its formats still listed, the report below should shrink to
+the core-tools counts, and importing a `.obj` should refuse with the
+all-disabled message) — the agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -1111,7 +1151,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **66.0%**, shown as 66%). The engine
+16 curated areas is **67.1%**, shown as 67%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1125,7 +1165,8 @@ select-through switch with the outliner's undoable visibility box as of #18,
 the format-named import/export surface (dialogs, drops, refusals) as of #19
 and the animation timeline (spin clips, playback, scrub, Space) as of #20 and
 the game-prep surface (LOD tags and isolate, dummies, the triangle budget) as
-of #21.
+of #21 and the plugin host controls (per-built-in enable/disable with measured
+attribution) as of #22.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face

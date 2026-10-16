@@ -53,7 +53,7 @@ Viewport editing UX (gizmos, wireframe, outlines, picking)|96|UI
 UV editor UI|58|UI
 Panels & dialogs (outliner, properties, toolbars)|53|UI
 Import/export UX|48|UI
-Plugin / service host|35|UI
+Plugin / service host|52|UI
 Game tooling (LOD, dummies/TXD, vehicles)|22|UI
 DATA
 )

@@ -22,13 +22,13 @@ APPLICATION SURFACE
   UV editor UI                                         ███████████░░░░░░░░░  58%
   Panels & dialogs (outliner, properties, toolbars)    ██████████░░░░░░░░░░  53%
   Import/export UX                                     █████████░░░░░░░░░░░  48%
-  Plugin / service host                                ███████░░░░░░░░░░░░░  35%
+  Plugin / service host                                ██████████░░░░░░░░░░  52%
   Game tooling (LOD, dummies/TXD, vehicles)            ████░░░░░░░░░░░░░░░░  22%
 
-  OVERALL (unweighted mean of 16 areas)                █████████████░░░░░░░  66%
+  OVERALL (unweighted mean of 16 areas)                █████████████░░░░░░░  67%
 
-Measured from the repo: 12 crates · 569 test fns · 30560 lines of Rust
-Exact mean of the curated area scores: 66.0% (sum 1057 over 16 areas)
+Measured from the repo: 12 crates · 571 test fns · 30784 lines of Rust
+Exact mean of the curated area scores: 67.1% (sum 1074 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 
