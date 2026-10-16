@@ -7908,11 +7908,11 @@ mod tests {
         assert!(report.contains("openforge.interchange"), "{report}");
         assert!(report.contains("Services (3)"), "{report}");
         assert!(report.contains("Tools (4)"), "{report}");
-        assert!(report.contains("Formats (4)"), "{report}");
+        assert!(report.contains("Formats (6)"), "{report}");
         for tool in ["Select", "Move", "Scale", "Rotate"] {
             assert!(report.contains(tool), "`{tool}` is missing from:\n{report}");
         }
-        for format in ["obj", "glb", "ply", "stl"] {
+        for format in ["obj", "glb", "ply", "stl", "dae", "off"] {
             assert!(report.contains(format), "`{format}` is missing from:\n{report}");
         }
     }
@@ -7979,10 +7979,41 @@ mod tests {
         app.import_file(unknown);
         assert_eq!(
             app.status,
-            format!("Skipped {unknown_name} — no filter knows it (glb, gltf, obj, ply, stl).")
+            format!("Skipped {unknown_name} — no filter knows it (dae, glb, gltf, obj, off, ply, stl).")
         );
         assert_eq!(app.scene.node_count(), 0, "and nothing came in");
         let _ = std::fs::remove_file(&obj);
+    }
+
+    #[test]
+    fn the_dae_and_off_filters_round_trip_through_the_app() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Body", primitive_box(1.0));
+        app.selection.select_node(id);
+
+        for (extension, label) in [("dae", "COLLADA"), ("off", "OFF")] {
+            let path = temp_path(extension);
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+            app.export_selected_with(path.clone(), FileOptions::default());
+            assert_eq!(
+                app.status,
+                format!("Exported Body to {name} ({label})."),
+                "{extension} export"
+            );
+            assert!(path.exists(), "{extension} was written");
+
+            let before = app.scene.node_count();
+            app.import_file(path.clone());
+            assert_eq!(
+                app.status,
+                format!("Imported 1 mesh(es) from {name} ({label})."),
+                "{extension} import"
+            );
+            assert_eq!(app.scene.node_count(), before + 1, "the copy landed");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     #[test]
@@ -8025,7 +8056,7 @@ mod tests {
         app.export_selected_with(unknown.clone(), FileOptions::default());
         assert_eq!(
             app.status,
-            format!("Can't export to {unknown_name} — no filter knows it (glb, gltf, obj, ply, stl).")
+            format!("Can't export to {unknown_name} — no filter knows it (dae, glb, gltf, obj, off, ply, stl).")
         );
         assert!(!unknown.exists());
         let _ = std::fs::remove_file(&path);
@@ -8320,7 +8351,7 @@ mod tests {
         app.set_plugin_enabled("openforge.interchange", true);
         assert_eq!(
             app.status,
-            "Enabled openforge.interchange — 4 format(s) active."
+            "Enabled openforge.interchange — 6 format(s) active."
         );
         app.import_file(obj.clone());
         assert!(
@@ -8352,7 +8383,7 @@ mod tests {
             .find(|info| info.name == "openforge.interchange")
             .expect("the interchange plugin");
         assert!(io.enabled);
-        assert_eq!(io.filters.len(), 4, "OBJ, glTF, PLY, STL");
+        assert_eq!(io.filters.len(), 6, "OBJ, glTF, PLY, STL, COLLADA, OFF");
         assert!(
             io.filters
                 .iter()
@@ -8376,7 +8407,7 @@ mod tests {
             .find(|info| info.name == "openforge.interchange")
             .unwrap();
         assert!(!io.enabled);
-        assert_eq!(io.filters.len(), 4, "what it would bring is still listed");
+        assert_eq!(io.filters.len(), 6, "what it would bring is still listed");
         assert_eq!(app.plugins.filters.len(), 0);
     }
 
@@ -8438,7 +8469,7 @@ mod tests {
 
         let err = app.plugins.register(&HijackPlugin).unwrap_err();
         assert!(matches!(err, PluginError::Duplicate { kind: "extension", .. }), "{err:?}");
-        assert_eq!(app.plugins.filters.len(), 4, "the rejected plugin left nothing behind");
+        assert_eq!(app.plugins.filters.len(), 6, "the rejected plugin left nothing behind");
         assert_eq!(app.plugins.filters.for_extension("obj").unwrap().id(), "obj");
         assert_eq!(app.plugins.plugins().len(), 2, "not reported as loaded");
     }

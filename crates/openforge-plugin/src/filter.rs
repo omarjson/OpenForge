@@ -1,12 +1,12 @@
 //! Format filters: importers and exporters behind the plugin host.
 //!
-//! The engine's four formats are ordinary plugins here, so a third-party
+//! The engine's six formats are ordinary plugins here, so a third-party
 //! filter for another extension is a registration rather than a change to the
 //! app: [`FilterRegistry::import`] dispatches on a file's extension, and the
 //! app never names a format again.
 
 use crate::error::PluginError;
-use openforge_io::{gltf, obj, ply, stl, Format, IoResult, LoadedScene, MeshData};
+use openforge_io::{dae, gltf, obj, off, ply, stl, Format, IoResult, LoadedScene, MeshData};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -39,6 +39,8 @@ fn engine_filter(format: Format) -> Box<dyn FormatFilter> {
         Format::Gltf => Box::new(EngineFilter::new(Format::Gltf)),
         Format::Ply => Box::new(EngineFilter::new(Format::Ply)),
         Format::Stl => Box::new(EngineFilter::new(Format::Stl)),
+        Format::Collada => Box::new(EngineFilter::new(Format::Collada)),
+        Format::Off => Box::new(EngineFilter::new(Format::Off)),
     }
 }
 
@@ -78,6 +80,8 @@ impl FormatFilter for EngineFilter {
             Format::Gltf => gltf::import(path),
             Format::Ply => ply::import(path),
             Format::Stl => stl::import(path),
+            Format::Collada => dae::import(path),
+            Format::Off => off::import(path),
         }
     }
 
@@ -87,6 +91,8 @@ impl FormatFilter for EngineFilter {
             Format::Gltf => gltf::export(path, data),
             Format::Ply => ply::export(path, data),
             Format::Stl => stl::export(path, data),
+            Format::Collada => dae::export(path, data),
+            Format::Off => off::export(path, data),
         }
     }
 }
@@ -213,7 +219,7 @@ fn extension_of(path: &Path) -> String {
 
 /// The engine's own filters, as a plugin would register them.
 pub fn engine_filters() -> Vec<Box<dyn FormatFilter>> {
-    [Format::Obj, Format::Gltf, Format::Ply, Format::Stl]
+    [Format::Obj, Format::Gltf, Format::Ply, Format::Stl, Format::Collada, Format::Off]
         .into_iter()
         .map(engine_filter)
         .collect()
@@ -255,13 +261,15 @@ mod tests {
     #[test]
     fn engine_filters_register_by_id_and_extension() {
         let registry = registry_with_engine_filters();
-        assert_eq!(registry.len(), 4);
-        assert_eq!(registry.ids().collect::<Vec<_>>(), ["glb", "obj", "ply", "stl"]);
+        assert_eq!(registry.len(), 6);
+        assert_eq!(registry.ids().collect::<Vec<_>>(), ["dae", "glb", "obj", "off", "ply", "stl"]);
         // glTF covers both extensions.
         assert_eq!(registry.for_extension("glb").unwrap().id(), "glb");
         assert_eq!(registry.for_extension("gltf").unwrap().id(), "glb");
         assert_eq!(registry.for_extension("OBJ").unwrap().id(), "obj");
         assert_eq!(registry.for_extension(".StL").unwrap().id(), "stl");
+        assert_eq!(registry.for_extension("dae").unwrap().label(), "COLLADA");
+        assert_eq!(registry.for_extension("off").unwrap().label(), "OFF");
         assert!(registry.for_extension("fbx").is_none());
     }
 
@@ -293,7 +301,7 @@ mod tests {
         }
         let err = registry.insert(Box::new(Claimer)).unwrap_err();
         assert!(matches!(err, PluginError::Duplicate { kind: "extension", .. }), "{err:?}");
-        assert_eq!(registry.len(), 4, "the failed filter left nothing behind");
+        assert_eq!(registry.len(), 6, "the failed filter left nothing behind");
     }
 
     #[test]
@@ -360,7 +368,7 @@ mod tests {
         let registry = registry_with_engine_filters();
         assert_eq!(
             registry.extensions().collect::<Vec<_>>(),
-            ["glb", "gltf", "obj", "ply", "stl"]
+            ["dae", "glb", "gltf", "obj", "off", "ply", "stl"]
         );
     }
 }

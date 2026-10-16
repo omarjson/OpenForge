@@ -222,7 +222,7 @@ impl Plugin for InterchangePlugin {
     }
 
     fn description(&self) -> &str {
-        "OBJ, glTF/GLB, PLY and STL import/export"
+        "COLLADA, OBJ, OFF, glTF/GLB, PLY and STL import/export"
     }
 
     fn register(&self, host: &mut PluginHost) -> Result<(), PluginError> {
@@ -322,12 +322,12 @@ mod tests {
             ["Move", "Rotate", "Scale", "Select"]
         );
         assert!(host.has_tool("Move") && host.has_tool("Select"));
-        assert_eq!(host.filters.ids().collect::<Vec<_>>(), ["glb", "obj", "ply", "stl"]);
+        assert_eq!(host.filters.ids().collect::<Vec<_>>(), ["dae", "glb", "obj", "off", "ply", "stl"]);
         assert!(host.services.contains("selection") && host.services.contains("io"));
         assert_eq!(host.plugins().len(), 2);
         assert_eq!(host.plugins()[0].name, "openforge.core-tools");
         assert_eq!(host.plugins()[1].version, "0.1.0");
-        assert_eq!(host.plugins()[1].description, "OBJ, glTF/GLB, PLY and STL import/export");
+        assert_eq!(host.plugins()[1].description, "COLLADA, OBJ, OFF, glTF/GLB, PLY and STL import/export");
     }
 
     #[test]

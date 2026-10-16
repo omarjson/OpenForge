@@ -9,8 +9,10 @@ use openforge_core::Vec3;
 use std::path::Path;
 use thiserror::Error;
 
+pub mod dae;
 pub mod gltf;
 pub mod obj;
+pub mod off;
 pub mod ply;
 pub mod stl;
 
@@ -56,6 +58,8 @@ pub fn format_from_extension(ext: &str) -> Option<Format> {
         "gltf" | "glb" => Some(Format::Gltf),
         "ply" => Some(Format::Ply),
         "stl" => Some(Format::Stl),
+        "dae" => Some(Format::Collada),
+        "off" => Some(Format::Off),
         _ => None,
     }
 }
@@ -67,6 +71,8 @@ pub enum Format {
     Gltf,
     Ply,
     Stl,
+    Collada,
+    Off,
 }
 
 impl Format {
@@ -76,6 +82,8 @@ impl Format {
             Format::Gltf => "glb",
             Format::Ply => "ply",
             Format::Stl => "stl",
+            Format::Collada => "dae",
+            Format::Off => "off",
         }
     }
 
@@ -85,6 +93,8 @@ impl Format {
             Format::Gltf => "glTF 2.0",
             Format::Ply => "Stanford PLY",
             Format::Stl => "STL",
+            Format::Collada => "COLLADA",
+            Format::Off => "OFF",
         }
     }
 }
@@ -101,6 +111,8 @@ pub fn import_path(path: &Path) -> IoResult<LoadedScene> {
         Some(Format::Gltf) => gltf::import(path),
         Some(Format::Ply) => ply::import(path),
         Some(Format::Stl) => stl::import(path),
+        Some(Format::Collada) => dae::import(path),
+        Some(Format::Off) => off::import(path),
         None => Err(IoError::Unsupported("unrecognized file extension")),
     }
 }
@@ -117,6 +129,8 @@ pub fn export_path(path: &Path, data: &MeshData) -> IoResult<()> {
         Some(Format::Gltf) => gltf::export(path, data),
         Some(Format::Ply) => ply::export(path, data),
         Some(Format::Stl) => stl::export(path, data),
+        Some(Format::Collada) => dae::export(path, data),
+        Some(Format::Off) => off::export(path, data),
         None => Err(IoError::Unsupported("unrecognized file extension")),
     }
 }
