@@ -54,7 +54,7 @@ UV editor UI|58|UI
 Panels & dialogs (outliner, properties, toolbars)|53|UI
 Import/export UX|48|UI
 Plugin / service host|35|UI
-Game tooling (LOD, dummies/TXD, vehicles)|5|UI
+Game tooling (LOD, dummies/TXD, vehicles)|22|UI
 DATA
 )
 

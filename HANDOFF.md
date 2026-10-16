@@ -42,11 +42,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (566 `#[test]` fns; 568 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (569 `#[test]` fns; 571 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 50 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. |
+| `openforge-core` | 50 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 173 (bin) | eframe/egui GUI. `app.rs` (~5500 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status, and the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub). |
+| `openforge-app` | 176 (bin) | eframe/egui GUI. `app.rs` (~5700 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status, the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), and the **Game menu** tags LOD levels, places dummies and reports the triangle budget (`LodReport`). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -256,6 +256,19 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   along the shortest arc, so a 360° turn needs intermediate keys: the "Spin
   Selected" clip carries four quarter-turn keys, not one full-turn key.
   The timeline is another bottom panel, added after the UV editor in `update`.
+- **Game tags ride the node; the LOD preview reuses visibility.** `Node::lod`
+  is the one game tag: an `Option<u8>` (0 = highest detail), part of node
+  equality, so a tag travels through undo and serialization like any other node
+  data, and the default is untagged — an ordinary scene is unaffected. The Game
+  menu's commands are ordinary `with_edit` edits: **Set LOD 0–3 / Clear** writes
+  the tag, **Isolate LOD 0–3** hides everything the level does not hold through
+  the same `node.visible` path as Isolate (so the viewport, the picks and `U`
+  keep agreeing — no second visibility filter), and **Add Dummy** creates the
+  attach point game formats carry beside their geometry, at the selection's
+  centre (the average of the selected nodes' world positions; the origin with
+  nothing selected). The model report is `LodReport` — a fold over mesh nodes,
+  triangles per level with the untagged pile first and the totals last — shown
+  in the Properties panel and held nowhere else.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -968,9 +981,37 @@ progress report:
   stack. Both run headless, like the rest: the frame seam (`advance_animation`)
   is a method, because the painting helpers stop at the central viewport.
 
+- **Game asset prep: LOD tags, dummies, a triangle budget** (work-stream #21).
+  A generic, format-neutral take on the game half of the tool:
+  - **`Node.lod: Option<u8>`** (core): 0 = highest detail, `None` = untagged.
+    Part of node `PartialEq`, so the tag rides the existing undo snapshots and
+    the serde round-trips without new plumbing.
+  - **Game ▸ Add Dummy**: `Scene::create_dummy` existed in core; nothing had
+    ever made one. The command puts it at the selection's centre (the average
+    of the selected nodes' world positions — the origin when nothing is
+    selected), selects it, and is one undo step.
+  - **Game ▸ Set LOD 0–3 / Clear** tags the selection in one undo step, with a
+    refusal when nothing is selected ("Select a node to tag.").
+  - **Game ▸ Isolate LOD 0–3** is the preview a game model needs while one
+    detail level is worked on: every node the level does not hold is hidden
+    through the ordinary `visible` flag — one undo step, exactly like Isolate,
+    and `U` shows everything again. An untagged level is refused with the
+    reason ("Nothing is tagged LOD n — set it first.").
+  - **The model report** (`LodReport`): triangles per LOD level over a set of
+    nodes — untagged first, then levels ascending, then the total — shown in
+    the Properties panel for the selection and for the whole scene, with each
+    node's tag also printed on its row and an `LOD n` suffix in the outliner.
+
+- **3 new tests**: the tag / isolate / clear round (one undo step for the
+  isolate; the refusals for an empty selection and an untagged level); the
+  report's per-level counts and panel lines over three boxes (a dummy holds no
+  triangles and is simply absent); and the dummy landing on the origin with
+  nothing selected and at the selection's centre (2, 1, 0) otherwise — kind
+  checked, undo entry counted.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **568 pass, 0 failures**
+build too); `cargo test --workspace` → **571 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -1016,7 +1057,10 @@ a drop driven through a frame — so only the native dialogs themselves are
 left to the eye. The animation path is pinned at the transport: the spin
 clip's key times, the half turn, the full turn (the double cover included),
 45° after a quarter second of play, the pause at the end and the rewind on
-stop, with the undo stack provably untouched.
+stop, with the undo stack provably untouched. The game-prep surface is pinned
+the same way: the tag / isolate / clear round with its single undo step and its
+refusals, the dummy at the origin and at the selection's centre (its kind
+checked), and the report's counts and lines per level.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1053,7 +1097,10 @@ groups per format, the export submenu's default file names, and a drop of a
 real file onto the window) and the **timeline** by eye (Animate ▸ Spin
 Selected: the panel should appear with the clip's five key times under the
 slider, Play and Space should turn the node smoothly, and Stop should snap it
-back to the start) — the agent has no
+back to the start), and the **Game menu** by eye (Set LOD / Isolate LOD / Add
+Dummy: outliner rows should carry their `LOD n` tag, Isolate LOD 1 should
+leave only the level-1 nodes standing, and `U` should bring the rest back) —
+the agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -1064,7 +1111,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **65.0%**, shown as 65%). The engine
+16 curated areas is **66.0%**, shown as 66%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1076,7 +1123,9 @@ the selection tools (all / none / invert, grow / shrink, hide / isolate /
 unhide) as of #16, the edge loop / ring walks as of #17, the
 select-through switch with the outliner's undoable visibility box as of #18,
 the format-named import/export surface (dialogs, drops, refusals) as of #19
-and the animation timeline (spin clips, playback, scrub, Space) as of #20.
+and the animation timeline (spin clips, playback, scrub, Space) as of #20 and
+the game-prep surface (LOD tags and isolate, dummies, the triangle budget) as
+of #21.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1114,10 +1163,12 @@ Prioritized next steps:
    the remaining pieces. Per-face material assignment — the reason slots exist
    per face — landed in #9.
 
-**Honest gap to parity:** game-specific tooling (vehicles, LOD, dummies/TXD),
-the full panel/dialog surface, animation *editing* (the timeline plays clips;
-keys are not yet drawn, dragged or recorded), and exact format breadth remain
-the largest deltas and are many work-streams, not one push.
+**Honest gap to parity:** format-specific game tooling (vehicles, TXD
+dictionaries, per-game export paths — the generic half, LOD tags, dummies and
+their triangle budget, landed in #21), the full panel/dialog surface, animation
+*editing* (the timeline plays clips; keys are not yet drawn, dragged or
+recorded), and exact format breadth remain the largest deltas and are many
+work-streams, not one push.
 
 ## 8. Known gotchas when using AI subagents here
 

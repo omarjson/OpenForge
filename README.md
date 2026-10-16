@@ -151,6 +151,12 @@ A sample GitHub Actions matrix is shown below.
   listed under it. Playback poses the scene on the frame clock; it is a view
   over the clip, not an edit, so nothing lands on the undo stack — Stop
   rewinds to the start.
+- **Game ▸ Set LOD 0–3 / Clear** tags the selected nodes with a detail level
+  (0 = highest), **Isolate LOD n** shows only that level (one undo step, like
+  Isolate; **U** shows everything again), and **Add Dummy** drops an
+  attach-point dummy at the selection's centre. The **Properties panel** reports
+  the triangle budget per LOD for the selection and the whole scene, and the
+  outliner rows carry their `LOD n` tag.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,
   camera, depth test and back-face culling as the frame, so only what the image
