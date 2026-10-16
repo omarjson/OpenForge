@@ -130,7 +130,11 @@ A sample GitHub Actions matrix is shown below.
   at a sub-object level — **Ctrl+Shift+A** clears it, **Ctrl+I** inverts it,
   and **Ctrl+Plus** / **Ctrl+Minus** grow or shrink it along the topology
   (faces through shared edges, edges through shared vertices, vertices through
-  edges), the result counted in the status bar. **H** hides the selected
+  edges), the result counted in the status bar. **L** adds the edge **loop**
+  through the selected edges and **Shift+L** the **ring** (Select menu or
+  toolbar row): the loop carries straight on through vertices where exactly
+  four edges meet, the ring crosses quads into the parallel band, and both add
+  to the selection, so a second press changes nothing. **H** hides the selected
   nodes, **Shift+H** isolates them (everything else hidden) and **U** shows
   everything again; all three are undo steps, and hidden nodes drop out of the
   viewport and the picks at once.
@@ -215,13 +219,12 @@ mostly application surface. Natural next steps:
   vertices; snapping to edges, faces and midpoints, and snapping during the
   free-form view-plane drag, are still to come.
 - A deeper GPU viewport: a **select-through** toggle (picking what the frame
-  hides) and **edge ring / loop** selection — the ops crate walks face loops
-  and rings today, the edge-level walk is still to come — on top of the ID
-  pass that now resolves faces, edges and vertices — and rectangles of them —
-  exactly as drawn, with a picked edge already highlighted in the frame and
-  the selection tools (all / none / invert, grow / shrink, hide / isolate) in
-  place, then the materials node graph — normal/specular maps and mipmapped
-  sampling on top of the diffuse map that samples today.
+  hides) on top of the ID pass that now resolves faces, edges and vertices —
+  and rectangles of them — exactly as drawn, with a picked edge already
+  highlighted in the frame and the selection tools (all / none / invert,
+  grow / shrink, edge loop / ring, hide / isolate) in place, then the
+  materials node graph — normal/specular maps and mipmapped sampling on top
+  of the diffuse map that samples today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.
