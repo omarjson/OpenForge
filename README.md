@@ -147,8 +147,12 @@ A sample GitHub Actions matrix is shown below.
   nothing to change there.
 - **Animate ▸ Spin Selected (2 s)** builds a one-turn clip over the selected
   nodes' current poses and opens the **Timeline**: the clip picker, **Space**
-  to play/pause, Stop, Loop, and a scrub slider with the clip's key times
-  listed under it. Playback poses the scene on the frame clock; it is a view
+  to play/pause, Stop, Loop, and a scrub slider with the clip's **key row**
+  under it. **Key** records the selected node's current transform at the
+  playhead; clicking a key diamond scrubs to it; dragging one slides its
+  position/rotation/scale column with a live preview, and the release is one
+  undo step; **Delete Key** removes the picked column. Playback poses the
+  scene on the frame clock; it is a view
   over the clip, not an edit, so nothing lands on the undo stack — Stop
   rewinds to the start.
 - **Game ▸ Set LOD 0–3 / Clear** tags the selected nodes with a detail level

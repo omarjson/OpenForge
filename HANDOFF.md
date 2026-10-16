@@ -42,22 +42,22 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (587 `#[test]` fns; 589 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (592 `#[test]` fns; 594 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 50 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). |
+| `openforge-core` | 50 | `Mesh`, `Scene`, nodes, selection, undo (a stack generic over its snapshot, so the app restores a scene and its clip library together), tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 19 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**, and **grid-cluster decimation** (`decimate_clustered`) for LOD chains. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
 | `openforge-render` | 102 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking — faces as triangles, edges as lines, vertices as points, through a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
-| `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
+| `openforge-animation` | 54 | Keyframe tracks, interpolation, clips, player — and the key *editing* maths: `Track::retime_key`/`index_at`, `TransformTrack::key_times`/`retime_keys`/`remove_keys_at` (the timeline's columns). |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 56 | Planar/cylindrical/spherical/box projections, unwrap, pack, **UV islands by continuity with per-island atlas packing** (`islands.rs`), per-selection affine edits for the UV editor, and island-scale edits (`edit.rs`): **weld** pulls UVs to their cluster average (the island walk reads positions, so a weld makes two patches one), **split** gives selected faces private copies of corners they share outside the set, **mirror** reflects a selection about its own bounds. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 189 (bin) | eframe/egui GUI. `app.rs` (~6400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
+| `openforge-app` | 190 (bin) | eframe/egui GUI. `app.rs` (~6400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -313,6 +313,14 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   hidden on arrival (a pile of overlapping shells helps nobody) and one level
   that came back with no face removed is skipped, not added as a duplicate —
   when every level is skipped the command says so and touches nothing.
+- **A key edit is a column, on the same undo stack as the scene.** The
+  timeline edits keys through `TransformTrack`'s column helpers — `key_times`
+  for the row, `retime_keys` for a drag, `remove_keys_at` for Delete Key —
+  never ad-hoc index juggling; a drag previews live and commits one step on
+  release, a landing within 5 ms of where the key sat reads as a pick, and
+  retiming onto another key displaces it exactly as `add_key` always has. The
+  undo stack is generic over its snapshot, so the app's steps carry the scene
+  *and* the clip library: Edit ▸ Undo puts back whichever one moved.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -1174,9 +1182,42 @@ progress report:
   list, the fallback, the refusal's exact message, and the app's own tool
   still answering — and on again for the full four.
 
+- **Key editing: record, retime, delete** (work-stream #27). The timeline
+  could play a clip but not touch one — keys were a read-only line and there
+  was no way to record a pose:
+  - **`openforge-animation` grows the column maths.** `Track::index_at` finds
+    the key at an exact time; `retime_key` slides one, keeping the track
+    sorted, displacing a key already at the landing time (`add_key`'s own
+    replace rule) and refusing non-finite times; `TransformTrack::key_times`
+    lists the distinct component times, `retime_keys` moves a whole
+    position/rotation/scale column and `remove_keys_at` takes one out;
+    `Clip::track_mut` and `ClipLibrary: PartialEq` make the edits possible
+    and *visible to a snapshot*.
+  - **The key row.** One diamond per key time of the selected node's track —
+    the clip's own times, dimmed and inert, when no single driven node is
+    selected — with the playhead through it. Click a diamond to pick it and
+    scrub there; drag one to slide the column with a live preview. **Key**
+    records the selected node's transform at the playhead (making the track
+    when the clip does not drive the node); **Delete Key** removes the picked
+    column. Refusals name the missing thing: no clip, no single node, a clip
+    that does not drive it, a time with no key.
+  - **Clips ride the undo stack.** `UndoStack` is generic over its snapshot
+    (`Scene` stays the default), and the app's `AppSnapshot` carries the scene
+    *and* the `ClipLibrary`, so recording, retiming and deleting are one undo
+    step each — and scene-only gestures pair their scene snapshot with the
+    library through `push_scene_edit`.
+- **5 new tests**: three in `openforge-animation` (a retimed key keeps its
+  value and re-sorts the blend; a landing key displaces the one sitting
+  there; refusals leave the track alone), one for the column maths (retime
+  and delete across components, key times ascending and deduped), and the app
+  round — the refusals in order, keying beside a spin clip's five rotation
+  keys, a mid-clip column, undo/redo bringing the *clip* back, a refused
+  retime leaving the stack alone, and a delete that takes all three
+  components in one step.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **589 pass, 0 failures**
+build too); `cargo test --workspace` → **594 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -1236,7 +1277,9 @@ fallback, and the app-level import/export round written back to disk.
 Decimation joins them: the grid collapse, the guards, and the app's LOD round
 with its one-step undo. The tool list is measured from the registry too: four
 entries with the host's own descriptions, an empty list and a refusal when the
-plugin goes, the full list when it returns.
+plugin goes, the full list when it returns. And a key edit is a step of the
+scene's own stack now: the snapshot carries the clip library, so undo after a
+retime or a delete puts the *clip* back, not just the scene.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1272,8 +1315,11 @@ step) and the **File menu's dialogs** by eye (the import dialog's filter
 groups per format, the export submenu's default file names, a drop of a
 real file onto the window, and the new options dialog — Z up and 2× should
 land the model turned and doubled, Cancel should leave the scene alone) and the **timeline** by eye (Animate ▸ Spin
-Selected: the panel should appear with the clip's five key times under the
-slider, Play and Space should turn the node smoothly, and Stop should snap it
+Selected: the panel should appear with the clip's five key diamonds under the
+slider, clicking one should scrub to it, dragging one should slide its column
+with a live preview and land as one undo step, **Key** should record the
+node's current pose at the playhead and **Delete Key** should take it back
+out, Play and Space should turn the node smoothly, and Stop should snap it
 back to the start), and the **Game menu** by eye (Set LOD / Isolate LOD / Add
 Dummy: outliner rows should carry their `LOD n` tag, Isolate LOD 1 should
 leave only the level-1 nodes standing, and `U` should bring the rest back;
@@ -1295,7 +1341,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **70.7%**, shown as 70%). The engine
+16 curated areas is **71.5%**, shown as 71%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1314,7 +1360,9 @@ attribution) as of #22 and the island-scale UV tools (weld, split, mirror,
 grid snap) as of #23 and the import/export options dialog (up-axis and scale at
 the file boundary) as of #24 and the LOD generator (cluster decimation into
 hidden LOD 1–3 copies) as of #25 and the registry-driven tool list (the
-toolbar and hotkeys walk the host's tools) as of #26.
+toolbar and hotkeys walk the host's tools) as of #26 and the key-editing
+timeline (key rows, drag-to-retime, Key/Delete Key, clips on the undo stack)
+as of #27.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1356,9 +1404,9 @@ Prioritized next steps:
 **Honest gap to parity:** format-specific game tooling (vehicles, TXD
 dictionaries, per-game export paths — the generic half, LOD tags, dummies,
 their triangle budget and the LOD generator, landed in #21/#25), the full
-panel/dialog surface, animation
-*editing* (the timeline plays clips; keys are not yet drawn, dragged or
-recorded), and exact format breadth remain the largest deltas and are many
+panel/dialog surface, animation *authoring* beyond the key row (per-key
+easing edits, a curve view, clip-level tools), and exact format breadth
+remain the largest deltas and are many
 work-streams, not one push.
 
 ## 8. Known gotchas when using AI subagents here

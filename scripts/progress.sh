@@ -45,7 +45,7 @@ Modeling ops (extrude, inset, bevel, mirror, weld, deformers)|80|Engine
 Boolean CSG|65|Engine
 Generators & algorithms (primitives, Catmull-Clark, noise, L-systems)|80|Engine
 Materials & textures|72|Engine
-Animation (tracks, clips, playback)|65|Engine
+Animation (tracks, clips, playback, key editing)|78|Engine
 Rigging & skinning|60|Engine
 UV math (project, unwrap, pack, edits)|87|Engine
 GPU viewport (depth, shading, grid, gizmo)|88|UI
