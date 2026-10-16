@@ -243,21 +243,36 @@ fn overlay_mode(level: SelectLevel, wireframe: viewport::Wireframe) -> viewport:
     }
 }
 
+/// The rig state an undo step carries: the skeleton, its weights, the bind
+/// positions and the node they belong to.
+///
+/// Which bone the panel points at and the live pose angle are UI state and
+/// stay put across undo.
+#[derive(Clone, PartialEq)]
+struct RigSnapshot {
+    skeleton: Skeleton,
+    weights: SkinWeights,
+    bind: Vec<Vec3>,
+    node: Option<NodeId>,
+}
+
 /// One undo snapshot: everything a single edit can touch.
 ///
 /// Scene edits were once the whole story; clip edits (keying, retiming,
-/// deleting) are the second surface, so both ride every step and Edit ▸ Undo
-/// puts back whichever one moved.
+/// deleting) and skin-weight edits are the next surfaces, so all of them ride
+/// every step and Edit ▸ Undo puts back whichever one moved.
 #[derive(Clone)]
 struct AppSnapshot {
     scene: Scene,
     clips: ClipLibrary,
+    rig: Option<RigSnapshot>,
 }
 
 impl AppSnapshot {
-    /// Same content? The scene compares structurally; clips derive equality.
+    /// Same content? The scene compares structurally; clips and the rig derive
+    /// equality.
     fn same(&self, other: &Self) -> bool {
-        self.scene.content_eq(&other.scene) && self.clips == other.clips
+        self.scene.content_eq(&other.scene) && self.clips == other.clips && self.rig == other.rig
     }
 }
 
@@ -309,6 +324,10 @@ pub struct OpenForgeApp {
     rig_bone: usize,
     rig_angle: f32,
     rig_bones: usize,
+    /// How much influence the Blend tool moves onto the active bone, and how
+    /// many passes Smooth runs.
+    rig_weight: f32,
+    rig_smooth_passes: u32,
     /// Live transform-gizmo state (hover, drag, this frame's handle layout).
     gizmo: gizmo::Gizmo,
     /// What a transform drag snaps to.
@@ -403,6 +422,8 @@ impl OpenForgeApp {
             rig_bone: 0,
             rig_angle: 0.0,
             rig_bones: 4,
+            rig_weight: 0.5,
+            rig_smooth_passes: 2,
             gizmo: gizmo::Gizmo::default(),
             snap: snap::Snap::default(),
             snap_marker: None,
@@ -482,24 +503,53 @@ impl OpenForgeApp {
         }
     }
 
-    /// The current undo snapshot: the scene and the clip library.
+    /// The current undo snapshot: the scene, the clip library and the rig.
     fn snapshot(&self) -> AppSnapshot {
+        let rig = self.rig_skeleton.as_ref().map(|skeleton| RigSnapshot {
+            skeleton: skeleton.clone(),
+            weights: self
+                .rig_weights
+                .clone()
+                .unwrap_or_else(|| SkinWeights::new(0, 0)),
+            bind: self.rig_bind.clone(),
+            node: self.rig_node,
+        });
         AppSnapshot {
             scene: self.scene.clone(),
             clips: self.anim.library().clone(),
+            rig,
         }
     }
 
     /// Push a scene-only edit: `before` is the scene captured where the
-    /// gesture started. A gesture cannot span a clip edit, so today's library
-    /// is the same one it began with.
+    /// gesture started. A gesture cannot span a clip or rig edit, so today's
+    /// library and rig are the same ones it began with.
     fn push_scene_edit(&mut self, label: impl Into<String>, before: Scene) {
         let after = self.snapshot();
         let before = AppSnapshot {
             scene: before,
             clips: after.clips.clone(),
+            rig: after.rig.clone(),
         };
         self.undo.push(label, before, after);
+    }
+
+    /// Put a snapshot's rig back into the app's rig fields.
+    fn restore_rig(&mut self, rig: Option<RigSnapshot>) {
+        match rig {
+            Some(rig) => {
+                self.rig_skeleton = Some(rig.skeleton);
+                self.rig_weights = Some(rig.weights);
+                self.rig_bind = rig.bind;
+                self.rig_node = rig.node;
+            }
+            None => {
+                self.rig_skeleton = None;
+                self.rig_weights = None;
+                self.rig_bind.clear();
+                self.rig_node = None;
+            }
+        }
     }
 
     // --- Commands -----------------------------------------------------------------
@@ -983,10 +1033,143 @@ impl OpenForgeApp {
         self.status = "Rig cleared.".into();
     }
 
+    /// The rig's bone names, for the panel's picker and the statuses.
+    fn rig_bone_names(&self) -> Vec<String> {
+        self.rig_skeleton
+            .as_ref()
+            .map(|skeleton| skeleton.bones().iter().map(|bone| bone.name.clone()).collect())
+            .unwrap_or_default()
+    }
+
+    /// The name of one bone, for a status ("bone 2" when it has gone).
+    fn rig_bone_name(&self, bone: usize) -> String {
+        self.rig_skeleton
+            .as_ref()
+            .and_then(|skeleton| skeleton.bone(bone).ok())
+            .map(|bone| bone.name.clone())
+            .unwrap_or_else(|| format!("bone {bone}"))
+    }
+
+    /// The vertex set the weight tools work on: the rigged mesh selected, the
+    /// vertex level active, and at least one vertex in the element selection.
+    ///
+    /// Every refusal says which of the three is missing.
+    fn rig_weight_target(&self) -> Result<Vec<u32>, String> {
+        let Some(node) = self.rig_node else {
+            return Err("Create a rig first.".into());
+        };
+        if self.rig_weights.is_none() {
+            return Err("Create a rig first.".into());
+        }
+        if !self.selection.is_node_selected(node) {
+            return Err("Select the rigged mesh to weigh.".into());
+        }
+        if self.selection.level != SelectLevel::Vertex {
+            return Err("Switch to vertex level to weigh.".into());
+        }
+        match self.selection.selected_elements(node) {
+            Some(vertices) if !vertices.is_empty() => Ok(vertices.iter().copied().collect()),
+            _ => Err("Select vertices to weigh.".into()),
+        }
+    }
+
+    /// Bind the selected vertices to the active bone at full weight. One undo
+    /// step; a repeat that changes nothing says so and leaves the stack alone.
+    fn rig_assign_weights(&mut self) {
+        let vertices = match self.rig_weight_target() {
+            Ok(vertices) => vertices,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        let bone = self.rig_bone;
+        let name = self.rig_bone_name(bone);
+        let mut changed = 0usize;
+        self.with_edit("Assign Weights", |app| {
+            if let Some(weights) = app.rig_weights.as_mut() {
+                changed = weights.assign(&vertices, bone);
+            }
+        });
+        if changed == 0 {
+            self.status = format!("{name} already binds the selected vertices.");
+            return;
+        }
+        self.status = format!("Bound {changed} vertex(es) to {name}.");
+    }
+
+    /// Move [`Self::rig_weight`] of the selected vertices' influence onto the
+    /// active bone. One undo step.
+    fn rig_blend_weights(&mut self) {
+        let vertices = match self.rig_weight_target() {
+            Ok(vertices) => vertices,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        let bone = self.rig_bone;
+        let share = self.rig_weight.clamp(0.0, 1.0);
+        let name = self.rig_bone_name(bone);
+        let mut changed = 0usize;
+        self.with_edit("Blend Weights", |app| {
+            if let Some(weights) = app.rig_weights.as_mut() {
+                changed = weights.blend(&vertices, bone, share);
+            }
+        });
+        if changed == 0 {
+            self.status = format!("Nothing to blend — {name} already holds that share.");
+            return;
+        }
+        self.status = format!("Blended {share:.2} onto {name} ({changed} vertex(es)).");
+    }
+
+    /// Average the selected vertices' weights over the mesh's edges, one undo
+    /// step for all passes. The untouched vertices keep their weights.
+    fn rig_smooth_weights(&mut self) {
+        let vertices = match self.rig_weight_target() {
+            Ok(vertices) => vertices,
+            Err(message) => {
+                self.status = message;
+                return;
+            }
+        };
+        let edges = match self.rig_node.and_then(|node| {
+            self.scene
+                .get(node)
+                .ok()
+                .and_then(|n| n.mesh())
+                .map(|mesh| mesh.edges())
+        }) {
+            Some(edges) => edges,
+            None => {
+                self.status = "The rigged node has no mesh.".into();
+                return;
+            }
+        };
+        let passes = self.rig_smooth_passes.max(1) as usize;
+        let before = self.rig_weights.clone();
+        self.with_edit("Smooth Weights", |app| {
+            if let Some(weights) = app.rig_weights.as_ref() {
+                app.rig_weights = Some(weights.smooth(&edges, &vertices, passes));
+            }
+        });
+        if self.rig_weights == before {
+            self.status = "Nothing to smooth — the neighbours agree already.".into();
+            return;
+        }
+        self.status = format!(
+            "Smoothed weights over {} vertex(es) ({passes} pass{}).",
+            vertices.len(),
+            if passes == 1 { "" } else { "es" }
+        );
+    }
+
     fn undo_edit(&mut self) {
         if let Some(snapshot) = self.undo.undo() {
             self.scene = snapshot.scene;
             *self.anim.library_mut() = snapshot.clips;
+            self.restore_rig(snapshot.rig);
             self.selection.clear();
             self.key_selected = None;
             self.key_drag = None;
@@ -1002,6 +1185,7 @@ impl OpenForgeApp {
         if let Some(snapshot) = self.undo.redo() {
             self.scene = snapshot.scene;
             *self.anim.library_mut() = snapshot.clips;
+            self.restore_rig(snapshot.rig);
             self.selection.clear();
             self.key_selected = None;
             self.key_drag = None;
@@ -3288,11 +3472,21 @@ impl OpenForgeApp {
                 }
                 if has_rig {
                     let bone_count = self.rig_skeleton.as_ref().map(|s| s.len()).unwrap_or(0);
+                    self.rig_bone = self.rig_bone.min(bone_count.saturating_sub(1));
                     ui.label("Bone:");
-                    ui.add(
-                        egui::DragValue::new(&mut self.rig_bone)
-                            .range(0..=bone_count.saturating_sub(1)),
-                    );
+                    let names = self.rig_bone_names();
+                    egui::ComboBox::from_id_salt("rig-bone")
+                        .selected_text(
+                            names
+                                .get(self.rig_bone)
+                                .cloned()
+                                .unwrap_or_else(|| self.rig_bone.to_string()),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (index, name) in names.iter().enumerate() {
+                                ui.selectable_value(&mut self.rig_bone, index, name);
+                            }
+                        });
                     let posed = ui
                         .add(
                             egui::Slider::new(&mut self.rig_angle, -3.0..=3.0)
@@ -3315,6 +3509,45 @@ impl OpenForgeApp {
                     }
                 }
             });
+            // Fifth row: skin weights, over the vertex selection.
+            if self.rig_skeleton.is_some() {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Weights:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.rig_weight)
+                            .range(0.0..=1.0)
+                            .speed(0.01)
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text("The share Blend moves onto the active bone");
+                    if ui
+                        .button("Assign")
+                        .on_hover_text("Bind the selected vertices to the active bone (weight 1)")
+                        .clicked()
+                    {
+                        self.rig_assign_weights();
+                    }
+                    if ui
+                        .button("Blend")
+                        .on_hover_text(
+                            "Move that share of the selected vertices' influence onto the active bone",
+                        )
+                        .clicked()
+                    {
+                        self.rig_blend_weights();
+                    }
+                    ui.add(egui::DragValue::new(&mut self.rig_smooth_passes).range(1..=8))
+                        .on_hover_text("How many passes Smooth runs");
+                    if ui
+                        .button("Smooth")
+                        .on_hover_text("Average the selected vertices' weights over the mesh edges")
+                        .clicked()
+                    {
+                        self.rig_smooth_weights();
+                    }
+                });
+            }
         });
     }
 
@@ -5621,6 +5854,7 @@ mod tests {
     use super::*;
     use openforge_io::{IoResult, LoadedScene, MeshData};
     use openforge_plugin::{FormatFilter, Plugin, PluginError};
+    use openforge_rig::Influence;
 
     const SCREEN: [f32; 2] = [1000.0, 700.0];
 
@@ -8607,5 +8841,113 @@ mod tests {
         assert_eq!(track(&app).rotation.len(), 5, "the rotation key went too");
         app.undo_edit();
         assert!(track(&app).key_times().contains(&0.25));
+    }
+
+    #[test]
+    fn skin_weights_assign_blend_and_smooth_through_the_rig() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Body", primitive_box(1.0));
+
+        // No rig yet: the weight tools refuse the same way.
+        app.rig_assign_weights();
+        assert_eq!(app.status, "Create a rig first.");
+        app.rig_blend_weights();
+        assert_eq!(app.status, "Create a rig first.");
+        app.rig_smooth_weights();
+        assert_eq!(app.status, "Create a rig first.");
+
+        app.selection.select_node(id);
+        app.rig_bones = 2;
+        app.rig_create();
+        assert_eq!(app.status, "Rig created: 2 bones, auto-weighted.");
+
+        // Face level is not where weights live, and an empty vertex set is
+        // its own refusal.
+        app.rig_assign_weights();
+        assert_eq!(app.status, "Switch to vertex level to weigh.");
+        app.selection.level = SelectLevel::Vertex;
+        app.rig_assign_weights();
+        assert_eq!(app.status, "Select vertices to weigh.");
+
+        // The auto-weight put every box corner squarely on one bone; pick the
+        // ones that are not already on bone 0 and bind them to it outright.
+        let influences = |app: &OpenForgeApp, vertex: u32| {
+            app.rig_weights
+                .as_ref()
+                .unwrap()
+                .influences(vertex as usize)
+                .unwrap()
+                .to_vec()
+        };
+        let candidates: Vec<u32> = (0..8)
+            .filter(|&vertex| influences(&app, vertex) != vec![Influence { bone: 0, weight: 1.0 }])
+            .collect();
+        assert!(!candidates.is_empty(), "the box has corners off bone 0");
+
+        app.selection.set_elements(id, candidates.iter().copied());
+        app.rig_bone = 0;
+        app.rig_assign_weights();
+        assert_eq!(
+            app.status,
+            format!("Bound {} vertex(es) to bone_0.", candidates.len())
+        );
+        for &vertex in &candidates {
+            assert_eq!(influences(&app, vertex), vec![Influence { bone: 0, weight: 1.0 }]);
+        }
+
+        // A repeat changes nothing and leaves the stack alone.
+        let depth = app.undo.len();
+        app.rig_assign_weights();
+        assert_eq!(app.status, "bone_0 already binds the selected vertices.");
+        assert_eq!(app.undo.len(), depth, "a no-op is not an edit");
+
+        // Blend half of one vertex's influence onto bone 1.
+        let target = candidates[0];
+        app.rig_bone = 1;
+        app.rig_weight = 0.5;
+        app.selection.set_elements(id, [target]);
+        app.rig_blend_weights();
+        assert_eq!(app.status, "Blended 0.50 onto bone_1 (1 vertex(es)).");
+        let inf = influences(&app, target);
+        assert_eq!(inf.len(), 2);
+        assert!((inf.iter().find(|i| i.bone == 0).unwrap().weight - 0.5).abs() < 1e-6);
+        assert!((inf.iter().find(|i| i.bone == 1).unwrap().weight - 0.5).abs() < 1e-6);
+
+        // Smooth a neighbour of the blended vertex: the pass changes its
+        // influences, leaves the blended vertex where it was, and undo puts
+        // the weights back.
+        let edges = app.scene.get(id).unwrap().mesh().unwrap().edges();
+        let neighbour = edges
+            .iter()
+            .find_map(|[a, b]| match (*a, *b) {
+                _ if *a == target && *b != target => Some(*b),
+                _ if *b == target && *a != target => Some(*a),
+                _ => None,
+            })
+            .expect("the blended vertex has a neighbour");
+        let neighbour_before = influences(&app, neighbour);
+        let target_before = influences(&app, target);
+        app.selection.set_elements(id, [neighbour]);
+        app.rig_smooth_passes = 1;
+        app.rig_smooth_weights();
+        assert_eq!(app.status, "Smoothed weights over 1 vertex(es) (1 pass).");
+        assert_ne!(
+            influences(&app, neighbour),
+            neighbour_before,
+            "the pass pulled the blend in"
+        );
+        assert_eq!(
+            influences(&app, target),
+            target_before,
+            "an unselected vertex keeps its weights"
+        );
+        app.undo_edit();
+        assert_eq!(
+            influences(&app, neighbour),
+            neighbour_before,
+            "undo restores the weights"
+        );
+        assert_eq!(influences(&app, target), target_before, "and the blend stays");
     }
 }

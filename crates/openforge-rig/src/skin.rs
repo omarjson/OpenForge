@@ -3,6 +3,7 @@
 use crate::error::RigError;
 use glam::{Mat4, Vec3};
 use openforge_core::mesh::Mesh;
+use std::collections::BTreeMap;
 
 /// Default cap on how many bones may influence one vertex.
 pub const DEFAULT_MAX_INFLUENCES: usize = 4;
@@ -111,6 +112,131 @@ impl SkinWeights {
         }
         self.influences[vertex] = merged;
         Ok(())
+    }
+
+    /// Bind every listed vertex to `bone` at full weight, replacing whatever
+    /// influences it carried.
+    ///
+    /// Vertices outside the mesh and bones the skeleton does not have are
+    /// skipped, and a vertex already bound exactly there is not counted as a
+    /// change; the return value is how many vertices actually moved.
+    pub fn assign(&mut self, vertices: &[u32], bone: usize) -> usize {
+        let mut changed = 0;
+        for &vertex in vertices {
+            let vertex = vertex as usize;
+            let Ok(existing) = self.influences(vertex) else {
+                continue;
+            };
+            if existing.len() == 1 && existing[0] == (Influence { bone, weight: 1.0 }) {
+                continue;
+            }
+            if self.set_weights(vertex, &[(bone, 1.0)]).is_ok() {
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    /// Move `weight` of every listed vertex's influence onto `bone`: the
+    /// influences the vertex already carried keep their proportions of the
+    /// remaining `1 - weight`, and the bone takes the rest.
+    ///
+    /// A vertex with no influences yet ends fully on the bone, exactly as one
+    /// already fully there; `weight` outside `0..=1` and non-finite values are
+    /// clamped or refused. Returns how many vertices changed.
+    pub fn blend(&mut self, vertices: &[u32], bone: usize, weight: f32) -> usize {
+        if !weight.is_finite() {
+            return 0;
+        }
+        let weight = weight.clamp(0.0, 1.0);
+        if weight <= 0.0 {
+            return 0;
+        }
+        let mut changed = 0;
+        for &vertex in vertices {
+            let vertex = vertex as usize;
+            let Ok(existing) = self.influences(vertex) else {
+                continue;
+            };
+            let before: Vec<Influence> = existing.to_vec();
+            let mut pairs: Vec<(usize, f32)> = existing
+                .iter()
+                .filter(|influence| influence.bone != bone)
+                .map(|influence| (influence.bone, influence.weight * (1.0 - weight)))
+                .filter(|&(_, weight)| weight > 0.0)
+                .collect();
+            pairs.push((bone, weight));
+            if self.set_weights(vertex, &pairs).is_err() {
+                continue;
+            }
+            match self.influences(vertex) {
+                Ok(now) if now != before.as_slice() => changed += 1,
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    /// Smooth the weights over `edges`, `iterations` times: each affected
+    /// vertex averages its influences with those of its edge neighbours — the
+    /// vertex itself counting once alongside every neighbour, whichever way
+    /// the edge points — and the average is renormalized into a fresh set.
+    ///
+    /// Vertices outside `affect` keep their weights but still count as
+    /// neighbours; an affected vertex with no neighbours keeps its own. The
+    /// result is a new, independent `SkinWeights`; `self` is not written to.
+    pub fn smooth(&self, edges: &[[u32; 2]], affect: &[u32], iterations: usize) -> SkinWeights {
+        let mut out = self.clone();
+        if iterations == 0 {
+            return out;
+        }
+        let mut neighbours: Vec<Vec<usize>> = vec![Vec::new(); self.vertex_count];
+        for &[a, b] in edges {
+            let (a, b) = (a as usize, b as usize);
+            if a == b || a >= self.vertex_count || b >= self.vertex_count {
+                continue;
+            }
+            neighbours[a].push(b);
+            neighbours[b].push(a);
+        }
+        let affected: Vec<usize> = affect
+            .iter()
+            .map(|&vertex| vertex as usize)
+            .filter(|&vertex| vertex < self.vertex_count)
+            .collect();
+        for _ in 0..iterations {
+            // Every pass reads the previous pass's weights, so the result does
+            // not depend on the order the affected vertices are listed in.
+            let mut next: Vec<Option<Vec<(usize, f32)>>> = vec![None; self.vertex_count];
+            for &vertex in &affected {
+                let around = &neighbours[vertex];
+                if around.is_empty() {
+                    continue;
+                }
+                let mut merged: BTreeMap<usize, f32> = BTreeMap::new();
+                for influence in out.influences(vertex).unwrap_or(&[]) {
+                    *merged.entry(influence.bone).or_insert(0.0) += influence.weight;
+                }
+                for &neighbour in around {
+                    for influence in out.influences(neighbour).unwrap_or(&[]) {
+                        *merged.entry(influence.bone).or_insert(0.0) += influence.weight;
+                    }
+                }
+                let scale = 1.0 / (1 + around.len()) as f32;
+                next[vertex] = Some(
+                    merged
+                        .iter()
+                        .map(|(&bone, &weight)| (bone, weight * scale))
+                        .collect(),
+                );
+            }
+            for &vertex in &affected {
+                if let Some(pairs) = &next[vertex] {
+                    let _ = out.set_weights(vertex, pairs);
+                }
+            }
+        }
+        out
     }
 }
 
@@ -370,5 +496,79 @@ mod tests {
             skin_positions(&[Vec3::ZERO], &[], &w1),
             Err(RigError::InvalidBone { index: 1, count: 0 })
         ));
+    }
+
+    #[test]
+    fn assigning_binds_a_vertex_to_one_bone() {
+        let mut w = SkinWeights::new(3, 2);
+        w.set_weights(0, &[(0, 0.5), (1, 0.5)]).unwrap();
+
+        assert_eq!(w.assign(&[0, 2], 1), 2, "both vertices changed");
+        assert_eq!(w.influences(0).unwrap(), &[Influence { bone: 1, weight: 1.0 }]);
+        assert_eq!(w.influences(2).unwrap(), &[Influence { bone: 1, weight: 1.0 }]);
+        assert_eq!(w.assign(&[0], 1), 0, "already exactly that");
+        assert_eq!(w.assign(&[7], 0), 0, "outside the mesh");
+        assert_eq!(w.assign(&[1], 5), 0, "no such bone");
+    }
+
+    #[test]
+    fn blending_moves_a_share_onto_the_bone() {
+        let mut w = SkinWeights::new(2, 3);
+        w.set_weights(0, &[(0, 1.0)]).unwrap();
+
+        // Half the influence moves over; the rest keeps its proportion.
+        assert_eq!(w.blend(&[0], 1, 0.5), 1);
+        let inf = w.influences(0).unwrap();
+        assert_eq!(inf.len(), 2, "{inf:?}");
+        assert!((inf.iter().find(|i| i.bone == 0).unwrap().weight - 0.5).abs() < 1e-6);
+        assert!((inf.iter().find(|i| i.bone == 1).unwrap().weight - 0.5).abs() < 1e-6);
+
+        // An unbound vertex simply lands on the bone, and repeating a blend
+        // that is already in effect counts nothing.
+        assert_eq!(w.blend(&[1], 2, 0.75), 1);
+        assert_eq!(w.influences(1).unwrap(), &[Influence { bone: 2, weight: 1.0 }]);
+        assert_eq!(w.blend(&[1], 2, 0.75), 0, "already fully there");
+        assert_eq!(w.blend(&[0], 1, 0.0), 0, "nothing to move");
+        assert_eq!(w.blend(&[0], 1, f32::NAN), 0);
+        assert_eq!(w.blend(&[0], 9, 0.5), 0, "no such bone");
+    }
+
+    #[test]
+    fn smoothing_averages_over_the_edges() {
+        let mut w = SkinWeights::new(3, 2);
+        w.set_weights(0, &[(0, 1.0)]).unwrap();
+        w.set_weights(1, &[(0, 1.0)]).unwrap();
+        w.set_weights(2, &[(1, 1.0)]).unwrap();
+
+        // A line 0 — 1 — 2; smoothing only the middle one averages its own
+        // influence with both neighbours', pulling a third of bone 1 into it.
+        let smoothed = w.smooth(&[[0, 1], [1, 2]], &[1], 1);
+        let inf = smoothed.influences(1).unwrap();
+        let weight = |bone: usize| {
+            inf.iter().find(|i| i.bone == bone).map(|i| i.weight).unwrap_or(0.0)
+        };
+        assert!((weight(0) - 2.0 / 3.0).abs() < 1e-6, "{}", weight(0));
+        assert!((weight(1) - 1.0 / 3.0).abs() < 1e-6, "{}", weight(1));
+        assert!((total(inf) - 1.0).abs() < 1e-6, "still normalized");
+        // The untouched vertices are the same as before, and the source was
+        // not written to.
+        assert_eq!(smoothed.influences(0).unwrap(), &[Influence { bone: 0, weight: 1.0 }]);
+        assert_eq!(smoothed.influences(2).unwrap(), &[Influence { bone: 1, weight: 1.0 }]);
+        assert_eq!(w.influences(1).unwrap(), &[Influence { bone: 0, weight: 1.0 }]);
+
+        // A second pass pulls more of the far end in; zero passes is a copy,
+        // and an edge that names no real neighbour leaves the vertex alone.
+        let twice = w.smooth(&[[0, 1], [1, 2]], &[1], 2);
+        let inf = twice.influences(1).unwrap();
+        let far = inf.iter().find(|i| i.bone == 1).map(|i| i.weight).unwrap_or(0.0);
+        assert!(far > 1.0 / 3.0, "{far}");
+        assert_eq!(
+            w.smooth(&[[0, 1]], &[1], 0).influences(1).unwrap(),
+            w.influences(1).unwrap()
+        );
+        assert_eq!(
+            w.smooth(&[[1, 9], [1, 1]], &[1], 1).influences(1).unwrap(),
+            w.influences(1).unwrap()
+        );
     }
 }
