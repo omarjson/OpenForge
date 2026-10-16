@@ -9,6 +9,8 @@ use crate::viewport::{self, Camera};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
 use glam::{Mat4, Vec2, Vec3, Vec4};
+use openforge_animation::{Clip, Interp, Player, TransformTrack};
+use openforge_core::math::Transform;
 use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
 use openforge_core::scene::Scene;
@@ -33,6 +35,14 @@ use std::path::{Path, PathBuf};
 /// Slot `0` must stay the default (and untextured): it is what every
 /// unassigned face resolves to. One preset carries a procedural checkerboard,
 /// so texturing can be seen without importing an image first.
+/// How long the "Spin Selected" clip runs, and how many keys carry the turn.
+///
+/// Four quarter-turn keys rather than a single 360° one: quaternion tracks
+/// blend along the shortest arc, and a 360° end key would blend back the way
+/// it came — the keys make the turn happen in the direction asked for.
+const SPIN_SECONDS: f64 = 2.0;
+const SPIN_STEPS: u32 = 4;
+
 fn default_materials() -> MaterialLibrary {
     let mut library = MaterialLibrary::new();
     for (name, rgb, shininess, specular) in [
@@ -136,6 +146,11 @@ pub struct OpenForgeApp {
     gpu: Option<GpuViewport>,
     /// UV editor panel state.
     uv: UvEditor,
+    /// The animation transport: the clips made in the app, the selected one,
+    /// and the playback clock the timeline drives.
+    anim: Player,
+    /// Whether the timeline panel is open.
+    anim_open: bool,
     /// Whether the viewport was interacted with this frame (drives repaint).
     dirty: bool,
     show_outliner: bool,
@@ -230,6 +245,8 @@ impl OpenForgeApp {
             tris: Vec::new(),
             gpu,
             uv: UvEditor::default(),
+            anim: Player::new(),
+            anim_open: false,
             dirty: true,
             show_outliner: true,
             show_properties: true,
@@ -2279,6 +2296,11 @@ impl OpenForgeApp {
 
 impl eframe::App for OpenForgeApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        // The transport advances on the frame's own clock, before anything
+        // paints, so the picture shows the pose it lands on. A hitch (a
+        // dragged window, a sleeping machine) must not jump the clip, so the
+        // step is capped.
+        self.advance_animation(ctx.input(|i| i.stable_dt as f64).min(0.25));
         self.handle_menu(ctx);
         self.handle_shortcuts(ctx);
         self.handle_top_toolbar(ctx);
@@ -2288,6 +2310,7 @@ impl eframe::App for OpenForgeApp {
         // input — clear of the bottom panels.
         self.handle_status_bar(ctx);
         self.handle_uv_editor(ctx);
+        self.handle_timeline(ctx);
         self.handle_side_panels(ctx);
         self.handle_central_viewport(ctx, frame.wgpu_render_state());
         self.import_dropped_files(ctx);
@@ -2366,6 +2389,35 @@ impl OpenForgeApp {
                             self.create_primitive(kind);
                             ui.close_menu();
                         }
+                    }
+                });
+                ui.menu_button("Animate", |ui| {
+                    if ui
+                        .button("Spin Selected (2 s)")
+                        .on_hover_text("One full turn about Y from each node's own pose")
+                        .clicked()
+                    {
+                        self.add_spin_clip();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Play / Pause (Space)").clicked() {
+                        self.toggle_playback();
+                        ui.close_menu();
+                    }
+                    if ui.button("Stop").clicked() {
+                        self.stop_playback();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button(format!(
+                            "Timeline: {}",
+                            if self.anim_open { "shown" } else { "hidden" }
+                        ))
+                        .clicked()
+                    {
+                        self.anim_open = !self.anim_open;
+                        ui.close_menu();
                     }
                 });
                 ui.menu_button("Select", |ui| {
@@ -2527,6 +2579,10 @@ impl OpenForgeApp {
         }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::P)) {
             self.toggle_select_through();
+        }
+        // Space is the transport: start and pause the animation.
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Space)) {
+            self.toggle_playback();
         }
         // Visibility.
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::SHIFT, egui::Key::H)) {
@@ -3633,6 +3689,235 @@ impl OpenForgeApp {
                     ui.label(file);
                 });
             });
+        });
+    }
+
+    // --- Animation --------------------------------------------------------------
+
+    /// Build a spin clip for the selected nodes: one full turn about Y over
+    /// [`SPIN_SECONDS`], in quarter-turn keys starting from each node's own
+    /// rotation.
+    ///
+    /// The clip is named around "spin" without colliding with the clips the
+    /// transport already holds, selected for playback and shown in the
+    /// timeline; the nodes themselves are untouched until it runs.
+    fn add_spin_clip(&mut self) {
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        if ids.is_empty() {
+            self.status = "Select a node to animate.".into();
+            return;
+        }
+        let name = self.unique_clip_name("spin");
+        let mut clip = Clip::new(name.clone());
+        for id in &ids {
+            let start = self
+                .scene
+                .get(*id)
+                .map(|n| n.transform.rotation)
+                .unwrap_or(Quat::IDENTITY);
+            let mut track = TransformTrack::targeting(*id);
+            for step in 0..=SPIN_STEPS {
+                let time = f64::from(step) * SPIN_SECONDS / f64::from(SPIN_STEPS);
+                let turn = Quat::from_rotation_y(
+                    std::f32::consts::TAU * step as f32 / SPIN_STEPS as f32,
+                );
+                track.add_rotation_key(time, turn * start, Interp::Linear);
+            }
+            clip.add_track(track);
+        }
+        self.anim.library_mut().add_clip(clip);
+        self.anim.select_clip(&name);
+        self.anim_open = true;
+        self.status = format!(
+            "Created {name} — {SPIN_SECONDS:.2} s over {} node(s).",
+            ids.len()
+        );
+    }
+
+    /// A clip name around `base` that the transport does not hold yet.
+    fn unique_clip_name(&self, base: &str) -> String {
+        let mut name = base.to_string();
+        let mut n = 2;
+        while self.anim.library().clip(&name).is_some() {
+            name = format!("{base} {n}");
+            n += 1;
+        }
+        name
+    }
+
+    /// Every key time in the selected clip, sorted and deduplicated — what the
+    /// timeline draws its ticks from.
+    fn clip_key_times(&self) -> Vec<f32> {
+        let Some(clip) = self.anim.current_clip() else {
+            return Vec::new();
+        };
+        let mut times: Vec<f32> = clip
+            .tracks()
+            .iter()
+            .flat_map(|track| {
+                track
+                    .position
+                    .keys()
+                    .iter()
+                    .map(|key| key.time)
+                    .chain(track.rotation.keys().iter().map(|key| key.time))
+                    .chain(track.scale.keys().iter().map(|key| key.time))
+            })
+            .map(|time| time as f32)
+            .collect();
+        times.sort_by(f32::total_cmp);
+        times.dedup();
+        times
+    }
+
+    /// Start or pause the transport.
+    fn toggle_playback(&mut self) {
+        let Some(name) = self.anim.current_clip_name().map(str::to_string) else {
+            self.status = "No clip — Animate ▸ Spin Selected to make one.".into();
+            return;
+        };
+        if self.anim.playing {
+            self.anim.pause();
+            self.status = format!("Paused at {:.2} s.", self.anim.time);
+        } else {
+            self.anim.play();
+            self.status = format!("Playing {name}.");
+        }
+    }
+
+    /// Stop the transport, rewind, and put the scene back at the clip's start.
+    fn stop_playback(&mut self) {
+        self.anim.stop();
+        self.pose_current();
+        self.status = "Stopped.".into();
+    }
+
+    /// Seek the transport and leave the scene posed there.
+    fn scrub_to(&mut self, time: f64) {
+        self.anim.seek(time);
+        self.pose_current();
+        self.status = self.transport_readout();
+    }
+
+    /// What a scrub or a stop reports: where the transport now stands.
+    fn transport_readout(&self) -> String {
+        match self.anim.current_clip_name() {
+            Some(name) => format!(
+                "{name} — {:.2} s of {:.2} s.",
+                self.anim.time,
+                self.anim.duration()
+            ),
+            None => "No clip to scrub.".into(),
+        }
+    }
+
+    /// Advance the transport by one frame and pose the scene with the result.
+    ///
+    /// Playback is a view over the clip, not an edit: it writes node
+    /// transforms so the frame shows the animation, and it leaves no undo
+    /// entry — whatever pose it stops at is simply where the scene stands.
+    fn advance_animation(&mut self, delta: f64) {
+        let poses = self.anim.step(delta);
+        if poses.is_empty() {
+            return;
+        }
+        self.apply_poses(&poses);
+    }
+
+    /// Pose the scene at the transport's current time without running the
+    /// clock.
+    fn pose_current(&mut self) {
+        let Some(poses) = self
+            .anim
+            .current_clip()
+            .map(|clip| clip.sample_all(self.anim.time))
+        else {
+            return;
+        };
+        self.apply_poses(&poses);
+    }
+
+    /// Write sampled transforms onto their nodes.
+    ///
+    /// A node the clip names may be gone; its pose is skipped.
+    fn apply_poses(&mut self, poses: &[(NodeId, Transform)]) {
+        for (id, transform) in poses {
+            if let Ok(node) = self.scene.get_mut(*id) {
+                node.transform = *transform;
+            }
+        }
+        self.dirty = true;
+    }
+
+    /// The timeline panel: the clip picker, the transport buttons, and the
+    /// scrub slider with the selected clip's key times under it.
+    fn handle_timeline(&mut self, ctx: &egui::Context) {
+        if !self.anim_open {
+            return;
+        }
+        egui::TopBottomPanel::bottom("timeline").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Timeline");
+                if ui.button("Close").clicked() {
+                    self.anim_open = false;
+                }
+                ui.separator();
+
+                let names: Vec<String> = self
+                    .anim
+                    .library()
+                    .clip_names()
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect();
+                let current = self
+                    .anim
+                    .current_clip_name()
+                    .unwrap_or("(no clip)")
+                    .to_string();
+                egui::ComboBox::from_label("Clip")
+                    .selected_text(current)
+                    .show_ui(ui, |ui| {
+                        for name in &names {
+                            if ui.selectable_label(false, name).clicked() {
+                                self.anim.select_clip(name);
+                                self.pose_current();
+                            }
+                        }
+                    });
+                ui.separator();
+
+                let playing = self.anim.playing;
+                if ui.button(if playing { "Pause" } else { "Play" }).clicked() {
+                    self.toggle_playback();
+                }
+                if ui.button("Stop").clicked() {
+                    self.stop_playback();
+                }
+                let mut looping = self.anim.looping;
+                if ui.checkbox(&mut looping, "Loop").changed() {
+                    self.anim.looping = looping;
+                }
+                ui.separator();
+                ui.label(self.transport_readout());
+            });
+
+            let duration = self.anim.duration() as f32;
+            let mut time = self.anim.time as f32;
+            let changed = ui
+                .add_enabled(
+                    duration > 0.0,
+                    egui::Slider::new(&mut time, 0.0..=duration.max(0.001)).suffix(" s"),
+                )
+                .changed();
+            if changed {
+                self.scrub_to(time as f64);
+            }
+            let keys = self.clip_key_times();
+            if !keys.is_empty() {
+                let ticks: Vec<String> = keys.iter().map(|t| format!("{t:.2}")).collect();
+                ui.label(format!("keys: {}", ticks.join(", ")));
+            }
         });
     }
 
@@ -6472,6 +6757,100 @@ mod tests {
         assert_eq!(app.scene.node_count(), 1, "one of the two files landed");
         assert_eq!(app.status, "Dropped 2 file(s) — imported 1 mesh node(s).");
         let _ = std::fs::remove_file(&obj);
+    }
+
+    #[test]
+    fn a_spin_clip_turns_the_selected_node_and_plays_it() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Cube", primitive_box(1.0));
+        app.selection.select_node(id);
+
+        app.add_spin_clip();
+        assert!(app.anim_open, "the timeline opens with the clip");
+        assert_eq!(app.anim.current_clip_name(), Some("spin"));
+        assert_eq!(app.status, "Created spin — 2.00 s over 1 node(s).");
+        assert_eq!(
+            app.scene.get(id).unwrap().transform.rotation,
+            Quat::IDENTITY,
+            "the clip leaves the scene where it stood"
+        );
+
+        // A scrub is a still frame of the clip: half way is half a turn.
+        app.scrub_to(1.0);
+        assert_eq!(app.status, "spin — 1.00 s of 2.00 s.");
+        let half = app.scene.get(id).unwrap().transform.rotation;
+        assert!(
+            half.w.abs() < 1e-4 && (half.y.abs() - 1.0).abs() < 1e-4,
+            "half a turn: {half:?}"
+        );
+
+        // The end lands back on the start (up to the quaternion double cover).
+        app.scrub_to(2.0);
+        let end = app.scene.get(id).unwrap().transform.rotation;
+        assert!((end.w.abs() - 1.0) < 1e-4, "a full turn: {end:?}");
+
+        // The transport turns it on the clock: a quarter second of a two
+        // second turn is 45°.
+        app.scrub_to(0.0);
+        app.toggle_playback();
+        assert_eq!(app.status, "Playing spin.");
+        app.advance_animation(0.25);
+        let turned = app.scene.get(id).unwrap().transform.rotation * Vec3::X;
+        let want = Quat::from_rotation_y(std::f32::consts::TAU / 8.0) * Vec3::X;
+        assert!((turned - want).length() < 1e-4, "{turned:?} vs {want:?}");
+
+        // Running past the end pauses at the end.
+        app.advance_animation(1.0);
+        app.advance_animation(1.0);
+        assert!(!app.anim.playing, "the transport pauses at the end");
+        assert_eq!(app.anim.time, 2.0);
+
+        app.stop_playback();
+        assert_eq!(app.status, "Stopped.");
+        assert_eq!(
+            app.scene.get(id).unwrap().transform.rotation,
+            Quat::IDENTITY,
+            "a stop rewinds the scene to the clip's start"
+        );
+    }
+
+    #[test]
+    fn playback_is_not_an_undo_step_and_clips_do_not_collide() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+
+        app.toggle_playback();
+        assert_eq!(app.status, "No clip — Animate ▸ Spin Selected to make one.");
+        app.add_spin_clip();
+        assert_eq!(app.status, "Select a node to animate.");
+
+        let id = app.scene.create_mesh("Cube", primitive_box(1.0));
+        app.selection.select_node(id);
+        app.add_spin_clip();
+        assert_eq!(app.anim.current_clip_name(), Some("spin"));
+        assert_eq!(
+            app.clip_key_times(),
+            vec![0.0, 0.5, 1.0, 1.5, 2.0],
+            "the turn is carried by five keys"
+        );
+        app.add_spin_clip();
+        assert_eq!(
+            app.anim.current_clip_name(),
+            Some("spin 2"),
+            "a second clip gets its own name"
+        );
+
+        // Playback writes the pose and leaves the undo stack alone.
+        app.anim.select_clip("spin");
+        app.toggle_playback();
+        app.advance_animation(0.5);
+        assert_ne!(
+            app.scene.get(id).unwrap().transform.rotation,
+            Quat::IDENTITY,
+            "the clip turned the node"
+        );
+        assert!(!app.undo.can_undo(), "playback is not an edit");
     }
 
     #[test]

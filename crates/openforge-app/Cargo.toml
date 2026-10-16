@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 openforge-core = { path = "../openforge-core" }
+openforge-animation = { path = "../openforge-animation" }
 openforge-io = { path = "../openforge-io" }
 openforge-materials = { path = "../openforge-materials" }
 openforge-ops = { path = "../openforge-ops" }
