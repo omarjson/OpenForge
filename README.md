@@ -107,17 +107,23 @@ A sample GitHub Actions matrix is shown below.
   selection outline, then every visible mesh's wireframe (**View → Wireframe**
   shows the current mode). Edges of the selected faces are highlighted, and
   edges seen only from behind are dropped so a closed mesh doesn't draw its own
-  far side through the shading. On the wgpu backend the overlay is drawn inside
-  the frame (depth-tested, so meshes occlude hidden edges) and the viewport is
-  anti-aliased when the GPU supports it; the CPU fallback paints the edges on
-  top.
+  far side through the shading; at the **Edge** level an *off* overlay is
+  drawn as the selected meshes' outline anyway, so the lines a pick can answer
+  from are on screen while the setting itself stays where the user left it. On
+  the wgpu backend the overlay is drawn inside the frame (depth-tested, so
+  meshes occlude hidden edges) and the viewport is anti-aliased when the GPU
+  supports it; the CPU fallback paints the edges on top.
 - **Vertex / Edge / Face level** editing: select sub-objects and the gizmo moves to
   their centroid, where a drag moves *only* those vertices — the node's own
   transform is left alone. Edges are numbered by the mesh's own edge
   enumeration, one list every picker answers from, and a selected edge carries
-  its endpoints into the drag like a corner carries a vertex. Changing level
+  its endpoints into the drag like a corner carries a vertex, and is drawn as a
+  bold highlight so what is selected reads in the picture, not just the status
+  bar. Changing level
   clears the element selection, because a face index and a vertex index are not
-  the same thing.
+  the same thing — and the viewport refuses to read one level's indices as
+  another's, so a selected edge never tints a face that happens to share its
+  number.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,
   camera, depth test and back-face culling as the frame, so only what the image
@@ -198,13 +204,12 @@ mostly application surface. Natural next steps:
   scale (translation already has fields). Snapping is in for the grid and for
   vertices; snapping to edges, faces and midpoints, and snapping during the
   free-form view-plane drag, are still to come.
-- A deeper GPU viewport: **showing an edge selection in the frame** (a picked
-  edge is counted in the status bar but not yet highlighted) and the selection
-  tools around the levels (isolate/hide, a select-through toggle, grow/shrink)
-  on top of the ID pass that now resolves faces, edges and vertices — and
-  rectangles of them — exactly as drawn, then the materials node graph —
-  normal/specular maps and mipmapped sampling on top of the diffuse map that
-  samples today.
+- A deeper GPU viewport: the selection **tools** around the levels
+  (isolate/hide, a select-through toggle, grow/shrink) on top of the ID pass
+  that now resolves faces, edges and vertices — and rectangles of them —
+  exactly as drawn, with a picked edge already highlighted in the frame, then
+  the materials node graph — normal/specular maps and mipmapped sampling on top
+  of the diffuse map that samples today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
 - More standard formats (FBX-ascii, USDZ, glTF extensions) behind the same `openforge-io` traits.

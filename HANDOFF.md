@@ -42,11 +42,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (534 `#[test]` fns; 536 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (540 `#[test]` fns; 542 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 38 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by. |
+| `openforge-core` | 39 | `Mesh`, `Scene`, nodes, selection, undo, tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, and `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index). |
 | `openforge-io` | 13 | Import/export: OBJ, glTF/GLB, PLY, STL. |
 | `openforge-ops` | 17 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 153 (bin) | eframe/egui GUI. `app.rs` (~4700 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). |
+| `openforge-app` | 158 (bin) | eframe/egui GUI. `app.rs` (~4800 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -168,6 +168,27 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   lines are a `LineList` pass with `CullMode::None` and `LessEqual` drawn
   between the faces and the points, so an edge wins the pixels it lies on and
   still loses to anything genuinely in front of it. See §8.
+- **Element indices belong to their level, and the frame reads them only
+  there** (`Selection::selected_faces` in `openforge-core`). The element set is
+  plain `u32`s, and edge 0 is not face 0 (nor vertex 0) however much the number
+  looks like one, so every path that shades a *face* by the selection asks
+  `selected_faces`, which answers only while the face level is the one being
+  edited: `viewport::collect_triangles` (the CPU tint), `collect_edges` (the
+  `face_selected` flag) and the app's `node_materials` (the GPU per-face
+  colours). The app's own `selected_faces` helper (the modeling ops' face list,
+  and the UV panel's "faces selected in the viewport") asks the same question,
+  so those ops refuse at any other level instead of acting on edge indices.
+- **Edge level draws its own aids, and the frame's overlay falls back on it.**
+  A pick has a tolerance but a line nobody can see is a line nobody can aim at,
+  so an *off* overlay is drawn as the selected meshes' outline at the edge
+  level (`overlay_mode` in `app.rs`, feeding both backends); the setting itself
+  is untouched — `Z` still cycles it and the View menu still reports it. On top
+  of that, `paint_selected_edges` marks every picked edge with a bold
+  `ELEMENT_SELECTED_SRGB` line, the same hue a selected vertex's dot and a
+  selected face's edges take, so "selected" reads as one colour at every level.
+  Both viewports draw it the way they draw the vertex dots — projected through
+  the shared camera, on top, unoccluded — while the GPU overlay itself stays
+  depth-tested inside the frame (see §8).
 - **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
   the canvas math and panel state, `app.rs` owns the wiring).
   `uv_editor::island_selection` grows a UV selection to whole islands through
@@ -734,9 +755,47 @@ progress report:
   over the quad's upper-left corner selects exactly the top and left edges, the
   whole quad all four of them, with the status counting them.
 
+- **Showing the selection in the frame** (work-stream #15). #14's last gap: the
+  picture did not show a picked edge, only the status bar counted it.
+  - **The frame's overlay falls back to the outline at edge level.**
+    `overlay_mode` draws an *off* overlay as the selected meshes' edges there,
+    so the lines a pick can answer from are on screen the moment a node is
+    being edited — the same context the vertex level gets from its dots. The
+    setting itself is untouched: `Z` still cycles it, the View menu still
+    reports it.
+  - **A picked edge is marked.** `paint_selected_edges` draws a bold
+    `ELEMENT_SELECTED_SRGB` line over every selected edge — the same hue a
+    selected vertex's dot and a selected face's edges take, so "selected" reads
+    as one colour at every level — from the same `Mesh::edges()` indices the
+    pick answered with, projected through the shared camera on both paths, on
+    top and unoccluded exactly like the dots. The GPU overlay itself stays
+    depth-tested inside the frame; the aid is an overlay, not part of the
+    shaded image.
+  - **A latent misread fell out of the same review.** The display paths read the
+    element set as *face* indices without checking the level, so at edge level
+    a selected edge 0 tinted face 0 — in three places: the CPU triangle tint,
+    the overlay's `face_selected` flag and the GPU path's per-face colours. All
+    three now ask `Selection::selected_faces`, which answers only while the
+    face level is the one being edited; the app's modeling-op and UV face lists
+    use it too, so a face op at another level refuses instead of acting on edge
+    indices.
+
+- **6 new tests**: 1 in `openforge-core` (`selected_faces` answers at the face
+  level, refuses at the edge level, and leaves the indices themselves alone),
+  2 in `viewport.rs` (`collect_edges` flags no `face_selected` at edge level
+  while the node flag stays and the face level still flags the same index;
+  `collect_triangles` tints only at the face level), and 3 in `app.rs`:
+  `overlay_mode`'s table (the fallback only at edge level *and* an off overlay,
+  a chosen mode drawn as chosen), the frame test driving a real corner
+  rectangle — four outline strokes through the off overlay, exactly two bold
+  highlights landing within 1.5 px of the projected top and left edges of the
+  quad, none at face level — and the GPU face colours (an edge selection keeps
+  every face on the node tint, while the same index at the face level carries
+  the face tint).
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **536 pass, 0 failures**
+build too); `cargo test --workspace` → **542 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -763,7 +822,10 @@ readbacks (an edge rectangle finds exactly the near quad's four edges — which
 is also the proof that a line beats the face at the same depth — and a click on
 a quad's top side finds that edge first while the face still resolves behind
 it), the ray-vs-segment and segment-rectangle rules in `viewport.rs`, and both
-gestures end to end in `app.rs`.
+gestures end to end in `app.rs` — plus what the edge level *draws*: the frames
+are asserted on the shapes painted (four outline strokes through an off
+overlay, two bold highlight segments matched against the projected edge
+endpoints), and `overlay_mode`'s table is tested directly.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -781,10 +843,12 @@ Islands should leave each island in its own cell with a gutter) and the
 rectangle should follow the pointer, Shift should add to the selection rather
 than replace it, and the wgpu path's answer — which the headless tests can only
 prove through a readback — should match what the image shows), and the
-**edge-level picking in the live app** (click an edge, drag a box at the Edge
-level: the pass answers from one-pixel lines, and a selected edge is *not* yet
-highlighted in the frame — the status bar counts it, the picture does not show
-it, which is the natural next stream) — the agent has no
+**edge-level picking and its highlight in the live app** (click an edge, drag a
+box at the Edge level: the pass answers from one-pixel lines, the frame should
+outline the edited mesh through an off overlay and draw a bold line over every
+picked edge, and the highlight is projected rather than depth-tested — so a
+picked edge behind a face glows through, exactly like the vertex dots) — the
+agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -795,24 +859,24 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **63.2%**, shown as 63%). The engine
+16 curated areas is **63.4%**, shown as 63%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
 gizmo snapping as of #10, textures sampling on both paths as of #11,
 sub-object picking that matches the drawn frame (plus UV islands) as of #12,
-rectangle selection through that same pass as of #13 and edge-level picking by
-click and rectangle as of #14.
+rectangle selection through that same pass as of #13, edge-level picking by
+click and rectangle as of #14 and the visible sub-object selection as of #15.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
    material shading (#9), texture sampling (#11), occlusion-exact sub-object
-   picking (#12), rectangle selection (#13) and edge-level picking (#14) are in.
-   What remains of the editor surface: **showing the edge selection** (a
-   selected edge is not highlighted in the frame yet — the status bar counts the
-   selection, the picture does not show it) and the selection *tools* around the
-   levels (isolate/hide, a select-through toggle, grow/shrink).
-   Beyond that: shadowing / ambient occlusion and a configurable shading mode.
+   picking (#12), rectangle selection (#13), edge-level picking (#14) and the
+   visible sub-object selection (#15: the edge-level outline fallback and the
+   bold picked-edge highlight) are in. What remains of the editor surface: the
+   selection *tools* around the levels (isolate/hide, a select-through toggle,
+   grow/shrink). Beyond that: shadowing / ambient occlusion and a configurable
+   shading mode.
 2. **Extend the gizmo further** (`gizmo.rs`, all additive): plane and centre
    handles, and numeric entry for rotation/scale (translation already has
    DragValues in Properties). Snapping landed in #10 but is deliberately partial:
@@ -901,6 +965,14 @@ deltas and are many work-streams, not one push.
   wrong). The list is derived from the face list, so editing faces renumbers
   edges: an Edge-level selection index only means anything while the faces it
   was picked from do not move.
+- **Element indices are per level — never read one level's set as another's.**
+  The element set holds plain `u32`s with no level attached, so a face-shading
+  path that looks up `selected_elements` directly will tint whatever face
+  shares a selected *edge's* (or vertex's) index — three display paths did
+  exactly that until #15, where a selected edge 0 tinted face 0. Ask
+  `Selection::selected_faces` for faces (it answers only at the face level);
+  the indices themselves stay where they were put, so `element_count` and the
+  status bar count them at any level.
 - **In `app.rs` tests the viewport rect is the whole `SCREEN` (1000×700).**
   `CentralPanel` gets no margin in that path, so
   `viewport::project(app.camera.view_proj(SCREEN[0] / SCREEN[1]), world, SCREEN)`
@@ -915,7 +987,14 @@ deltas and are many work-streams, not one push.
   (depth-tested, `LessEqual`, no depth write); `paint_gpu_viewport` therefore
   must not also call `paint_wireframe`, or every edge draws twice. The CPU
   fallback still paints the overlay on top, and both paths share the
-  `viewport::EDGE_*` colours through `gpu_viewport::edge_vertices`.
+  `viewport::EDGE_*` colours through `gpu_viewport::edge_vertices`. The frame
+  must ask `overlay_mode`, not `self.wireframe` directly: it is what turns an
+  *off* overlay into the selected meshes' outline at the edge level (the
+  setting itself stays as the user left it), so a new call site that reads the
+  field would draw nothing there. The **edge-level highlight is deliberately
+  not built from that overlay**: `paint_selected_edges` projects each picked
+  edge on top, unoccluded, on both paths — an editing aid exactly like the
+  vertex dots — so it reads through whatever the depth-tested frame shows.
 - **eframe picks its backend from `renderer: eframe::Renderer::Wgpu`** in
   `main.rs`. eframe's default features still include `glow`, so without that line
   the GPU path would silently never activate and the app would quietly stay on
