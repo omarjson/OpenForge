@@ -198,6 +198,30 @@ pub trait UvOps {
         rotate: f32,
         pivot: Vec2,
     );
+
+    /// Pull the given UV entries together: entries closer than `tolerance`
+    /// take their cluster's average position, so the island walk (which reads
+    /// UV *positions*) sees them as one.
+    ///
+    /// Clusters are built greedily in index order, so the result is stable.
+    /// Returns how many clusters held more than one entry; a negative or
+    /// non-finite tolerance does nothing.
+    fn uv_weld(&mut self, indices: &[u32], tolerance: f32) -> usize;
+
+    /// Give the given faces private copies of every UV corner they share with
+    /// a face outside the set — the mechanical half of a split; the copies
+    /// only drift apart once one side is moved.
+    ///
+    /// Returns how many corners got a private copy; out-of-range faces are
+    /// ignored.
+    fn uv_split_faces(&mut self, faces: &[u32]) -> usize;
+
+    /// Mirror the given UV entries about their combined bounds:
+    /// `u' = min + max - u` along the chosen axis (`horizontal` mirrors u,
+    /// else v).
+    ///
+    /// Repeated indices move once; returns how many entries moved.
+    fn uv_mirror(&mut self, indices: &[u32], horizontal: bool) -> usize;
 }
 
 // A single impl block (Rust allows only one per trait/type pair); the bodies
@@ -280,6 +304,18 @@ impl UvOps for Mesh {
         pivot: Vec2,
     ) {
         edit::uv_transform_selected(self, indices, translate, scale, rotate, pivot);
+    }
+
+    fn uv_weld(&mut self, indices: &[u32], tolerance: f32) -> usize {
+        edit::uv_weld(self, indices, tolerance)
+    }
+
+    fn uv_split_faces(&mut self, faces: &[u32]) -> usize {
+        edit::uv_split_faces(self, faces)
+    }
+
+    fn uv_mirror(&mut self, indices: &[u32], horizontal: bool) -> usize {
+        edit::uv_mirror(self, indices, horizontal)
     }
 }
 

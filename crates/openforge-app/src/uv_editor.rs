@@ -64,6 +64,28 @@ pub fn canvas_to_uv(pos: egui::Pos2, canvas: egui::Rect) -> Vec2 {
     )
 }
 
+/// The UV-space grid step a snapped drag lands on.
+pub const SNAP_STEP: f32 = 0.05;
+
+/// How close two UVs must be for the Weld tool to pull them together.
+pub const WELD_TOLERANCE: f32 = 0.005;
+
+/// Round a UV-space delta to the snap grid.
+///
+/// The drag applies the difference of *rounded totals* through this (see
+/// [`UvDrag::total`]), so a slow drag still lands exactly on the grid once it
+/// has moved far enough, instead of rounding each frame's step to nothing.
+/// A non-positive step passes the delta through unchanged.
+pub fn snap_uv(delta: Vec2, step: f32) -> Vec2 {
+    if !delta.is_finite() || !step.is_finite() || step <= 0.0 {
+        return delta;
+    }
+    Vec2::new(
+        (delta.x / step).round() * step,
+        (delta.y / step).round() * step,
+    )
+}
+
 /// The `0..1` tile, inset inside the canvas.
 ///
 /// Uses [`egui::Rect::from_two_pos`], not `from_min_max`: `v` grows upwards, so
@@ -153,6 +175,10 @@ pub struct UvDrag {
     pub before: Scene,
     /// Canvas position of the previous frame.
     pub last: egui::Pos2,
+    /// Total UV-space delta since the drag began, before snapping — the snap
+    /// rounds this total, not each frame's step, so a slow drag still reaches
+    /// the grid instead of rounding every step to nothing.
+    pub total: Vec2,
 }
 
 /// Persistent state of the UV editor panel.
@@ -173,6 +199,8 @@ pub struct UvEditor {
     pub scale: f32,
     /// Rotation in degrees applied to the selection by the transform button.
     pub rotate_deg: f32,
+    /// Whether drag translations land on the [`SNAP_STEP`] grid.
+    pub snap: bool,
 }
 
 impl Default for UvEditor {
@@ -186,6 +214,7 @@ impl Default for UvEditor {
             grid: 2,
             scale: 1.0,
             rotate_deg: 0.0,
+            snap: false,
         }
     }
 }
@@ -656,5 +685,27 @@ mod tests {
             .expect("four vertices");
         assert_eq!(top.uv.y, 1.0, "the texture's last row is the UV space's top");
         assert_eq!(bottom.uv.y, 0.0, "row 0 is v = 0, at the bottom");
+    }
+
+    #[test]
+    fn snap_uv_rounds_to_the_grid_and_passes_bad_input_through() {
+        assert_eq!(snap_uv(Vec2::ZERO, SNAP_STEP), Vec2::ZERO);
+        let rounded = snap_uv(Vec2::new(0.07, -0.03), SNAP_STEP);
+        assert!(
+            (rounded - Vec2::new(0.05, -0.05)).length() < 1e-6,
+            "{rounded:?}"
+        );
+        let rounded = snap_uv(Vec2::new(0.073, 0.024), SNAP_STEP);
+        assert!(
+            (rounded - Vec2::new(0.05, 0.0)).length() < 1e-6,
+            "{rounded:?}"
+        );
+
+        // A non-positive step and non-finite deltas pass through unchanged.
+        assert_eq!(
+            snap_uv(Vec2::new(0.07, 0.0), 0.0),
+            Vec2::new(0.07, 0.0)
+        );
+        assert!(snap_uv(Vec2::new(f32::NAN, 0.0), SNAP_STEP).x.is_nan());
     }
 }

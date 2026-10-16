@@ -4491,6 +4491,41 @@ impl OpenForgeApp {
                 self.uv.rotate_deg = 0.0;
             }
         });
+
+        ui.horizontal(|ui| {
+            ui.label("Tools:");
+            if ui
+                .add_enabled(selected > 1, egui::Button::new("Weld"))
+                .on_hover_text("Pull the selected UVs closer than 0.005 to their cluster average")
+                .clicked()
+            {
+                self.uv_weld_selected(id);
+            }
+            if ui
+                .add_enabled(faces_selected, egui::Button::new("Split"))
+                .on_hover_text("Give the viewport-selected faces their own UV corners")
+                .clicked()
+            {
+                self.uv_split_selected();
+            }
+            if ui
+                .add_enabled(selected > 0, egui::Button::new("Mirror U"))
+                .on_hover_text("Reflect the selection in u about its bounds centre")
+                .clicked()
+            {
+                self.uv_mirror_selected(id, true);
+            }
+            if ui
+                .add_enabled(selected > 0, egui::Button::new("Mirror V"))
+                .on_hover_text("Reflect the selection in v about its bounds centre")
+                .clicked()
+            {
+                self.uv_mirror_selected(id, false);
+            }
+            ui.separator();
+            ui.checkbox(&mut self.uv.snap, "Snap")
+                .on_hover_text("Drag translations land on a 0.05 grid");
+        });
     }
 
     /// The UV canvas: draw the mesh's UVs, then handle pick/drag/band input.
@@ -4531,6 +4566,7 @@ impl OpenForgeApp {
                         self.uv.drag = Some(uv_editor::UvDrag {
                             before: self.scene.clone(),
                             last: pos,
+                            total: Vec2::ZERO,
                         });
                     }
                     None => {
@@ -4544,12 +4580,24 @@ impl OpenForgeApp {
         } else if response.dragged() {
             if let Some(pos) = pointer {
                 if self.uv.drag.is_some() {
+                    let snap = self.uv.snap;
                     // Scope the mutable borrow so the mesh can be edited below.
                     let step = {
                         let drag = self.uv.drag.as_mut().expect("checked above");
                         let last = drag.last;
                         drag.last = pos;
-                        uv_editor::canvas_to_uv(pos, rect) - uv_editor::canvas_to_uv(last, rect)
+                        let delta = uv_editor::canvas_to_uv(pos, rect)
+                            - uv_editor::canvas_to_uv(last, rect);
+                        let before = drag.total;
+                        drag.total += delta;
+                        // Snap the *total*, not the frame's step: rounding each
+                        // step would stall a slow drag before it ever moved.
+                        if snap {
+                            uv_editor::snap_uv(drag.total, uv_editor::SNAP_STEP)
+                                - uv_editor::snap_uv(before, uv_editor::SNAP_STEP)
+                        } else {
+                            delta
+                        }
                     };
                     self.uv_apply_delta(id, step);
                 } else if let Some(band) = self.uv.band.as_mut() {
@@ -4698,6 +4746,67 @@ impl OpenForgeApp {
                 self.dirty = true;
             }
         }
+    }
+
+    /// Weld the UV selection: entries closer than [`uv_editor::WELD_TOLERANCE`]
+    /// take their cluster's average, as one undo entry.
+    fn uv_weld_selected(&mut self, id: NodeId) {
+        let indices = self.uv.indices();
+        if indices.len() < 2 {
+            self.status = "Select at least two UVs to weld.".to_string();
+            return;
+        }
+        let mut welded = 0;
+        self.with_edit("UV Weld", |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    welded = mesh.uv_weld(&indices, uv_editor::WELD_TOLERANCE);
+                }
+            }
+        });
+        self.status = if welded == 0 {
+            format!(
+                "Nothing to weld — the selection is further apart than {:.3}.",
+                uv_editor::WELD_TOLERANCE
+            )
+        } else {
+            format!("Welded {welded} cluster(s) of UVs.")
+        };
+    }
+
+    /// Give the viewport-selected faces private copies of their shared UV
+    /// corners, as one undo entry.
+    fn uv_split_selected(&mut self) {
+        self.with_mesh_faces("UV Split", true, |mesh, faces| {
+            let faces: Vec<u32> = faces.iter().map(|&f| f as u32).collect();
+            let split = mesh.uv_split_faces(&faces);
+            if split == 0 {
+                "Nothing to split — no selected corner is shared with another face.".to_string()
+            } else {
+                format!("Split {split} UV corner(s) to their own entries.")
+            }
+        });
+    }
+
+    /// Mirror the UV selection about its bounds centre, as one undo entry.
+    fn uv_mirror_selected(&mut self, id: NodeId, horizontal: bool) {
+        let indices = self.uv.indices();
+        if indices.is_empty() {
+            self.status = "Select UVs to mirror.".to_string();
+            return;
+        }
+        let mut moved = 0;
+        self.with_edit("UV Mirror", |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                if let Some(mesh) = node.mesh_mut() {
+                    moved = mesh.uv_mirror(&indices, horizontal);
+                }
+            }
+        });
+        self.status = format!(
+            "Mirrored {moved} UV(s) in {}.",
+            if horizontal { "u" } else { "v" }
+        );
     }
 
     /// Select the UVs of the faces selected in the viewport.
@@ -7492,5 +7601,113 @@ mod tests {
             app.tool = mode;
             assert_eq!(app.active_tool().name(), name, "the host built {name}");
         }
+    }
+
+    /// Two quads side by side whose shared corners carry shared UV indices:
+    /// face 0 uses UVs 0..4, face 1 reuses 1 and 2 along the shared edge.
+    fn two_quads_sharing_uvs() -> Mesh {
+        let mut m = Mesh::new();
+        for p in [
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::new(1.0, 0.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(0.0, 1.0, 0.0),
+            Vec3::new(2.0, 0.0, 0.0),
+            Vec3::new(2.0, 1.0, 0.0),
+        ] {
+            m.add_vertex(p);
+        }
+        m.add_face(&[0, 1, 2, 3]);
+        m.add_face(&[1, 4, 5, 2]);
+        m.uvs = vec![
+            Vec2::new(0.1, 0.0),
+            Vec2::new(0.4, 0.0),
+            Vec2::new(0.4, 0.2),
+            Vec2::new(0.1, 0.2),
+            Vec2::new(0.7, 0.0),
+            Vec2::new(0.7, 0.2),
+        ];
+        for (i, uv) in [0u32, 1, 2, 3].into_iter().enumerate() {
+            m.faces[0].corners[i].uv = uv;
+        }
+        for (i, uv) in [1u32, 4, 5, 2].into_iter().enumerate() {
+            m.faces[1].corners[i].uv = uv;
+        }
+        m
+    }
+
+    #[test]
+    fn the_uv_tools_weld_split_and_mirror_with_undo() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Two Quads", two_quads_sharing_uvs());
+        app.selection.select_node(id);
+
+        // Mirror the UV pair in u: they swap about their bounds, one undo step.
+        app.uv.select_only([0, 1]);
+        app.uv_mirror_selected(id, true);
+        assert_eq!(app.status, "Mirrored 2 UV(s) in u.");
+        let uvs = app.scene.get(id).unwrap().mesh().unwrap().uvs.clone();
+        assert!((uvs[0] - Vec2::new(0.4, 0.0)).length() < 1e-6, "{:?}", uvs[0]);
+        assert!((uvs[1] - Vec2::new(0.1, 0.0)).length() < 1e-6, "{:?}", uvs[1]);
+        assert!((uvs[2] - Vec2::new(0.4, 0.2)).length() < 1e-6, "outside the selection");
+        assert!(app.undo.can_undo(), "a mirror is an edit");
+        app.undo_edit();
+        // Undo clears the node selection; the UV selection stands.
+        app.selection.select_node(id);
+        let uvs = app.scene.get(id).unwrap().mesh().unwrap().uvs.clone();
+        assert!((uvs[0] - Vec2::new(0.1, 0.0)).length() < 1e-6, "one step back");
+
+        // Weld asks for two UVs, and says so when nothing is close enough.
+        app.uv.deselect_all();
+        app.uv_weld_selected(id);
+        assert_eq!(app.status, "Select at least two UVs to weld.");
+        app.uv.select_only([0, 1]);
+        app.uv_weld_selected(id);
+        assert_eq!(
+            app.status,
+            format!(
+                "Nothing to weld — the selection is further apart than {:.3}.",
+                uv_editor::WELD_TOLERANCE
+            )
+        );
+
+        // Bring them close: the weld moves both to the cluster average.
+        if let Some(mesh) = app.scene.get_mut(id).unwrap().mesh_mut() {
+            mesh.uvs[1] = Vec2::new(0.102, 0.0);
+        }
+        app.uv_weld_selected(id);
+        assert_eq!(app.status, "Welded 1 cluster(s) of UVs.");
+        let uvs = app.scene.get(id).unwrap().mesh().unwrap().uvs.clone();
+        assert!((uvs[0] - Vec2::new(0.101, 0.0)).length() < 1e-6, "{:?}", uvs[0]);
+        assert!((uvs[1] - Vec2::new(0.101, 0.0)).length() < 1e-6, "{:?}", uvs[1]);
+
+        // Split needs faces; it copies only the corners shared with a face
+        // outside the set.
+        app.uv_split_selected();
+        assert_eq!(app.status, "Switch to Face level and select faces.");
+        app.selection.level = SelectLevel::Face;
+        app.selection.select_elements(id, [0]);
+        app.uv_split_selected();
+        assert_eq!(app.status, "Split 2 UV corner(s) to their own entries.");
+        let mesh = app.scene.get(id).unwrap().mesh().unwrap();
+        assert_eq!(mesh.uvs.len(), 8, "two private copies");
+        assert_eq!(
+            mesh.faces[0].corners.iter().map(|c| c.uv).collect::<Vec<_>>(),
+            vec![0, 6, 7, 3]
+        );
+        assert_eq!(
+            mesh.faces[1].corners.iter().map(|c| c.uv).collect::<Vec<_>>(),
+            vec![1, 4, 5, 2],
+            "the other face keeps its indices"
+        );
+
+        // With both faces selected nothing is shared with the outside.
+        app.selection.select_elements(id, [0, 1]);
+        app.uv_split_selected();
+        assert_eq!(
+            app.status,
+            "Nothing to split — no selected corner is shared with another face."
+        );
     }
 }

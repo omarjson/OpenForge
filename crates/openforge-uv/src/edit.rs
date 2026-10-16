@@ -3,6 +3,8 @@
 //! The [`UvOps`](crate::UvOps) methods that call into this module live in the
 //! crate root's single impl block.
 
+use std::collections::{HashMap, HashSet};
+
 use glam::Vec2;
 use openforge_core::mesh::Mesh;
 
@@ -151,6 +153,141 @@ pub(crate) fn uv_transform_selected(
         let p = (*v - pivot) * scale;
         *v = Vec2::new(p.x * cos - p.y * sin, p.x * sin + p.y * cos) + pivot + translate;
     }
+}
+
+/// Pull UV entries together: entries in `indices` closer than `tolerance`
+/// take their cluster's average position.
+///
+/// The island walk reads UV *positions*, so welding is what turns two nearly
+/// coincident patches into one island. Clusters are built greedily in index
+/// order around their first unvisited member, which keeps the result stable
+/// for a given input; non-finite entries are skipped and left as they are.
+pub(crate) fn uv_weld(mesh: &mut Mesh, indices: &[u32], tolerance: f32) -> usize {
+    if indices.is_empty() || !tolerance.is_finite() || tolerance < 0.0 {
+        return 0;
+    }
+    // Read the candidates up front so the writes below are free to go through
+    // `get_mut`.
+    let values: Vec<Option<Vec2>> = indices
+        .iter()
+        .map(|&i| mesh.uvs.get(i as usize).copied().filter(|v| v.is_finite()))
+        .collect();
+    let mut visited = vec![false; values.len()];
+    let mut welded = 0;
+    for i in 0..values.len() {
+        if visited[i] {
+            continue;
+        }
+        let Some(base) = values[i] else { continue };
+        visited[i] = true;
+        let mut members = vec![i];
+        for j in (i + 1)..values.len() {
+            if visited[j] {
+                continue;
+            }
+            let Some(v) = values[j] else { continue };
+            if (v - base).length() <= tolerance {
+                members.push(j);
+            }
+        }
+        if members.len() < 2 {
+            continue;
+        }
+        for &m in &members {
+            visited[m] = true;
+        }
+        welded += 1;
+        let count = members.len() as f32;
+        let average = members.iter().map(|&m| values[m].unwrap_or(base)).sum::<Vec2>() / count;
+        for &m in &members {
+            if let Some(slot) = mesh.uvs.get_mut(indices[m] as usize) {
+                *slot = average;
+            }
+        }
+    }
+    welded
+}
+
+/// Give the selected faces private copies of every UV corner they share with
+/// a face outside the set.
+///
+/// This is the mechanical half of a split: the copies hold the same spot, so
+/// nothing moves and the island walk still welds the two sides until one of
+/// them is edited. Index-growth only — existing entries and every other
+/// corner's index are left alone. Returns the number of corners copied.
+pub(crate) fn uv_split_faces(mesh: &mut Mesh, faces: &[u32]) -> usize {
+    let selected: HashSet<u32> = faces
+        .iter()
+        .copied()
+        .filter(|&f| (f as usize) < mesh.faces.len())
+        .collect();
+    if selected.is_empty() {
+        return 0;
+    }
+    // Reference counts per UV entry, total and from the selected faces.
+    let mut total: HashMap<u32, usize> = HashMap::new();
+    let mut inside: HashMap<u32, usize> = HashMap::new();
+    for (fi, face) in mesh.faces.iter().enumerate() {
+        let is_selected = selected.contains(&(fi as u32));
+        for corner in &face.corners {
+            *total.entry(corner.uv).or_default() += 1;
+            if is_selected {
+                *inside.entry(corner.uv).or_default() += 1;
+            }
+        }
+    }
+    let mut split = 0;
+    for fi in 0..mesh.faces.len() {
+        if !selected.contains(&(fi as u32)) {
+            continue;
+        }
+        for ci in 0..mesh.faces[fi].corners.len() {
+            let uv = mesh.faces[fi].corners[ci].uv;
+            if total.get(&uv).copied().unwrap_or(0) <= inside.get(&uv).copied().unwrap_or(0) {
+                continue;
+            }
+            let Some(position) = mesh.uvs.get(uv as usize).copied() else {
+                continue;
+            };
+            let new = mesh.uvs.len() as u32;
+            mesh.uvs.push(position);
+            mesh.faces[fi].corners[ci].uv = new;
+            split += 1;
+        }
+    }
+    split
+}
+
+/// Mirror UV entries about their combined bounds: `u' = min + max - u` along
+/// the chosen axis (`horizontal` mirrors u, else v).
+///
+/// The bounds come from the same entries (see [`uv_bounds_selected`]), so the
+/// reflection keeps the selection exactly where it was; a repeated index
+/// moves once and returns are counts of entries that moved.
+pub(crate) fn uv_mirror(mesh: &mut Mesh, indices: &[u32], horizontal: bool) -> usize {
+    let Some(bounds) = uv_bounds_selected(mesh, indices) else {
+        return 0;
+    };
+    let mut seen: HashSet<u32> = HashSet::new();
+    let mut moved = 0;
+    for &i in indices {
+        if !seen.insert(i) {
+            continue;
+        }
+        let Some(v) = mesh.uvs.get_mut(i as usize) else {
+            continue;
+        };
+        if !v.is_finite() {
+            continue;
+        }
+        if horizontal {
+            v.x = bounds.min.x + bounds.max.x - v.x;
+        } else {
+            v.y = bounds.min.y + bounds.max.y - v.y;
+        }
+        moved += 1;
+    }
+    moved
 }
 
 #[cfg(test)]
@@ -401,5 +538,121 @@ mod tests {
         m.faces[0].corners[1].uv = 1;
         m.faces[0].corners[2].uv = 2;
         assert_eq!(m.uv_face_area_uv(0), 0.0);
+    }
+
+    /// Two quads side by side sharing the edge between positions 1 and 2.
+    /// Every corner carries a UV index; the caller wires which ones are
+    /// shared.
+    fn two_quads_sharing_an_edge() -> Mesh {
+        let mut m = Mesh::new();
+        for p in [
+            Vec3::new(0.0, 0.0, 0.0), // 0
+            Vec3::new(1.0, 0.0, 0.0), // 1
+            Vec3::new(1.0, 1.0, 0.0), // 2
+            Vec3::new(0.0, 1.0, 0.0), // 3
+            Vec3::new(2.0, 0.0, 0.0), // 4
+            Vec3::new(2.0, 1.0, 0.0), // 5
+        ] {
+            m.add_vertex(p);
+        }
+        m.add_face(&[0, 1, 2, 3]);
+        m.add_face(&[1, 4, 5, 2]);
+        m
+    }
+
+    #[test]
+    fn weld_pulls_nearby_uvs_to_their_cluster_average() {
+        let mut m = Mesh::new();
+        m.uvs = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.002, 0.0),
+            Vec2::new(0.5, 0.5),
+        ];
+        // The pair welds to its average; the loner is untouched.
+        assert_eq!(m.uv_weld(&[0, 1, 2], 0.01), 1);
+        assert!((m.uvs[0] - Vec2::new(0.001, 0.0)).length() < 1e-6, "{:?}", m.uvs[0]);
+        assert!((m.uvs[1] - Vec2::new(0.001, 0.0)).length() < 1e-6, "{:?}", m.uvs[1]);
+        assert_eq!(m.uvs[2], Vec2::new(0.5, 0.5));
+
+        // Exact duplicates weld even at zero tolerance.
+        m.uvs = vec![Vec2::new(0.25, 0.25), Vec2::new(0.25, 0.25)];
+        assert_eq!(m.uv_weld(&[0, 1], 0.0), 1);
+        assert_eq!(m.uvs[1], Vec2::new(0.25, 0.25));
+
+        // Nothing within tolerance: no clusters reported, entries stand.
+        m.uvs = vec![Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0)];
+        assert_eq!(m.uv_weld(&[0, 1], 0.1), 0);
+        assert_eq!(m.uvs[1], Vec2::new(1.0, 1.0));
+
+        // A negative tolerance and an empty selection do nothing.
+        assert_eq!(m.uv_weld(&[0, 1], -1.0), 0);
+        assert_eq!(m.uv_weld(&[], 0.1), 0);
+    }
+
+    #[test]
+    fn split_gives_selected_faces_private_corners() {
+        let mut m = two_quads_sharing_an_edge();
+        m.uvs = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(0.5, 0.0),
+            Vec2::new(0.5, 1.0),
+            Vec2::new(0.0, 1.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+        ];
+        // Face 0 keeps UVs 0..4; face 1 reuses 1 and 2 along the shared edge.
+        for (i, uv) in [0u32, 1, 2, 3].into_iter().enumerate() {
+            m.faces[0].corners[i].uv = uv;
+        }
+        for (i, uv) in [1u32, 4, 5, 2].into_iter().enumerate() {
+            m.faces[1].corners[i].uv = uv;
+        }
+
+        // Splitting face 0 copies the two shared corners and nothing else.
+        assert_eq!(m.uv_split_faces(&[0]), 2);
+        assert_eq!(m.uvs.len(), 8, "two private copies were appended");
+        assert_eq!(
+            m.faces[0].corners.iter().map(|c| c.uv).collect::<Vec<_>>(),
+            vec![0, 6, 7, 3]
+        );
+        assert_eq!(
+            m.faces[1].corners.iter().map(|c| c.uv).collect::<Vec<_>>(),
+            vec![1, 4, 5, 2],
+            "the other side keeps every index it had"
+        );
+        assert_uv_indices_valid(&m);
+
+        // Splitting both faces leaves nothing shared with the outside.
+        assert_eq!(m.uv_split_faces(&[0, 1]), 0);
+
+        // Out-of-range faces, and an empty set, do nothing.
+        assert_eq!(m.uv_split_faces(&[7]), 0);
+        assert_eq!(m.uv_split_faces(&[]), 0);
+    }
+
+    #[test]
+    fn mirror_reflects_within_the_selection_bounds() {
+        let mut m = Mesh::new();
+        m.uvs = vec![
+            Vec2::new(0.1, 0.0),
+            Vec2::new(0.4, 0.0),
+            Vec2::new(0.7, 0.2),
+        ];
+        // u mirror about the selection's bounds (0.1..0.4): the pair swaps
+        // and the entry outside the selection keeps its spot.
+        assert_eq!(m.uv_mirror(&[0, 1], true), 2);
+        assert!((m.uvs[0] - Vec2::new(0.4, 0.0)).length() < 1e-6, "{:?}", m.uvs[0]);
+        assert!((m.uvs[1] - Vec2::new(0.1, 0.0)).length() < 1e-6, "{:?}", m.uvs[1]);
+        assert_eq!(m.uvs[2], Vec2::new(0.7, 0.2));
+
+        // v mirror; a repeated index moves only once.
+        m.uvs = vec![Vec2::new(0.0, 0.2), Vec2::new(0.0, 0.8)];
+        assert_eq!(m.uv_mirror(&[0, 0, 1], false), 2);
+        assert!((m.uvs[0] - Vec2::new(0.0, 0.8)).length() < 1e-6);
+        assert!((m.uvs[1] - Vec2::new(0.0, 0.2)).length() < 1e-6);
+
+        // An empty selection and out-of-range indices move nothing.
+        assert_eq!(m.uv_mirror(&[], true), 0);
+        assert_eq!(m.uv_mirror(&[9], true), 0);
     }
 }
