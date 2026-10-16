@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (571 `#[test]` fns; 573 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (576 `#[test]` fns; 578 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -53,11 +53,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-render` | 102 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking — faces as triangles, edges as lines, vertices as points, through a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
 | `openforge-animation` | 50 | Keyframe tracks, interpolation, clips, player. |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
-| `openforge-uv` | 53 | Planar/cylindrical/spherical/box projections, unwrap, pack, **UV islands by continuity with per-island atlas packing** (`islands.rs`), plus per-selection affine edits for the UV editor. |
+| `openforge-uv` | 56 | Planar/cylindrical/spherical/box projections, unwrap, pack, **UV islands by continuity with per-island atlas packing** (`islands.rs`), per-selection affine edits for the UV editor, and island-scale edits (`edit.rs`): **weld** pulls UVs to their cluster average (the island walk reads positions, so a weld makes two patches one), **split** gives selected faces private copies of corners they share outside the set, **mirror** reflects a selection about its own bounds. |
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 178 (bin) | eframe/egui GUI. `app.rs` (~6000 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status, the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
+| `openforge-app` | 180 (bin) | eframe/egui GUI. `app.rs` (~6100 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status, the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -280,6 +280,19 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   formats that are known, or says every format plugin is off; and a disabled
   `openforge.core-tools` degrades `active_tool` to the Select fallback that was
   already there for a host without a built-in.
+- **UV tools work at island scale, and a split is index-growth only.** The
+  island walk (`openforge-uv::islands`) groups faces by UV *positions* across a
+  shared mesh edge, so **weld** is the tool that makes two patches one: it
+  moves the selected entries onto their cluster average rather than merging
+  indices, which keeps every corner's `uv` index valid and the editor's
+  selection meaningful. **Split** is the mechanical half: selected faces get
+  private copies of the corners they share outside the set — appended, never
+  removed — so nothing moves and no index shifts until one side is edited.
+  **Mirror** reflects a selection about its own bounds (`min + max - u`), so
+  the selection stays exactly where it was. The drag's **Snap** rounds the
+  *total* drag delta through `uv_editor::snap_uv` (the difference of rounded
+  totals), not each frame's step — rounding steps would stall a slow drag
+  before it moved at all.
 - **Bottom-panel order is load-bearing.** Add the status bar first, then other
   bottom panels, then the side panels, and the central viewport last: that is
   what keeps the viewport's rect clear of the panels below it.
@@ -1043,9 +1056,37 @@ progress report:
   4 filters, the OBJ filter present; a disabled plugin still lists what it
   would bring).
 
+- **UV tools at island scale: weld, split, mirror, grid snap** (work-stream
+  #23). The UV editor's remaining maths gaps, closed in `openforge-uv`'s
+  `edit.rs` and the panel's new Tools row:
+  - **Weld** (`uv_weld`): the selected UVs closer than 0.005 take their
+    cluster's average, gathered greedily around the first unvisited member.
+    The island walk reads positions, so welding is exactly what turns two
+    nearly coincident patches into one island.
+  - **Split** (`uv_split_faces`): the viewport-selected faces get private
+    copies of every corner they share with a face outside the set —
+    index-growth only, so nothing moves and no other index shifts until one
+    side is edited.
+  - **Mirror** (`uv_mirror`): reflect about the selection's own bounds
+    (`min + max - u`), in u or v; a repeated index moves once.
+  - **Grid snap**: a Snap checkbox in the panel; the drag rounds its *total*
+    delta (`uv_editor::snap_uv` over `UvDrag::total`) so a slow drag still
+    reaches the grid instead of rounding each frame's step to nothing.
+  - Each tool is one `with_edit` undo entry, and the statuses say what
+    happened ("Welded 1 cluster(s) of UVs.") or why not ("Nothing to weld —
+    the selection is further apart than 0.005.", "Switch to Face level and
+    select faces.").
+
+- **5 new tests**: the weld's clusters, exact duplicates and no-op cases; the
+  split's copied corners beside the untouched other side; the mirror's bounds
+  reflection and duplicate indices; the snap's rounding and non-finite
+  passthrough; and the app round — a mirror with its one-step undo, the weld
+  refusal and average, and the split refusal and result with the other face's
+  indices intact.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **573 pass, 0 failures**
+build too); `cargo test --workspace` → **578 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -1097,7 +1138,9 @@ refusals, the dummy at the origin and at the selection's centre (its kind
 checked), and the report's counts and lines per level. The plugin controls are
 pinned through the host itself: the formats leaving and returning, the refusal
 wording when none is left, and the panel's rows summing to the live registry
-counts.
+counts. The UV tools sit on the same seam: the weld clusters, the split's
+copied indices, the mirror's bounds reflection and the snap's rounded totals,
+plus the panel round with its one-step undo.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1140,7 +1183,9 @@ leave only the level-1 nodes standing, and `U` should bring the rest back),
 and the **Plugins panel** by eye (uncheck `openforge.interchange`: the row
 should stay with its formats still listed, the report below should shrink to
 the core-tools counts, and importing a `.obj` should refuse with the
-all-disabled message) — the agent has no
+all-disabled message), and the **UV Tools row** by eye (Weld / Split / Mirror U
+/ Mirror V and the Snap box: a snapped drag should step in 0.05 jumps, and
+Split should leave the neighbour's UVs standing) — the agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -1151,7 +1196,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **67.1%**, shown as 67%). The engine
+16 curated areas is **68.0%**, shown as 68%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1166,7 +1211,8 @@ the format-named import/export surface (dialogs, drops, refusals) as of #19
 and the animation timeline (spin clips, playback, scrub, Space) as of #20 and
 the game-prep surface (LOD tags and isolate, dummies, the triangle budget) as
 of #21 and the plugin host controls (per-built-in enable/disable with measured
-attribution) as of #22.
+attribution) as of #22 and the island-scale UV tools (weld, split, mirror,
+grid snap) as of #23.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1186,10 +1232,11 @@ Prioritized next steps:
    during free drags too. (Sub-object pivots are done: a vertex/face-level drag
    moves only its own geometry, via `gizmo::Targets` +
    `viewport::element_centroid`.)
-3. **Deepen the UV editor.** The texture background (#11) and island selection
-   plus per-island packing (#12) landed; still missing: island weld/split/mirror,
-   snapping, per-face map assignment from the canvas, and the 3D face selection
-   staying in sync with the UV selection rather than being pushed on demand.
+3. **Deepen the UV editor.** The texture background (#11), island selection
+   plus per-island packing (#12) and the island-scale tools — weld, split,
+   mirror, grid snap (#23) — landed; still missing: per-face map assignment
+   from the canvas, and the 3D face selection staying in sync with the UV
+   selection rather than being pushed on demand.
 4. **Deepen the plugin host.** The host is in and the app goes through it, but
    three pieces are still hard-wired: tools are chosen through the app's
    `ActiveTool` enum rather than by walking `host.tool_entries()`, a `Service`

@@ -47,10 +47,10 @@ Generators & algorithms (primitives, Catmull-Clark, noise, L-systems)|80|Engine
 Materials & textures|72|Engine
 Animation (tracks, clips, playback)|65|Engine
 Rigging & skinning|60|Engine
-UV math (project, unwrap, pack, edits)|85|Engine
+UV math (project, unwrap, pack, edits)|87|Engine
 GPU viewport (depth, shading, grid, gizmo)|88|UI
 Viewport editing UX (gizmos, wireframe, outlines, picking)|96|UI
-UV editor UI|58|UI
+UV editor UI|70|UI
 Panels & dialogs (outliner, properties, toolbars)|53|UI
 Import/export UX|48|UI
 Plugin / service host|52|UI

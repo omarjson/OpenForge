@@ -161,6 +161,11 @@ A sample GitHub Actions matrix is shown below.
   brings (its formats, services and tools); unchecking one rebuilds the host
   without it, so its formats stop being importable/exportable in one step, and
   re-checking restores them.
+- **The UV editor's Tools row**: **Weld** pulls the selected UVs closer than
+  0.005 to their cluster average, **Split** gives the viewport-selected faces
+  their own UV corners, **Mirror U/V** reflects the selection about its bounds,
+  and the **Snap** box makes drags land on a 0.05 grid — each one undo step,
+  with the status saying what it did or why it did not.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,
   camera, depth test and back-face culling as the frame, so only what the image
