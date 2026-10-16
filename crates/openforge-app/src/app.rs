@@ -187,6 +187,38 @@ enum ActiveTool {
     Rotate,
 }
 
+impl ActiveTool {
+    /// Every tool the app knows how to drive, in toolbar order.
+    fn all() -> [ActiveTool; 4] {
+        [
+            ActiveTool::Select,
+            ActiveTool::Move,
+            ActiveTool::Scale,
+            ActiveTool::Rotate,
+        ]
+    }
+
+    /// The name the tool answers to in the plugin host's registry.
+    fn registry_name(self) -> &'static str {
+        match self {
+            ActiveTool::Select => "Select",
+            ActiveTool::Move => "Move",
+            ActiveTool::Scale => "Scale",
+            ActiveTool::Rotate => "Rotate",
+        }
+    }
+
+    /// The hotkey the toolbar prints beside the tool.
+    fn hotkey(self) -> egui::Key {
+        match self {
+            ActiveTool::Select => egui::Key::Q,
+            ActiveTool::Move => egui::Key::W,
+            ActiveTool::Scale => egui::Key::E,
+            ActiveTool::Rotate => egui::Key::R,
+        }
+    }
+}
+
 /// The colour of a directly selected sub-object, as an egui colour.
 fn element_selected_color() -> egui::Color32 {
     egui::Color32::from_rgb(
@@ -372,15 +404,44 @@ impl OpenForgeApp {
     /// replacement `Move` would come through. The fallback only fires if the
     /// host somehow lacks a built-in.
     fn active_tool(&mut self) -> Box<dyn Tool> {
-        let name = match self.tool {
-            ActiveTool::Select => "Select",
-            ActiveTool::Move => "Move",
-            ActiveTool::Scale => "Scale",
-            ActiveTool::Rotate => "Rotate",
-        };
+        let name = self.tool.registry_name();
         self.plugins
             .make_tool(name)
             .unwrap_or_else(|| Box::new(SelectTool { additive: false }))
+    }
+
+    /// The tools the plugin host offers, in toolbar order.
+    ///
+    /// The registry is the single source: each tool the app drives is looked
+    /// up by name, so a disabled `openforge.core-tools` leaves the toolbar
+    /// empty rather than showing buttons that cannot build a tool.
+    fn tool_entries(&self) -> Vec<(ActiveTool, String, String)> {
+        ActiveTool::all()
+            .into_iter()
+            .filter_map(|tool| {
+                let name = tool.registry_name();
+                self.plugins
+                    .tool_entries()
+                    .find(|(entry, _)| *entry == name)
+                    .map(|(_, description)| (tool, name.to_string(), description.to_string()))
+            })
+            .collect()
+    }
+
+    /// Switch the active tool, refusing one whose plugin is off instead of
+    /// leaving the toolbar pointing at something the host cannot build.
+    ///
+    /// Returns whether the tool was taken.
+    fn activate_tool(&mut self, tool: ActiveTool) -> bool {
+        if !self.plugins.has_tool(tool.registry_name()) {
+            self.status = format!(
+                "{} is off — enable its plugin in the Plugins panel.",
+                tool.registry_name()
+            );
+            return false;
+        }
+        self.tool = tool;
+        true
     }
 
     /// Run a closure that may edit the scene, capturing undo state around it.
@@ -2818,18 +2879,19 @@ impl OpenForgeApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::D)) {
             self.duplicate_selected();
         }
-        // Tool hotkeys.
+        // Tool hotkeys — through the registry, so a hotkey for a disabled
+        // tool refuses out loud rather than leaving a dead selection.
         if ctx.input(|i| i.key_pressed(egui::Key::Q)) {
-            self.tool = ActiveTool::Select;
+            self.activate_tool(ActiveTool::Select);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::W)) {
-            self.tool = ActiveTool::Move;
+            self.activate_tool(ActiveTool::Move);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::E)) {
-            self.tool = ActiveTool::Scale;
+            self.activate_tool(ActiveTool::Scale);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::R)) {
-            self.tool = ActiveTool::Rotate;
+            self.activate_tool(ActiveTool::Rotate);
         }
         // Modeling hotkeys (sub-object ops).
         if ctx.input(|i| i.key_pressed(egui::Key::X)) {
@@ -2866,10 +2928,16 @@ impl OpenForgeApp {
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label("Tools:");
-                tool_button(ui, &mut self.tool, ActiveTool::Select, "Select (Q)");
-                tool_button(ui, &mut self.tool, ActiveTool::Move, "Move (W)");
-                tool_button(ui, &mut self.tool, ActiveTool::Scale, "Scale (E)");
-                tool_button(ui, &mut self.tool, ActiveTool::Rotate, "Rotate (R)");
+                for (tool, name, description) in self.tool_entries() {
+                    let label = format!("{name} ({:?})", tool.hotkey());
+                    if ui
+                        .selectable_label(self.tool == tool, label)
+                        .on_hover_text(description)
+                        .clicked()
+                    {
+                        self.activate_tool(tool);
+                    }
+                }
                 ui.separator();
                 ui.label("Level:");
                 let level_before = self.selection.level;
@@ -3385,6 +3453,11 @@ impl OpenForgeApp {
             }
         }
         self.plugins = host;
+        // An active tool whose plugin just went away falls back rather than
+        // staying selected over a tool the host cannot build.
+        if !self.plugins.has_tool(self.tool.registry_name()) {
+            self.tool = ActiveTool::Select;
+        }
     }
 
     /// The built-ins and what each one brings, as the Plugins panel draws them.
@@ -5080,13 +5153,6 @@ impl OpenForgeApp {
             self.camera.distance = (radius * 2.5).clamp(1.0, 500.0);
             self.dirty = true;
         }
-    }
-}
-
-fn tool_button(ui: &mut egui::Ui, current: &mut ActiveTool, value: ActiveTool, label: &str) {
-    let selected = *current == value;
-    if ui.selectable_label(selected, label).clicked() {
-        *current = value;
     }
 }
 
@@ -8077,5 +8143,52 @@ mod tests {
             "Nothing to decimate — Box is already at grid resolution."
         );
         assert!(!app.undo.can_undo(), "a refusal is not an edit");
+    }
+
+    #[test]
+    fn tools_come_from_the_registry_and_a_disabled_plugin_takes_them_away() {
+        let mut app = OpenForgeApp::with_gpu(None);
+
+        // Every tool the toolbar offers is one the host can build, described
+        // by the registry, in toolbar order.
+        let entries = app.tool_entries();
+        let tools: Vec<ActiveTool> = entries.iter().map(|(tool, _, _)| *tool).collect();
+        assert_eq!(
+            tools,
+            vec![
+                ActiveTool::Select,
+                ActiveTool::Move,
+                ActiveTool::Scale,
+                ActiveTool::Rotate
+            ]
+        );
+        assert!(
+            entries[1].2.contains("Translate"),
+            "the registry's description rides along: {:?}",
+            entries[1].2
+        );
+        assert!(app.activate_tool(ActiveTool::Move));
+        assert_eq!(app.tool, ActiveTool::Move);
+
+        // With the core-tools plugin off the registry has no tools, the
+        // toolbar would draw none, and activating one refuses out loud.
+        app.set_plugin_enabled("openforge.core-tools", false);
+        assert!(app.tool_entries().is_empty());
+        assert_eq!(app.tool, ActiveTool::Select, "the dead tool falls back");
+        assert!(!app.activate_tool(ActiveTool::Move));
+        assert_eq!(
+            app.status,
+            "Move is off — enable its plugin in the Plugins panel."
+        );
+        assert_eq!(app.tool, ActiveTool::Select);
+
+        // The app's own fallback still answers while the host has no tools.
+        let _ = app.active_tool();
+
+        // Re-enabling brings the toolbar back.
+        app.set_plugin_enabled("openforge.core-tools", true);
+        assert_eq!(app.tool_entries().len(), 4);
+        assert!(app.activate_tool(ActiveTool::Rotate));
+        assert_eq!(app.tool, ActiveTool::Rotate);
     }
 }
