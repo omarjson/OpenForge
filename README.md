@@ -163,8 +163,9 @@ A sample GitHub Actions matrix is shown below.
   is skipped rather than duplicated.
 - **The Plugins panel** lists each built-in plugin with a checkbox and what it
   brings (its formats, services and tools); unchecking one rebuilds the host
-  without it, so its formats stop being importable/exportable in one step, and
-  re-checking restores them.
+  without it, so its formats stop being importable/exportable and its tools
+  leave the toolbar (and refuse their hotkey) in one step, and re-checking
+  restores them.
 - **The UV editor's Tools row**: **Weld** pulls the selected UVs closer than
   0.005 to their cluster average, **Split** gives the viewport-selected faces
   their own UV corners, **Mirror U/V** reflects the selection about its bounds,

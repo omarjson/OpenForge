@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (586 `#[test]` fns; 588 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (587 `#[test]` fns; 589 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 188 (bin) | eframe/egui GUI. `app.rs` (~6400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
+| `openforge-app` | 189 (bin) | eframe/egui GUI. `app.rs` (~6400 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -1156,9 +1156,27 @@ progress report:
   three hidden tagged copies under the source's face counts, one undo step
   back, and the box's refusal leaving the stack alone.
 
+- **The tool registry drives the toolbar and hotkeys** (work-stream #26). The
+  host has carried the tools since the start — the four built-ins are ordinary
+  registry entries — but the app still drew four hard-wired buttons and set
+  the active tool straight from `Q`/`W`/`E`/`R`:
+  - **`ActiveTool` names itself** (`all` in toolbar order, `registry_name`,
+    `hotkey`) and `tool_entries()` walks the host's registry, keeping the
+    tools it actually offers, in toolbar order, with each entry's own
+    description as the button's hover text.
+  - **`activate_tool` refuses a tool whose plugin is off** ("Move is off —
+    enable its plugin in the Plugins panel.") instead of selecting it; the
+    hotkeys go through it, and `rebuild_plugins` falls the active tool back to
+    Select when its plugin just went away — no more toolbar pointing at a
+    tool `active_tool()` would silently replace.
+- **1 new test**: the four registered tools in toolbar order with the
+  registry's descriptions, then `openforge.core-tools` off — an empty toolbar
+  list, the fallback, the refusal's exact message, and the app's own tool
+  still answering — and on again for the full four.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **588 pass, 0 failures**
+build too); `cargo test --workspace` → **589 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -1216,7 +1234,9 @@ plus the panel round with its one-step undo. The file options are pinned at the
 boundary: both turns, the exact inverse over a round trip, the bad-scale
 fallback, and the app-level import/export round written back to disk.
 Decimation joins them: the grid collapse, the guards, and the app's LOD round
-with its one-step undo.
+with its one-step undo. The tool list is measured from the registry too: four
+entries with the host's own descriptions, an empty list and a refusal when the
+plugin goes, the full list when it returns.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1275,7 +1295,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **70.0%**, shown as 70%). The engine
+16 curated areas is **70.7%**, shown as 70%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1293,7 +1313,8 @@ of #21 and the plugin host controls (per-built-in enable/disable with measured
 attribution) as of #22 and the island-scale UV tools (weld, split, mirror,
 grid snap) as of #23 and the import/export options dialog (up-axis and scale at
 the file boundary) as of #24 and the LOD generator (cluster decimation into
-hidden LOD 1–3 copies) as of #25.
+hidden LOD 1–3 copies) as of #25 and the registry-driven tool list (the
+toolbar and hotkeys walk the host's tools) as of #26.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1318,12 +1339,12 @@ Prioritized next steps:
    mirror, grid snap (#23) — landed; still missing: per-face map assignment
    from the canvas, and the 3D face selection staying in sync with the UV
    selection rather than being pushed on demand.
-4. **Deepen the plugin host.** The host is in and the app goes through it, but
-   three pieces are still hard-wired: tools are chosen through the app's
-   `ActiveTool` enum rather than by walking `host.tool_entries()`, a `Service`
-   carries a name and a description rather than behaviour, and plugins are
-   compiled in rather than *loaded* — a `cdylib`/WASM filter discovered at
-   runtime is the real prize. That is the long road to true parity.
+4. **Deepen the plugin host.** The host is in, the app goes through it and the
+   toolbar and hotkeys now walk the tool registry (#26), but two pieces are
+   still hard-wired: a `Service` carries a name and a description rather than
+   behaviour, and plugins are compiled in rather than *loaded* — a
+   `cdylib`/WASM filter discovered at runtime is the real prize. That is the
+   long road to true parity.
 5. **IO expansion.** Add COLLADA/DAE, OFF, or ASCII FBX (open subsets) to widen
    format coverage beyond the current 4.
 6. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
