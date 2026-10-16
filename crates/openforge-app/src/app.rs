@@ -23,10 +23,11 @@ use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
 use openforge_materials::{Material, MaterialLibrary, Texture};
-use openforge_plugin::PluginHost;
+use openforge_plugin::{builtin_plugins, PluginHost};
 use openforge_render::{FaceShading, FrameStats, NodeMaterials, PickElement, TextureLayer};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The material library a new scene starts with: the crate's default grey at
@@ -92,6 +93,21 @@ impl LodReport {
         }
         out
     }
+}
+
+/// One built-in plugin and everything it brings, measured by registering the
+/// plugin alone into a scratch host — so the Plugins panel can name what a
+/// disable takes away.
+#[derive(Clone, Debug, PartialEq)]
+struct PluginInfo {
+    name: String,
+    version: String,
+    description: String,
+    /// Whether the plugin is currently registered in the app's host.
+    enabled: bool,
+    services: Vec<(String, String)>,
+    tools: Vec<(String, String)>,
+    filters: Vec<(String, String, Vec<String>)>,
 }
 
 fn default_materials() -> MaterialLibrary {
@@ -253,6 +269,9 @@ pub struct OpenForgeApp {
     uv_texture_background: bool,
     /// Loaded plugins: services, tools and format filters.
     plugins: PluginHost,
+    /// The built-in plugins a user turned off in the Plugins panel, by name.
+    /// Changing it rebuilds the host from the rest.
+    disabled_plugins: BTreeSet<String>,
     /// The library entry the materials panel is editing.
     current_material: usize,
     /// Scene captured when a text field took focus, so committing the edit
@@ -323,6 +342,7 @@ impl OpenForgeApp {
             gpu_texture_epoch: u64::MAX,
             uv_texture_background: true,
             plugins: openforge_plugin::builtin_host(),
+            disabled_plugins: BTreeSet::new(),
             current_material: 0,
             rename_before: None,
             tool_drag: None,
@@ -869,11 +889,7 @@ impl OpenForgeApp {
     /// the registry does know.
     fn import_file(&mut self, path: PathBuf) {
         let Some(label) = self.format_label(&path).map(str::to_string) else {
-            self.status = format!(
-                "Skipped {} — no filter knows it ({}).",
-                Self::file_label(&path),
-                self.known_extensions()
-            );
+            self.status = self.unknown_format_line("Skipped", &Self::file_label(&path));
             return;
         };
         match self.plugins.import(&path) {
@@ -959,11 +975,8 @@ impl OpenForgeApp {
             }
         }
         let Some(label) = self.format_label(&path).map(str::to_string) else {
-            self.status = format!(
-                "Can't export to {} — no filter knows it ({}).",
-                Self::file_label(&path),
-                self.known_extensions()
-            );
+            self.status =
+                self.unknown_format_line("Can't export to", &Self::file_label(&path));
             return;
         };
         let id = meshes[0];
@@ -1003,6 +1016,18 @@ impl OpenForgeApp {
         let mut extensions: Vec<&str> = self.plugins.filters.extensions().collect();
         extensions.sort_unstable();
         extensions.join(", ")
+    }
+
+    /// What a path no filter knows is told: which formats are known, or that
+    /// every format plugin is off.
+    fn unknown_format_line(&self, lead: &str, file: &str) -> String {
+        let known = self.known_extensions();
+        let why = if known.is_empty() {
+            "every format plugin is disabled (see the Plugins panel)".to_string()
+        } else {
+            format!("no filter knows it ({known})")
+        };
+        format!("{lead} {file} — {why}.")
     }
 
     /// A path as the status should name it: the file's own name when it has
@@ -3182,11 +3207,125 @@ impl OpenForgeApp {
         lines
     }
 
+    /// Rebuild the plugin host from the built-ins, minus the disabled ones.
+    ///
+    /// Everything the host serves — formats, tools, services — is rebuilt in
+    /// one go, so a disabled plugin cannot leave half of itself behind.
+    fn rebuild_plugins(&mut self) {
+        let mut host = PluginHost::new();
+        for plugin in builtin_plugins() {
+            if self.disabled_plugins.contains(plugin.name()) {
+                continue;
+            }
+            if let Err(err) = host.register(plugin.as_ref()) {
+                log::warn!("built-in plugin `{}` rejected: {err}", plugin.name());
+            }
+        }
+        self.plugins = host;
+    }
+
+    /// The built-ins and what each one brings, as the Plugins panel draws them.
+    ///
+    /// Each plugin's own report is measured by registering it alone into a
+    /// scratch host, so every row can say what turning it off would take away.
+    fn plugin_infos(&self) -> Vec<PluginInfo> {
+        builtin_plugins()
+            .iter()
+            .map(|plugin| {
+                let mut alone = PluginHost::new();
+                let _ = alone.register(plugin.as_ref());
+                PluginInfo {
+                    name: plugin.name().to_string(),
+                    version: plugin.version().to_string(),
+                    description: plugin.description().to_string(),
+                    enabled: !self.disabled_plugins.contains(plugin.name()),
+                    services: alone
+                        .services
+                        .entries()
+                        .map(|(name, text)| (name.to_string(), text.to_string()))
+                        .collect(),
+                    tools: alone
+                        .tool_entries()
+                        .map(|(name, text)| (name.to_string(), text.to_string()))
+                        .collect(),
+                    filters: alone
+                        .filters
+                        .entries()
+                        .map(|(id, label, extensions)| {
+                            (
+                                id.to_string(),
+                                label.to_string(),
+                                extensions.iter().map(|e| e.to_string()).collect(),
+                            )
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
+    /// Enable or disable one built-in plugin and rebuild what the host serves.
+    fn set_plugin_enabled(&mut self, name: &str, enabled: bool) {
+        if enabled {
+            self.disabled_plugins.remove(name);
+        } else {
+            self.disabled_plugins.insert(name.to_string());
+        }
+        self.rebuild_plugins();
+        self.status = format!(
+            "{} {name} — {} format(s) active.",
+            if enabled { "Enabled" } else { "Disabled" },
+            self.plugins.filters.len()
+        );
+    }
+
     /// What the plugin host has loaded, as reported by [`Self::plugin_report`].
     fn plugins_panel(&mut self, ui: &mut egui::Ui) {
         egui::CollapsingHeader::new("Plugins")
             .default_open(false)
             .show(ui, |ui| {
+                for info in self.plugin_infos() {
+                    let mut enabled = info.enabled;
+                    let title = format!("{} {}", info.name, info.version);
+                    if ui
+                        .checkbox(&mut enabled, title)
+                        .on_hover_text(
+                            "Rebuild the host without this plugin's formats, tools and services",
+                        )
+                        .changed()
+                    {
+                        self.set_plugin_enabled(&info.name, enabled);
+                    }
+                    if !info.description.is_empty() {
+                        ui.label(egui::RichText::new(&info.description).weak().small());
+                    }
+                    // What a disable would take away.
+                    let mut brings: Vec<String> = Vec::new();
+                    if !info.filters.is_empty() {
+                        brings.push(format!(
+                            "formats: {}",
+                            info.filters
+                                .iter()
+                                .map(|(_, label, _)| label.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                    if !info.services.is_empty() {
+                        brings.push(format!("services: {}", info.services.len()));
+                    }
+                    if !info.tools.is_empty() {
+                        brings.push(format!("tools: {}", info.tools.len()));
+                    }
+                    if !brings.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("    {}", brings.join(" · ")))
+                                .weak()
+                                .small(),
+                        );
+                    }
+                }
+                ui.separator();
                 for line in self.plugin_report() {
                     if line.is_empty() {
                         ui.separator();
@@ -7191,6 +7330,91 @@ mod tests {
             (centre - Vec3::new(2.0, 1.0, 0.0)).length() < 1e-5,
             "{centre:?}"
         );
+    }
+
+    #[test]
+    fn disabling_the_interchange_plugin_takes_the_formats_with_it() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let obj = temp_path("obj");
+        std::fs::write(&obj, "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n").unwrap();
+
+        app.set_plugin_enabled("openforge.interchange", false);
+        assert_eq!(
+            app.status,
+            "Disabled openforge.interchange — 0 format(s) active."
+        );
+        assert_eq!(app.plugins.filters.len(), 0);
+        app.import_file(obj.clone());
+        assert_eq!(
+            app.status,
+            format!(
+                "Skipped {} — every format plugin is disabled (see the Plugins panel).",
+                OpenForgeApp::file_label(&obj)
+            )
+        );
+
+        app.set_plugin_enabled("openforge.interchange", true);
+        assert_eq!(
+            app.status,
+            "Enabled openforge.interchange — 4 format(s) active."
+        );
+        app.import_file(obj.clone());
+        assert!(
+            app.status.starts_with("Imported 1 mesh(es) from"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.scene.node_count(), 1);
+        let _ = std::fs::remove_file(&obj);
+    }
+
+    #[test]
+    fn the_plugins_panel_reports_what_each_plugin_brings() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let infos = app.plugin_infos();
+        assert_eq!(infos.len(), 2, "two built-ins");
+
+        let core = infos
+            .iter()
+            .find(|info| info.name == "openforge.core-tools")
+            .expect("the core-tools plugin");
+        assert!(core.enabled);
+        assert_eq!(core.tools.len(), 4, "Select, Move, Scale, Rotate");
+        assert_eq!(core.services.len(), 2, "selection, undo");
+        assert!(core.filters.is_empty());
+
+        let io = infos
+            .iter()
+            .find(|info| info.name == "openforge.interchange")
+            .expect("the interchange plugin");
+        assert!(io.enabled);
+        assert_eq!(io.filters.len(), 4, "OBJ, glTF, PLY, STL");
+        assert!(
+            io.filters
+                .iter()
+                .any(|(_, _, extensions)| extensions.iter().any(|e| e == "obj")),
+            "the OBJ filter: {io:?}"
+        );
+
+        // Every row's own report adds up to what the host actually serves.
+        let filters: usize = infos.iter().map(|info| info.filters.len()).sum();
+        let tools: usize = infos.iter().map(|info| info.tools.len()).sum();
+        let services: usize = infos.iter().map(|info| info.services.len()).sum();
+        assert_eq!(filters, app.plugins.filters.len());
+        assert_eq!(tools, app.plugins.tool_count());
+        assert_eq!(services, app.plugins.services.len());
+
+        // A disabled plugin says so while still listing what it would bring.
+        app.set_plugin_enabled("openforge.interchange", false);
+        let infos = app.plugin_infos();
+        let io = infos
+            .iter()
+            .find(|info| info.name == "openforge.interchange")
+            .unwrap();
+        assert!(!io.enabled);
+        assert_eq!(io.filters.len(), 4, "what it would bring is still listed");
+        assert_eq!(app.plugins.filters.len(), 0);
     }
 
     #[test]
