@@ -1,6 +1,7 @@
 //! The OpenForge application: UI layout, viewport interaction, and the glue
 //! between egui and the openforge-core scene model.
 
+use crate::file_options::{self, FileOptions, UpAxis};
 use crate::gizmo;
 use crate::gpu_viewport::{self, GpuViewport};
 use crate::snap::{self, SnapMode};
@@ -108,6 +109,19 @@ struct PluginInfo {
     services: Vec<(String, String)>,
     tools: Vec<(String, String)>,
     filters: Vec<(String, String, Vec<String>)>,
+}
+
+/// A file the pickers chose, waiting on its options dialog.
+///
+/// Nothing is read or written until the dialog is confirmed; Cancel just drops
+/// this, so a half-open dialog never touches the disk.
+struct PendingFile {
+    /// The file to read (import) or write (export) on confirmation.
+    path: PathBuf,
+    /// Export when true, import otherwise.
+    export: bool,
+    /// The up-axis and scale the dialog is editing.
+    options: FileOptions,
 }
 
 fn default_materials() -> MaterialLibrary {
@@ -272,6 +286,8 @@ pub struct OpenForgeApp {
     /// The built-in plugins a user turned off in the Plugins panel, by name.
     /// Changing it rebuilds the host from the rest.
     disabled_plugins: BTreeSet<String>,
+    /// The file an import/export options dialog is waiting on, if one is open.
+    pending_file: Option<PendingFile>,
     /// The library entry the materials panel is editing.
     current_material: usize,
     /// Scene captured when a text field took focus, so committing the edit
@@ -343,6 +359,7 @@ impl OpenForgeApp {
             uv_texture_background: true,
             plugins: openforge_plugin::builtin_host(),
             disabled_plugins: BTreeSet::new(),
+            pending_file: None,
             current_material: 0,
             rename_before: None,
             tool_drag: None,
@@ -882,18 +899,28 @@ impl OpenForgeApp {
         }
     }
 
+    /// Import one file with the default options — the path drops take.
+    ///
+    /// The menu's Import… opens the options dialog first; a drop cannot wait
+    /// for one, so dropped files land as the file has them.
+    fn import_file(&mut self, path: PathBuf) {
+        self.import_file_with(path, FileOptions::default());
+    }
+
     /// Import one file through the plugin host's filter registry: a plugin
     /// that registers a new extension is picked up here with no app change.
     ///
     /// A path no filter knows is refused before anything is read, naming what
-    /// the registry does know.
-    fn import_file(&mut self, path: PathBuf) {
+    /// the registry does know. The options turn every loaded mesh into the
+    /// world's Y-up space and scale it, all in one undo step.
+    fn import_file_with(&mut self, path: PathBuf, options: FileOptions) {
         let Some(label) = self.format_label(&path).map(str::to_string) else {
             self.status = self.unknown_format_line("Skipped", &Self::file_label(&path));
             return;
         };
         match self.plugins.import(&path) {
-            Ok(loaded) => {
+            Ok(mut loaded) => {
+                file_options::apply_loaded(&mut loaded, options);
                 let count = loaded.mesh_count();
                 self.with_edit("Import", |app| {
                     for md in loaded.meshes {
@@ -901,12 +928,73 @@ impl OpenForgeApp {
                     }
                 });
                 self.status = format!(
-                    "Imported {} mesh(es) from {} ({label}).",
+                    "Imported {} mesh(es) from {} ({label}{}).",
                     count,
-                    Self::file_label(&path)
+                    Self::file_label(&path),
+                    Self::options_note(options)
                 );
             }
             Err(e) => self.status = format!("Import failed: {}", e),
+        }
+    }
+
+    /// Open the options dialog for an import of `path`.
+    fn import_begin(&mut self, path: PathBuf) {
+        self.status = format!(
+            "Import {} — set its up-axis and scale.",
+            Self::file_label(&path)
+        );
+        self.pending_file = Some(PendingFile {
+            path,
+            export: false,
+            options: FileOptions::default(),
+        });
+    }
+
+    /// Open the options dialog for an export to `path`, refusing straight away
+    /// when there is nothing to export.
+    fn export_begin(&mut self, path: PathBuf) {
+        match self.export_candidate() {
+            Ok(_) => {
+                self.status = format!(
+                    "Export to {} — set its up-axis and scale.",
+                    Self::file_label(&path)
+                );
+                self.pending_file = Some(PendingFile {
+                    path,
+                    export: true,
+                    options: FileOptions::default(),
+                });
+            }
+            Err(message) => self.status = message,
+        }
+    }
+
+    /// Run the import or export its options dialog was opened for.
+    fn confirm_pending(&mut self) {
+        let Some(pending) = self.pending_file.take() else {
+            return;
+        };
+        if pending.export {
+            self.export_selected_with(pending.path, pending.options);
+        } else {
+            self.import_file_with(pending.path, pending.options);
+        }
+    }
+
+    /// Drop the pending file without touching it.
+    fn cancel_pending(&mut self) {
+        if self.pending_file.take().is_some() {
+            self.status = "Cancelled.".to_string();
+        }
+    }
+
+    /// The part a status line adds when the options were not the defaults.
+    fn options_note(options: FileOptions) -> String {
+        if options.is_identity() {
+            String::new()
+        } else {
+            format!(", {:.2}× scale, {}", options.scale, options.up.label())
         }
     }
 
@@ -951,39 +1039,44 @@ impl OpenForgeApp {
         }
     }
 
+    /// The one mesh node an export would write, or the status that refuses it.
+    fn export_candidate(&self) -> Result<NodeId, String> {
+        let selected: Vec<NodeId> = self.selection.selected_nodes().collect();
+        let meshes = self.selected_mesh_nodes();
+        match meshes.len() {
+            0 if selected.is_empty() => Err("Select a mesh node to export.".into()),
+            0 => Err("Selected node has no mesh.".into()),
+            1 => Ok(meshes[0]),
+            n => Err(format!(
+                "Select one mesh to export — {n} mesh nodes selected."
+            )),
+        }
+    }
+
     /// Export the one selected mesh node, naming the format in the status.
     ///
     /// The path's extension picks the filter, so one no filter knows is
     /// refused before anything is written; a selection holding more than one
-    /// mesh node is refused too, rather than quietly writing one of them.
-    fn export_selected(&mut self, path: PathBuf) {
-        let selected: Vec<NodeId> = self.selection.selected_nodes().collect();
-        let meshes = self.selected_mesh_nodes();
-        match meshes.len() {
-            1 => {}
-            0 if selected.is_empty() => {
-                self.status = "Select a mesh node to export.".into();
+    /// mesh node is refused too, rather than quietly writing one of them. The
+    /// options turn the mesh back into the file's up-axis and scale.
+    fn export_selected_with(&mut self, path: PathBuf, options: FileOptions) {
+        let id = match self.export_candidate() {
+            Ok(id) => id,
+            Err(message) => {
+                self.status = message;
                 return;
             }
-            0 => {
-                self.status = "Selected node has no mesh.".into();
-                return;
-            }
-            n => {
-                self.status = format!("Select one mesh to export — {n} mesh nodes selected.");
-                return;
-            }
-        }
+        };
         let Some(label) = self.format_label(&path).map(str::to_string) else {
             self.status =
                 self.unknown_format_line("Can't export to", &Self::file_label(&path));
             return;
         };
-        let id = meshes[0];
-        let Some(mesh) = self.mesh_copy(id) else {
+        let Some(mut mesh) = self.mesh_copy(id) else {
             self.status = "Selected node has no mesh.".into();
             return;
         };
+        options.apply(&mut mesh, false);
         let name = self
             .scene
             .get(id)
@@ -997,8 +1090,9 @@ impl OpenForgeApp {
         match self.plugins.export(&path, &data) {
             Ok(()) => {
                 self.status = format!(
-                    "Exported {name} to {} ({label}).",
-                    Self::file_label(&path)
+                    "Exported {name} to {} ({label}{}).",
+                    Self::file_label(&path),
+                    Self::options_note(options)
                 )
             }
             Err(e) => self.status = format!("Export failed: {}", e),
@@ -2387,6 +2481,7 @@ impl eframe::App for OpenForgeApp {
         self.handle_status_bar(ctx);
         self.handle_uv_editor(ctx);
         self.handle_timeline(ctx);
+        self.handle_file_dialog(ctx);
         self.handle_side_panels(ctx);
         self.handle_central_viewport(ctx, frame.wgpu_render_state());
         self.import_dropped_files(ctx);
@@ -2413,7 +2508,7 @@ impl OpenForgeApp {
                         .clicked()
                     {
                         if let Some(path) = rfd_pick_file(self.format_groups()) {
-                            self.import_file(path);
+                            self.import_begin(path);
                         }
                         ui.close_menu();
                     }
@@ -2421,7 +2516,7 @@ impl OpenForgeApp {
                         for (label, extensions) in self.format_groups() {
                             if ui.button(format!("{label}…")).clicked() {
                                 if let Some(path) = rfd_save_file(&label, &extensions) {
-                                    self.export_selected(path);
+                                    self.export_begin(path);
                                 }
                                 ui.close_menu();
                             }
@@ -3090,6 +3185,64 @@ impl OpenForgeApp {
                 }
             });
         });
+    }
+
+    /// The import/export options dialog: the chosen file's name, its up-axis,
+    /// its scale, and Import/Export or Cancel.
+    ///
+    /// Drawn while a file waits; nothing is read or written until the
+    /// confirming button is clicked.
+    fn handle_file_dialog(&mut self, ctx: &egui::Context) {
+        if self.pending_file.is_none() {
+            return;
+        }
+        let mut confirmed = false;
+        let mut cancelled = false;
+        {
+            let pending = self.pending_file.as_mut().expect("checked above");
+            egui::Window::new(if pending.export {
+                "Export options"
+            } else {
+                "Import options"
+            })
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(Self::file_label(&pending.path));
+                ui.horizontal(|ui| {
+                    ui.label("Up-axis:");
+                    for axis in [UpAxis::Y, UpAxis::Z, UpAxis::X] {
+                        ui.selectable_value(&mut pending.options.up, axis, axis.label());
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Scale:");
+                    ui.add(
+                        egui::DragValue::new(&mut pending.options.scale)
+                            .range(0.001..=1000.0)
+                            .speed(0.01),
+                    );
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(if pending.export { "Export" } else { "Import" })
+                        .clicked()
+                    {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancelled = true;
+                    }
+                });
+            });
+        }
+        if confirmed {
+            self.confirm_pending();
+        } else if cancelled {
+            self.cancel_pending();
+        }
     }
 
     fn handle_side_panels(&mut self, ctx: &egui::Context) {
@@ -7080,7 +7233,7 @@ mod tests {
         app.selection.select_node(id);
 
         let path = temp_path("obj");
-        app.export_selected(path.clone());
+        app.export_selected_with(path.clone(), FileOptions::default());
         assert!(app.status.contains("Exported"), "status: {}", app.status);
         assert!(path.exists(), "the host filter wrote the file");
 
@@ -7096,7 +7249,7 @@ mod tests {
     fn exporting_with_nothing_selected_writes_nothing() {
         let mut app = OpenForgeApp::with_gpu(None);
         let path = temp_path("obj");
-        app.export_selected(path.clone());
+        app.export_selected_with(path.clone(), FileOptions::default());
         assert!(app.status.contains("Select a mesh node"), "status: {}", app.status);
         assert!(!path.exists(), "an empty selection writes no file");
     }
@@ -7139,12 +7292,12 @@ mod tests {
         let path = temp_path("obj");
         let name = path.file_name().unwrap().to_string_lossy().into_owned();
 
-        app.export_selected(path.clone());
+        app.export_selected_with(path.clone(), FileOptions::default());
         assert_eq!(app.status, "Select a mesh node to export.");
         assert!(!path.exists(), "an empty selection writes no file");
 
         app.selection.select_node(id);
-        app.export_selected(path.clone());
+        app.export_selected_with(path.clone(), FileOptions::default());
         assert!(path.exists(), "the host filter wrote the file");
         assert_eq!(
             app.status,
@@ -7156,7 +7309,7 @@ mod tests {
         let second = app.scene.create_mesh("Box", primitive_box(1.0));
         app.selection.select_node(second);
         let two = temp_path("obj");
-        app.export_selected(two.clone());
+        app.export_selected_with(two.clone(), FileOptions::default());
         assert_eq!(
             app.status,
             "Select one mesh to export — 2 mesh nodes selected."
@@ -7168,7 +7321,7 @@ mod tests {
         app.selection.select_node(id);
         let unknown = temp_path("wtf");
         let unknown_name = unknown.file_name().unwrap().to_string_lossy().into_owned();
-        app.export_selected(unknown.clone());
+        app.export_selected_with(unknown.clone(), FileOptions::default());
         assert_eq!(
             app.status,
             format!("Can't export to {unknown_name} — no filter knows it (glb, gltf, obj, ply, stl).")
@@ -7709,5 +7862,90 @@ mod tests {
             app.status,
             "Nothing to split — no selected corner is shared with another face."
         );
+    }
+
+    #[test]
+    fn the_import_options_dialog_turns_and_scales_a_file() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let obj = temp_path("obj");
+        std::fs::write(&obj, "v 1 2 3\nv 0 1 0\nv 0 0 1\nf 1 2 3\n").unwrap();
+
+        // The dialog opens first: nothing is read yet, and Cancel reads nothing.
+        app.import_begin(obj.clone());
+        assert!(!app.pending_file.as_ref().unwrap().export);
+        assert_eq!(
+            app.status,
+            format!(
+                "Import {} — set its up-axis and scale.",
+                OpenForgeApp::file_label(&obj)
+            )
+        );
+        app.cancel_pending();
+        assert!(app.pending_file.is_none());
+        assert_eq!(app.status, "Cancelled.");
+        assert_eq!(app.scene.node_count(), 0, "cancel touched nothing");
+
+        // Confirming with Z-up and 2× turns the file into the world's Y-up
+        // space, and the status says what the options did.
+        app.import_begin(obj.clone());
+        {
+            let pending = app.pending_file.as_mut().unwrap();
+            pending.options.up = UpAxis::Z;
+            pending.options.scale = 2.0;
+        }
+        app.confirm_pending();
+        assert!(app.pending_file.is_none());
+        assert_eq!(app.scene.node_count(), 1);
+        assert_eq!(
+            app.status,
+            format!(
+                "Imported 1 mesh(es) from {} (Wavefront OBJ, 2.00× scale, Z up).",
+                OpenForgeApp::file_label(&obj)
+            )
+        );
+        let id = app.scene.iter().next().unwrap().id;
+        let mesh = app.scene.get(id).unwrap().mesh().unwrap();
+        // (1, 2, 3) in a Z-up file reads as world (1, 3, -2), doubled.
+        let first = mesh.positions[0];
+        assert!(
+            (first - Vec3::new(2.0, 6.0, -4.0)).length() < 1e-5,
+            "{first:?}"
+        );
+
+        // Export the same way out: the options turn the world back into the
+        // file's own axes and scale, so the round trip lands on the original.
+        app.selection.select_node(id);
+        let out = temp_path("obj");
+        app.export_begin(out.clone());
+        assert!(app.pending_file.as_ref().unwrap().export);
+        {
+            let pending = app.pending_file.as_mut().unwrap();
+            pending.options.up = UpAxis::Z;
+            pending.options.scale = 0.5;
+        }
+        app.confirm_pending();
+        assert!(app.status.starts_with("Exported "), "{}", app.status);
+        assert!(
+            app.status.contains(", 0.50× scale, Z up)."),
+            "{}",
+            app.status
+        );
+        let text = std::fs::read_to_string(&out).unwrap();
+        let vertex = text
+            .lines()
+            .find(|line| line.starts_with("v "))
+            .expect("the OBJ has a vertex");
+        let coords: Vec<f32> = vertex
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|token| token.parse().ok())
+            .collect();
+        assert_eq!(coords.len(), 3, "{vertex}");
+        for (got, want) in coords.iter().zip([1.0, 2.0, 3.0]) {
+            assert!((got - want).abs() < 1e-4, "{vertex}");
+        }
+        let _ = std::fs::remove_file(&obj);
+        let _ = std::fs::remove_file(&out);
     }
 }
