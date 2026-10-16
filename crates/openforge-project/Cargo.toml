@@ -1,0 +1,14 @@
+[package]
+name = "openforge-project"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The OpenForge project file: one versioned JSON document holding the scene, its material library and its animation clips."
+
+[dependencies]
+openforge-core = { path = "../openforge-core", features = ["serde"] }
+openforge-materials = { path = "../openforge-materials" }
+openforge-animation = { path = "../openforge-animation" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

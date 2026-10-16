@@ -35,11 +35,11 @@ jobs:
           targets: x86_64-pc-windows-msvc,x86_64-unknown-linux-gnu,x86_64-apple-darwin
       - uses: Swatinem/rust-cache@v2
       - name: Check Windows
-        run: cargo check -p openforge-core -p openforge-io --target x86_64-pc-windows-msvc
+        run: cargo check -p openforge-core -p openforge-io -p openforge-project --target x86_64-pc-windows-msvc
       - name: Check Linux
-        run: cargo check -p openforge-core -p openforge-io --target x86_64-unknown-linux-gnu
+        run: cargo check -p openforge-core -p openforge-io -p openforge-project --target x86_64-unknown-linux-gnu
       - name: Check macOS
-        run: cargo check -p openforge-core -p openforge-io --target x86_64-apple-darwin
+        run: cargo check -p openforge-core -p openforge-io -p openforge-project --target x86_64-apple-darwin
 
   # Full release build of the app on each OS.
   build:

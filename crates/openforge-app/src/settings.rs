@@ -150,6 +150,8 @@ impl Settings {
 /// the frame, the toolbar and the registry's names all share), so the window
 /// and the handlers cannot drift apart.
 pub const SHORTCUTS: &[(&str, &str)] = &[
+    ("Ctrl+O / Ctrl+S", "Open a project / save the project"),
+    ("Ctrl+Shift+S", "Save the project under a new name"),
     ("Ctrl+Z / Ctrl+Shift+Z", "Undo / redo"),
     ("Ctrl+A / Ctrl+Shift+A", "Select all elements / clear the selection"),
     ("Ctrl+I", "Invert the element selection"),

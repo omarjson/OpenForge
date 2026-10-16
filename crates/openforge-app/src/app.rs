@@ -26,6 +26,7 @@ use openforge_core::NodeId;
 use openforge_ops::MeshOps;
 use openforge_materials::{Material, MaterialLibrary, Texture};
 use openforge_plugin::{builtin_plugins, PluginHost};
+use openforge_project::Project;
 use openforge_render::{FaceShading, FrameStats, NodeMaterials, PickElement, TextureLayer};
 use openforge_rig::{skin_positions, Bone, LocalTransform, Quat, Skeleton, SkinWeights};
 use openforge_uv::UvOps;
@@ -1302,6 +1303,91 @@ impl OpenForgeApp {
     fn cancel_pending(&mut self) {
         if self.pending_file.take().is_some() {
             self.status = "Cancelled.".to_string();
+        }
+    }
+
+    // --- Project files -------------------------------------------------------
+    // A project is the whole document — the scene, the material library and
+    // the clips — in one file (see `openforge-project`). Import/export move
+    // *meshes* through the plugin registry; these move the document.
+
+    /// Save the document to `path` and remember it as the current project.
+    fn save_project_to(&mut self, path: PathBuf) {
+        let project = Project::from_parts(&self.scene, &self.materials, self.anim.library());
+        match project.save(&path) {
+            Ok(()) => {
+                self.status = format!(
+                    "Saved project to {} ({}).",
+                    Self::file_label(&path),
+                    project.summary().describe()
+                );
+                self.current_file = Some(path);
+            }
+            Err(error) => {
+                self.status =
+                    format!("Could not save project to {}: {error}.", Self::file_label(&path));
+            }
+        }
+    }
+
+    /// Save where the document was last saved (File ▸ Save Project, Ctrl+S),
+    /// asking for a path when it has none yet.
+    fn save_project(&mut self) {
+        match self.current_file.clone() {
+            Some(path) => self.save_project_to(path),
+            None => self.save_project_as(),
+        }
+    }
+
+    /// Ask for a path and save there (File ▸ Save Project As…, Ctrl+Shift+S).
+    fn save_project_as(&mut self) {
+        let extensions = vec![openforge_project::EXTENSION.to_string()];
+        if let Some(path) = rfd_save_file("OpenForge project", &extensions, "project.ofproj") {
+            self.save_project_to(path);
+        }
+    }
+
+    /// Ask for a project file and open it (File ▸ Open Project…, Ctrl+O).
+    fn open_project(&mut self) {
+        let groups = vec![(
+            "OpenForge project".to_string(),
+            vec![openforge_project::EXTENSION.to_string()],
+        )];
+        if let Some(path) = rfd_pick_file(groups) {
+            self.open_project_from(path);
+        }
+    }
+
+    /// Replace the document with the project at `path`.
+    ///
+    /// Opening is a fresh start, the way New is: the selection and the undo
+    /// history belong to the document being replaced, so they go with it —
+    /// and so does the rig, because version 1 of the format does not carry a
+    /// rig yet and one left pointing at the old node ids would be worse than
+    /// none.
+    fn open_project_from(&mut self, path: PathBuf) {
+        let label = Self::file_label(&path);
+        match Project::load(&path) {
+            Ok(project) => {
+                let summary = project.summary().describe();
+                self.scene = project.scene;
+                self.materials = project.materials;
+                self.anim = Player::with_library(project.clips);
+                self.selection.clear();
+                self.undo.clear();
+                self.rig_skeleton = None;
+                self.rig_weights = None;
+                self.rig_bind.clear();
+                self.rig_node = None;
+                self.key_selected = None;
+                self.key_drag = None;
+                self.current_file = Some(path);
+                self.dirty = true;
+                self.status = format!("Opened project {label} ({summary}).");
+            }
+            Err(error) => {
+                self.status = format!("Could not open project {label}: {error}.");
+            }
         }
     }
 
@@ -2847,6 +2933,35 @@ impl OpenForgeApp {
                     }
                     ui.separator();
                     if ui
+                        .button("Open Project…")
+                        .on_hover_text(
+                            "Replace the scene, materials and clips with a project file (Ctrl+O)",
+                        )
+                        .clicked()
+                    {
+                        self.open_project();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Save Project")
+                        .on_hover_text(
+                            "Save the scene, materials and clips to the project file (Ctrl+S)",
+                        )
+                        .clicked()
+                    {
+                        self.save_project();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button("Save Project As…")
+                        .on_hover_text("Save the project under a new name (Ctrl+Shift+S)")
+                        .clicked()
+                    {
+                        self.save_project_as();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
                         .button("Import…")
                         .on_hover_text("Or drop model files on the window")
                         .clicked()
@@ -2859,7 +2974,13 @@ impl OpenForgeApp {
                     ui.menu_button("Export selected as", |ui| {
                         for (label, extensions) in self.format_groups() {
                             if ui.button(format!("{label}…")).clicked() {
-                                if let Some(path) = rfd_save_file(&label, &extensions) {
+                                let default_name = format!(
+                                    "export.{}",
+                                    extensions.first().map(String::as_str).unwrap_or("obj")
+                                );
+                                if let Some(path) =
+                                    rfd_save_file(&label, &extensions, &default_name)
+                                {
                                     self.export_begin(path);
                                 }
                                 ui.close_menu();
@@ -3116,6 +3237,19 @@ impl OpenForgeApp {
     }
 
     fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        // Project files. Ctrl+Shift+S is checked before Ctrl+S; egui's
+        // `consume_key` matches modifiers exactly, so the two never collide.
+        if ctx.input_mut(|i| {
+            i.consume_key(egui::Modifiers::COMMAND | egui::Modifiers::SHIFT, egui::Key::S)
+        }) {
+            self.save_project_as();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::S)) {
+            self.save_project();
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::O)) {
+            self.open_project();
+        }
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
             self.undo_edit();
         }
@@ -6059,14 +6193,14 @@ fn rfd_pick_file(groups: Vec<(String, Vec<String>)>) -> Option<PathBuf> {
     dialog.pick_file()
 }
 
-/// The save dialog for one format: its own filter and a matching default file
-/// name, so the file the user picks carries the format they chose.
-fn rfd_save_file(label: &str, extensions: &[String]) -> Option<PathBuf> {
+/// The save dialog for one format: its own filter and the default file name
+/// the caller passes, so the file the user picks carries the format they
+/// chose.
+fn rfd_save_file(label: &str, extensions: &[String], file_name: &str) -> Option<PathBuf> {
     let exts: Vec<&str> = extensions.iter().map(|e| e.as_str()).collect();
-    let first = exts.first().copied().unwrap_or("obj");
     rfd::FileDialog::new()
         .add_filter(label, &exts)
-        .set_file_name(format!("export.{first}"))
+        .set_file_name(file_name)
         .save_file()
 }
 
@@ -8170,6 +8304,130 @@ mod tests {
         assert!(app.status.contains("Imported"), "status: {}", app.status);
         assert_eq!(app.scene.node_count(), before + 1, "the file came back as a node");
         assert!(app.undo.can_undo(), "an import is undoable");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn projects_round_trip_through_a_real_file() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.new_scene();
+        app.create_primitive("Box");
+        let node = app.scene.all_ids()[0];
+        {
+            let n = app.scene.get_mut(node).unwrap();
+            n.name = "Hull".into();
+            n.transform.translation = Vec3::new(1.0, 2.0, 3.0);
+            n.lod = Some(2);
+        }
+        app.materials.materials[1].diffuse = Vec4::new(0.1, 0.2, 0.3, 1.0);
+        app.materials.textures.push(Texture::solid("checker", 2, 2, [255, 0, 255, 255]));
+        app.materials.materials[1].diffuse_map = Some(0);
+        let mut clip = Clip::new("Spin");
+        let mut track = TransformTrack::targeting(node);
+        track.add_rotation_key(0.0, Quat::IDENTITY, Interp::Linear);
+        track.add_rotation_key(1.0, Quat::from_rotation_z(1.0), Interp::Ease);
+        clip.add_track(track);
+        app.anim.library_mut().add_clip(clip);
+
+        let path = temp_path("ofproj");
+        app.save_project_to(path.clone());
+        assert!(app.status.starts_with("Saved project to"), "status: {}", app.status);
+        assert!(app.status.contains("1 node(s), 6 material(s), 1 clip(s)"), "status: {}", app.status);
+        assert_eq!(app.current_file.as_ref(), Some(&path));
+        // The file on disk is a real project document.
+        let saved = Project::load(&path).expect("the file loads");
+        assert_eq!(saved.summary().nodes, 1);
+        assert_eq!(saved.summary().clips, 1);
+
+        // Saving again goes to the remembered path without a dialog.
+        app.create_primitive("Sphere");
+        app.save_project();
+        assert!(app.status.starts_with("Saved project to"), "status: {}", app.status);
+        assert_eq!(Project::load(&path).unwrap().summary().nodes, 2);
+
+        // Wreck the document (and leave a stale rig pointing at old ids),
+        // then open the file back.
+        app.new_scene();
+        app.materials = MaterialLibrary::new();
+        app.anim = Player::new();
+        app.rig_node = Some(node);
+        app.rig_bind = vec![Vec3::ZERO];
+        app.key_selected = Some(0.5);
+        assert_eq!(app.scene.node_count(), 0);
+
+        app.open_project_from(path.clone());
+        assert!(app.status.starts_with("Opened project"), "status: {}", app.status);
+        assert_eq!(app.current_file.as_ref(), Some(&path));
+        assert_eq!(app.scene.node_count(), 2);
+        let hull = app
+            .scene
+            .iter()
+            .find(|n| n.name == "Hull")
+            .expect("the named node came back");
+        assert_eq!(hull.transform.translation, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(hull.lod, Some(2));
+        assert_eq!(app.materials.materials.len(), 6, "default grey plus the five presets");
+        assert_eq!(app.materials.materials[1].diffuse, Vec4::new(0.1, 0.2, 0.3, 1.0));
+        assert_eq!(app.materials.materials[1].diffuse_map, Some(0));
+        assert_eq!(app.materials.textures.len(), 2, "the app's checker plus this test's");
+        assert_eq!(app.materials.textures[1].pixels.len(), 16);
+        assert_eq!(app.anim.library().clip_names(), vec!["Spin"]);
+        assert_eq!(app.anim.library().clip("Spin").unwrap().tracks()[0].rotation.len(), 2);
+        // Opening starts a fresh history, selection and rig state.
+        assert!(!app.undo.can_undo());
+        assert_eq!(app.selection.node_count(), 0);
+        assert!(app.rig_node.is_none() && app.rig_bind.is_empty(), "the rig is not in a project yet");
+        assert_eq!(app.key_selected, None);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_broken_project_file_leaves_the_document_alone() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.new_scene();
+        app.create_primitive("Box");
+
+        // An OBJ opened as a project: not JSON.
+        let path = temp_path("ofproj");
+        std::fs::write(&path, b"o Cube\nv 0 0 0\n").unwrap();
+        app.open_project_from(path.clone());
+        assert!(app.status.starts_with("Could not open project"), "status: {}", app.status);
+        assert!(app.status.contains("not JSON"), "status: {}", app.status);
+        assert_eq!(app.scene.node_count(), 1, "the document is untouched");
+        assert_eq!(app.current_file, None, "no project is claimed");
+
+        // A file that is not there.
+        let missing = path.with_extension("missing.ofproj");
+        app.open_project_from(missing);
+        assert!(app.status.contains("could not read or write"), "status: {}", app.status);
+        assert_eq!(app.scene.node_count(), 1);
+
+        // A JSON file that is not ours names what it found.
+        std::fs::write(&path, br#"{"hello": 1}"#).unwrap();
+        app.open_project_from(path.clone());
+        assert!(app.status.contains("not an OpenForge project file"), "status: {}", app.status);
+        assert_eq!(app.scene.node_count(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ctrl_s_saves_the_project_it_already_has_a_path_for() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.new_scene();
+        app.create_primitive("Box");
+        let path = temp_path("ofproj");
+        app.save_project_to(path.clone());
+        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists(), "the file was cleared for the shortcut to write");
+
+        // Ctrl+S goes to the path the first save remembered.
+        app.create_primitive("Sphere");
+        let ctx = egui::Context::default();
+        ctx.run(key_frame_mods(0.0, egui::Key::S, egui::Modifiers::COMMAND), |ctx| {
+            app.handle_shortcuts(ctx);
+        });
+        assert!(path.exists(), "Ctrl+S wrote the project back");
+        assert_eq!(Project::load(&path).unwrap().summary().nodes, 2);
         let _ = std::fs::remove_file(&path);
     }
 
