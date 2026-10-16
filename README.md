@@ -137,7 +137,14 @@ A sample GitHub Actions matrix is shown below.
   to the selection, so a second press changes nothing. **H** hides the selected
   nodes, **Shift+H** isolates them (everything else hidden) and **U** shows
   everything again; all three are undo steps, and hidden nodes drop out of the
-  viewport and the picks at once.
+  viewport and the picks at once — the outliner's per-node **Visible** box
+  makes the same edit for one node, undo included.
+- **Select Through** (**View → Select Through**, or **P**): the sub-object
+  picks stop asking the depth-tested ID pass and answer from the projection
+  instead, so a click takes the nearest element under the pointer and a
+  rectangle everything it covers, whether the frame shows it or not. On a
+  machine without wgpu the picks already answer that way, so the switch has
+  nothing to change there.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,
   camera, depth test and back-face culling as the frame, so only what the image
@@ -218,11 +225,12 @@ mostly application surface. Natural next steps:
   scale (translation already has fields). Snapping is in for the grid and for
   vertices; snapping to edges, faces and midpoints, and snapping during the
   free-form view-plane drag, are still to come.
-- A deeper GPU viewport: a **select-through** toggle (picking what the frame
-  hides) on top of the ID pass that now resolves faces, edges and vertices —
-  and rectangles of them — exactly as drawn, with a picked edge already
-  highlighted in the frame and the selection tools (all / none / invert,
-  grow / shrink, edge loop / ring, hide / isolate) in place, then the
+- A deeper GPU viewport: shading depth on top of the ID pass that now resolves
+  faces, edges and vertices — and rectangles of them — exactly as drawn (the
+  select-through switch answers from the projection instead), with a picked
+  edge already highlighted in the frame and the selection tools (all / none /
+  invert, grow / shrink, edge loop / ring, hide / isolate) in place: shadowing
+  and a configurable shading mode are the honest gaps left, then the
   materials node graph — normal/specular maps and mipmapped sampling on top
   of the diffuse map that samples today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the

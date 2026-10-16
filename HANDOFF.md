@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 12 crates (559 `#[test]` fns; 561 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 12 crates (561 `#[test]` fns; 563 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -57,7 +57,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
 | `openforge-rig` | 22 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights`, `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
-| `openforge-app` | 166 (bin) | eframe/egui GUI. `app.rs` (~5100 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide are undoable scene edits. |
+| `openforge-app` | 168 (bin) | eframe/egui GUI. `app.rs` (~5100 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring); hide/isolate/unhide and the outliner's visibility box are undoable scene edits, and **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection. |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -215,7 +215,13 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   or at a boundary edge (one face). Both answer in `Mesh::edges()` ids, both
   return sets, and the app adds the walk of *every* selected edge (L /
   Shift+L), so a press can only grow the selection — clearing is what "None"
-  is for.
+  is for. One more switch sits over the picks: **Select Through** (P) turns
+  the sub-object answers from the occluding ID pass over to the projection —
+  the nearest element under the pointer, everything a rectangle covers,
+  hidden geometry included — through the one gate both pick paths ask,
+  `occluding_picks(select_through, has_backend)`. Without a wgpu backend the
+  switch has nothing to change, because the projection is already the answer
+  there.
 - **The UV editor is its own panel, not a viewport mode** (`uv_editor.rs` owns
   the canvas math and panel state, `app.rs` owns the wiring).
   `uv_editor::island_selection` grows a UV selection to whole islands through
@@ -874,9 +880,28 @@ progress report:
   the edge) and 1 in `app.rs` driving both walks through the actions, the
   hotkeys, and the two refusals.
 
+- **Select Through and the outliner's visibility box** (work-stream #18). Two
+  loose ends from the picking and visibility work:
+  - **View ▸ Select Through (P)** sends the sub-object picks to the projection
+    instead of the ID pass: a click takes the nearest element under the
+    pointer, a rectangle everything it covers, whether the frame shows it or
+    not. `OpenForgeApp::occluding_picks(select_through, has_backend)` is the
+    one gate, asked by `gpu_pick` and the GPU branch of `marquee_hits` alike;
+    on a machine without wgpu the switch changes nothing, because the raycast
+    and the projection already answer there.
+  - **The outliner's visibility box** now runs through `set_node_visible`:
+    one undo step (it used to edit the scene with no undo entry at all), a
+    status naming the node ("Hidden Grid." / "Shown Grid."), and hiding drops
+    the node from the selection exactly the way H does.
+
+- **2 new tests**: one drives the gate's truth table, flips the mode by the P
+  key and lands a click on a vertex hidden behind the face in front of it
+  (the projection's own answer, pinned because it is what the mode falls back
+  to); the other takes the outliner's box through hide, undo and show.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **561 pass, 0 failures**
+build too); `cargo test --workspace` → **563 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam and now texture sampling on both paths are all covered *without* a
@@ -913,7 +938,10 @@ the app actions with their statuses, hotkeys and undo steps — hide is even
 followed into the painted frame, whose stroke count drops and returns. The
 edge walks are pinned in core too (the grid's parallel bands and middle
 column, the cube's closed four-edge rings, the non-quad stop) and driven in
-the app through the same keys.
+the app through the same keys. Select Through is pinned at the gate itself
+(its truth table and the P key) and by a click landing on a vertex hidden
+behind the face in front of it, and the outliner's box by its single undo
+step.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -939,9 +967,13 @@ picked edge behind a face glows through, exactly like the vertex dots), the
 **Select menu / toolbar row / hotkeys and hide-isolate by eye** (Ctrl+A should
 fill the level, Ctrl+Plus/Ctrl+Minus should step along the topology with the
 status counting, H/Shift+H/U should hide, isolate and reveal with undo
-stepping back) and the **edge loop / ring walk** by eye (pick one edge of a
-quad grid, L should take its column and Shift+L its band of parallels) — the
-agent has no
+stepping back), the **edge loop / ring walk** by eye (pick one edge of a
+quad grid, L should take its column and Shift+L its band of parallels), the
+**select-through switch** by eye (P, then click a vertex behind the surface or
+drag a box over hidden edges: the occluded element should answer, and turning
+it off should bring the image's own answer back) and the **outliner's Visible
+box** by eye (it should hide and show one node with its status and one undo
+step) — the agent has no
 display access, so a human should look at all of those once. (An earlier session did
 launch the app on the wgpu path and saw `eframe: ... Using wgpu.` with a Metal
 adapter, no `egui_wgpu` warnings and no panic over a 12 s run.)
@@ -952,7 +984,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **63.7%**, shown as 63%). The engine
+16 curated areas is **63.8%**, shown as 63%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -961,17 +993,18 @@ sub-object picking that matches the drawn frame (plus UV islands) as of #12,
 rectangle selection through that same pass as of #13, edge-level picking by
 click and rectangle as of #14, the visible sub-object selection as of #15,
 the selection tools (all / none / invert, grow / shrink, hide / isolate /
-unhide) as of #16 and the edge loop / ring walks as of #17.
+unhide) as of #16, the edge loop / ring walks as of #17 and the
+select-through switch with the outliner's undoable visibility box as of #18.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
    material shading (#9), texture sampling (#11), occlusion-exact sub-object
    picking (#12), rectangle selection (#13), edge-level picking (#14), the
-   visible sub-object selection (#15) and the selection tools (#16: all / none
-   / invert, grow / shrink, hide / isolate / unhide) and the edge loop / ring
-   walks (#17) are in. What remains of the editor surface: a **select-through
-   toggle** (pick what the frame hides). Beyond that: shadowing / ambient
-   occlusion and a configurable shading mode.
+   visible sub-object selection (#15), the selection tools (#16: all / none /
+   invert, grow / shrink, hide / isolate / unhide), the edge loop / ring walks
+   (#17) and the select-through switch (#18: the ID pass or the projection, P)
+   are in. What remains of the viewport surface: shadowing / ambient occlusion
+   and a configurable shading mode.
 2. **Extend the gizmo further** (`gizmo.rs`, all additive): plane and centre
    handles, and numeric entry for rotation/scale (translation already has
    DragValues in Properties). Snapping landed in #10 but is deliberately partial:
