@@ -304,6 +304,8 @@ mod tests {
         painted.shininess = 128.0;
         painted.two_sided = true;
         painted.diffuse_map = Some(0);
+        painted.normal_map = Some(0);
+        painted.emissive = Vec3::new(0.2, 0.0, 0.1);
         materials.materials.push(painted);
         materials
             .materials
@@ -412,6 +414,11 @@ mod tests {
         );
         assert!(loaded.materials.materials[1].two_sided);
         assert_eq!(loaded.materials.materials[1].diffuse_map, Some(0));
+        assert_eq!(loaded.materials.materials[1].normal_map, Some(0));
+        assert_eq!(
+            loaded.materials.materials[1].emissive,
+            Vec3::new(0.2, 0.0, 0.1)
+        );
         assert_eq!(loaded.materials.textures.len(), 1);
         assert_eq!(loaded.materials.textures[0].pixels.len(), 2 * 2 * 4);
         assert_eq!(loaded.clips.clip_names(), vec!["Hover"]);
@@ -440,6 +447,29 @@ mod tests {
 
         assert_eq!(loaded.summary(), original.summary());
         assert_eq!(loaded.summary().keys, 5);
+    }
+
+    #[test]
+    fn an_emissive_map_saves_and_a_file_without_the_field_still_loads() {
+        let mut project = rich_project();
+        project.materials.materials[1].emissive_map = Some(0);
+        let text = project.to_json().unwrap();
+        assert!(text.contains("\"emissive_map\": 0"), "{text}");
+        let loaded = Project::from_json(&text).unwrap();
+        assert_eq!(loaded.materials.materials[1].emissive_map, Some(0));
+
+        // A file written before the field existed: the line is simply absent,
+        // and the map is absent rather than the whole file being refused.
+        let older: String = text
+            .lines()
+            .filter(|line| !line.contains("\"emissive_map\""))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_ne!(older, text, "the field should have been written");
+        let loaded = Project::from_json(&older).unwrap();
+        assert_eq!(loaded.materials.materials[1].emissive_map, None);
+        // Nothing else moved: the other maps are still there.
+        assert_eq!(loaded.materials.materials[1].diffuse_map, Some(0));
     }
 
     #[test]

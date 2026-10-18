@@ -9,7 +9,7 @@
 
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use openforge_core::math::Ray;
-use openforge_materials::{Material, MaterialLibrary};
+use openforge_materials::{MapKind, Material, MaterialLibrary};
 use std::collections::HashMap;
 use openforge_core::mesh::Mesh;
 use openforge_core::scene::Scene;
@@ -160,16 +160,27 @@ pub fn material_base(material: &Material, selected: bool, face_selected: bool) -
     }
 }
 
-/// The library texture a face's material samples, if any.
+/// The library texture one of a face's material's maps samples, if any.
 ///
-/// A material names its diffuse map by index; a map whose texture the library
+/// A material names each of its maps by index; one whose texture the library
 /// no longer holds is ignored, so a face can never sample past the end of the
-/// texture list. Both viewports resolve through this one function — the CPU
-/// painter takes the index as its texture array handle, the GPU path as the
-/// vertex's layer — so they cannot disagree about which faces are textured.
+/// texture list. Everything that reads a map goes through here — the CPU
+/// painter samples through the indices, the GPU path turns them into vertex
+/// layers, and `MapTexels` reads the same ones — so the two paths cannot
+/// disagree about which faces are mapped.
+pub fn face_map(library: &MaterialLibrary, material_slot: u32, kind: MapKind) -> Option<usize> {
+    library
+        .resolve(material_slot)
+        .map(kind)
+        .filter(|index| library.textures.get(*index).is_some())
+}
+
+/// The library texture a face's material samples as its diffuse map, if any.
+///
+/// Both viewports resolve through this one function — the CPU painter takes
+/// the index as its texture array handle, the GPU path as the vertex's layer.
 pub fn face_texture(library: &MaterialLibrary, material_slot: u32) -> Option<usize> {
-    let map = library.resolve(material_slot).diffuse_map;
-    map.filter(|index| library.textures.get(*index).is_some())
+    face_map(library, material_slot, MapKind::Diffuse)
 }
 
 /// Collect all visible mesh triangles from the scene in world space.
@@ -1408,6 +1419,38 @@ mod tests {
             None,
             "an out-of-range slot falls back to the default material"
         );
+    }
+
+    #[test]
+    fn face_map_reads_every_kind_and_the_diffuse_shortcut_agrees() {
+        let mut library = MaterialLibrary::new();
+        let texture = library.add_texture(Texture::solid("tiny", 1, 1, [1, 2, 3, 4]));
+        let missing = library.texture_count();
+        let mut mapped = Material::new("mapped");
+        mapped.diffuse_map = Some(texture);
+        mapped.normal_map = Some(missing);
+        mapped.specular_map = Some(texture);
+        mapped.emissive_map = Some(texture);
+        let slot = library.add_material(mapped) as u32;
+
+        assert_eq!(face_map(&library, slot, MapKind::Diffuse), Some(texture));
+        assert_eq!(
+            face_map(&library, slot, MapKind::Normal),
+            None,
+            "a dangling map is ignored, not sampled"
+        );
+        assert_eq!(face_map(&library, slot, MapKind::Specular), Some(texture));
+        assert_eq!(face_map(&library, slot, MapKind::Emissive), Some(texture));
+        // The older accessor is the diffuse kind, so the UV editor and the
+        // viewport agree on what \"the\" map is.
+        assert_eq!(
+            face_texture(&library, slot),
+            face_map(&library, slot, MapKind::Diffuse)
+        );
+        // The default material wears nothing, whatever kind is asked for.
+        for kind in MapKind::ALL {
+            assert_eq!(face_map(&library, 0, kind), None, "{kind:?}");
+        }
     }
 
     #[test]

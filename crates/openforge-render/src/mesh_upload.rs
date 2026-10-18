@@ -102,7 +102,7 @@ impl MeshBuffers {
         };
 
         let mut out = MeshBuffers::default();
-        let mut corner_map: HashMap<(u32, u32, u32, [u32; 4], u32), u32> = HashMap::new();
+        let mut corner_map: HashMap<(u32, u32, u32, [u32; 15]), u32> = HashMap::new();
 
         for (face_idx, face) in mesh.faces.iter().enumerate() {
             let cs = &face.corners;
@@ -114,18 +114,10 @@ impl MeshBuffers {
             }
             let shading = face_shading(face_idx);
             let color = shading.color;
-            let color_key = [
-                color[0].to_bits(),
-                color[1].to_bits(),
-                color[2].to_bits(),
-                color[3].to_bits(),
-            ];
-            // Plain indices; the white layer is layer 0, so `+ 1` keeps
-            // "untextured" distinct from "texture 0".
-            let layer_key = match shading.layer {
-                Some(layer) => layer as u32 + 1,
-                None => 0,
-            };
+            // Everything about this face's shading joins the dedup key, so two
+            // faces sharing a corner but differing in any map or surface term
+            // keep their own vertices (and their own sampling).
+            let shading_key = shading_key(&shading);
             // Flat fallback: Newell normal over the face's transformed corners.
             let mut flat = Vec3::ZERO;
             for i in 0..cs.len() {
@@ -138,7 +130,7 @@ impl MeshBuffers {
 
             for i in 1..cs.len() - 1 {
                 for &c in &[cs[0], cs[i], cs[i + 1]] {
-                    let key = (c.position, c.normal, c.uv, color_key, layer_key);
+                    let key = (c.position, c.normal, c.uv, shading_key);
                     let idx = *corner_map.entry(key).or_insert_with(|| {
                         let position = world.transform_point3(mesh.positions[c.position as usize]);
                         let normal = match mesh.normals.get(c.normal as usize) {
@@ -151,6 +143,19 @@ impl MeshBuffers {
                             Some(layer) => vertex.with_texture_layer(layer),
                             None => vertex,
                         };
+                        let vertex = match shading.normal_layer {
+                            Some(layer) => vertex.with_normal_layer(layer),
+                            None => vertex,
+                        };
+                        let vertex = match shading.specular_layer {
+                            Some(layer) => vertex.with_specular_layer(layer),
+                            None => vertex,
+                        };
+                        let vertex = match shading.emissive_layer {
+                            Some(layer) => vertex.with_emissive_layer(layer),
+                            None => vertex,
+                        };
+                        let vertex = vertex.with_surface(shading.specular, shading.emissive);
                         out.vertices.push(vertex);
                         (out.vertices.len() - 1) as u32
                     });
@@ -162,32 +167,109 @@ impl MeshBuffers {
     }
 }
 
-/// What the renderer shades one face with: its linear colour plus, for a
-/// textured face, which of the caller's textures to sample.
+/// What the renderer shades one face with: its linear colour, the maps it
+/// samples and the material's own highlight and glow.
 ///
 /// The renderer knows nothing about materials — a caller that has a material
-/// library resolves each face's slot into a colour and a texture index and
-/// hands the result in. `layer` counts the caller's textures from zero (the
-/// renderer reserves array layer 0 for white), and `None` means "shade with
-/// the colour alone".
+/// library resolves each face's slot into a colour, four texture indices and
+/// the two surface terms and hands the result in. Each map index counts the
+/// caller's textures from zero (the renderer offsets them past its reserved
+/// identity layers), and `None` means "this face has no such map", which the
+/// shader reads as the identity layer: white scales a colour, a neutral normal
+/// leaves the geometric normal alone and black adds nothing.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct FaceShading {
     /// Linear-space RGBA the face is shaded with (multiplied by the texel).
     pub color: [f32; 4],
-    /// The caller's texture index to sample, or `None` for a flat face.
+    /// The caller's diffuse texture index, or `None` for a flat face.
     pub layer: Option<usize>,
+    /// The caller's normal-map texture index, or `None`.
+    pub normal_layer: Option<usize>,
+    /// The caller's specular-map texture index, or `None`.
+    pub specular_layer: Option<usize>,
+    /// The caller's emissive-map texture index, or `None`.
+    pub emissive_layer: Option<usize>,
+    /// Linear-space highlight colour, with the Phong exponent in `.w`; a
+    /// non-positive exponent (the default) contributes no highlight.
+    pub specular: [f32; 4],
+    /// Linear-space self-illumination; the default black adds nothing.
+    pub emissive: [f32; 3],
 }
 
 impl FaceShading {
     /// A face shaded with a colour alone.
     pub fn flat(color: [f32; 4]) -> Self {
-        Self { color, layer: None }
+        Self { color, ..Self::default() }
     }
 
-    /// A face shaded with a colour and the caller's texture `layer`.
+    /// A face shaded with a colour and the caller's diffuse texture `layer`.
     pub fn textured(color: [f32; 4], layer: usize) -> Self {
-        Self { color, layer: Some(layer) }
+        Self::flat(color).with_diffuse_map(layer)
     }
+
+    /// Sample the caller's texture `index` as the diffuse map, chaining.
+    #[must_use]
+    pub fn with_diffuse_map(mut self, index: usize) -> Self {
+        self.layer = Some(index);
+        self
+    }
+
+    /// Sample the caller's texture `index` as the normal map, chaining.
+    #[must_use]
+    pub fn with_normal_map(mut self, index: usize) -> Self {
+        self.normal_layer = Some(index);
+        self
+    }
+
+    /// Sample the caller's texture `index` as the specular map, chaining.
+    #[must_use]
+    pub fn with_specular_map(mut self, index: usize) -> Self {
+        self.specular_layer = Some(index);
+        self
+    }
+
+    /// Sample the caller's texture `index` as the emissive map, chaining.
+    #[must_use]
+    pub fn with_emissive_map(mut self, index: usize) -> Self {
+        self.emissive_layer = Some(index);
+        self
+    }
+
+    /// Carry the material's highlight (RGB plus exponent in `.w`) and
+    /// self-illumination, chaining.
+    #[must_use]
+    pub fn with_surface(mut self, specular: [f32; 4], emissive: [f32; 3]) -> Self {
+        self.specular = specular;
+        self.emissive = emissive;
+        self
+    }
+}
+
+/// The bits that make two faces' shading differ, for the corner dedup key:
+/// the four map layers (offset so "no map" is distinct from texture 0) and
+/// the two surface terms.
+fn shading_key(shading: &FaceShading) -> [u32; 15] {
+    let layer = |slot: Option<usize>| match slot {
+        Some(index) => index as u32 + 1,
+        None => 0,
+    };
+    [
+        shading.color[0].to_bits(),
+        shading.color[1].to_bits(),
+        shading.color[2].to_bits(),
+        shading.color[3].to_bits(),
+        layer(shading.layer),
+        layer(shading.normal_layer),
+        layer(shading.specular_layer),
+        layer(shading.emissive_layer),
+        shading.specular[0].to_bits(),
+        shading.specular[1].to_bits(),
+        shading.specular[2].to_bits(),
+        shading.specular[3].to_bits(),
+        shading.emissive[0].to_bits(),
+        shading.emissive[1].to_bits(),
+        shading.emissive[2].to_bits(),
+    ]
 }
 
 impl From<[f32; 4]> for FaceShading {
@@ -351,7 +433,7 @@ fn build_scene_per_face(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu_types::WHITE_LAYER;
+    use crate::gpu_types::{texture_layer_index, WHITE_LAYER};
     use openforge_core::mesh::{Corner, Face};
 
     /// A unit quad in the XY plane (facing +Z) with shared corners.
@@ -663,8 +745,14 @@ mod tests {
         // Corners of faces on different textures may not be shared.
         assert_eq!(buf.vertices.len(), 7);
         assert_eq!(buf.indices.len(), 9);
-        assert!(buf.vertices[..4].iter().all(|v| v.tex_layer == 1.0), "texture 0");
-        assert!(buf.vertices[4..].iter().all(|v| v.tex_layer == 2.0), "texture 1");
+        assert!(
+            buf.vertices[..4].iter().all(|v| v.tex_layer == texture_layer_index(0)),
+            "texture 0"
+        );
+        assert!(
+            buf.vertices[4..].iter().all(|v| v.tex_layer == texture_layer_index(1)),
+            "texture 1"
+        );
     }
 
     #[test]
@@ -679,7 +767,9 @@ mod tests {
         });
         assert_eq!(buf.vertices.len(), 7, "flat and textured faces stay apart");
         assert!(buf.vertices[..4].iter().all(|v| v.tex_layer == WHITE_LAYER));
-        assert!(buf.vertices[4..].iter().all(|v| v.tex_layer == 1.0));
+        assert!(
+            buf.vertices[4..].iter().all(|v| v.tex_layer == texture_layer_index(0))
+        );
     }
 
     #[test]
@@ -689,7 +779,9 @@ mod tests {
             FaceShading::textured(RED, 3)
         });
         assert_eq!(buf.vertices.len(), 4);
-        assert!(buf.vertices.iter().all(|v| v.tex_layer == 4.0));
+        assert!(
+            buf.vertices.iter().all(|v| v.tex_layer == texture_layer_index(3))
+        );
     }
 
     #[test]
@@ -740,7 +832,11 @@ mod tests {
             ),
         );
         let layers: Vec<f32> = buffers[0].vertices.iter().map(|v| v.tex_layer).collect();
-        assert_eq!(layers.iter().filter(|l| **l == 3.0).count(), 4, "the quad");
+        assert_eq!(
+            layers.iter().filter(|l| **l == texture_layer_index(2)).count(),
+            4,
+            "the quad"
+        );
         assert_eq!(
             layers.iter().filter(|l| **l == WHITE_LAYER).count(),
             3,

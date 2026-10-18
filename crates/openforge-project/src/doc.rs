@@ -75,6 +75,10 @@ pub(crate) struct DocMaterial {
     pub normal_map: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub specular_map: Option<usize>,
+    /// The self-illumination map. Added after the other three, so a file that
+    /// predates it loads with the map absent rather than being refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emissive_map: Option<usize>,
     pub two_sided: bool,
 }
 
@@ -90,6 +94,7 @@ impl From<&Material> for DocMaterial {
             diffuse_map: m.diffuse_map,
             normal_map: m.normal_map,
             specular_map: m.specular_map,
+            emissive_map: m.emissive_map,
             two_sided: m.two_sided,
         }
     }
@@ -107,6 +112,7 @@ impl DocMaterial {
             diffuse_map: self.diffuse_map,
             normal_map: self.normal_map,
             specular_map: self.specular_map,
+            emissive_map: self.emissive_map,
             two_sided: self.two_sided,
         }
     }

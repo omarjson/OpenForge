@@ -31,7 +31,7 @@
 //! half of the crate keeps building and testing without wgpu in the graph.
 
 use crate::camera::OrbitCamera;
-use crate::gpu_types::{FrameUniforms, GpuVertex, TextureLayer};
+use crate::gpu_types::{FrameUniforms, GpuVertex, TextureLayer, RESERVED_LAYERS};
 use crate::mesh_upload::{build_scene_materials, MeshBuffers, NodeMaterials};
 use crate::pick::{resolve_patch, PickElement, PickGeometry, PickVertex};
 use crate::pipeline::{self, CullMode};
@@ -287,12 +287,17 @@ pub struct FrameStats {
 // --- Vertex layout ---------------------------------------------------------------
 
 /// Attribute layout matching [`GpuVertex`]'s `@location`s and byte offsets.
-const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 5] = [
+const VERTEX_ATTRIBUTES: [wgpu::VertexAttribute; 10] = [
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 0, shader_location: 0 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 12, shader_location: 1 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x2, offset: 24, shader_location: 2 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 32, shader_location: 3 },
     wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 48, shader_location: 4 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 52, shader_location: 5 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 56, shader_location: 6 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32, offset: 60, shader_location: 7 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x4, offset: 64, shader_location: 8 },
+    wgpu::VertexAttribute { format: wgpu::VertexFormat::Float32x3, offset: 80, shader_location: 9 },
 ];
 
 fn vertex_layout() -> wgpu::VertexBufferLayout<'static> {
@@ -476,15 +481,13 @@ impl GpuRenderer {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let face_texture =
-            create_face_texture(device, MIN_TARGET_DIM, MIN_TARGET_DIM, 1);
-        write_face_layer(
-            queue,
-            &face_texture,
-            [MIN_TARGET_DIM, MIN_TARGET_DIM],
-            0,
-            &[255, 255, 255, 255],
+        let face_texture = create_face_texture(
+            device,
+            MIN_TARGET_DIM,
+            MIN_TARGET_DIM,
+            RESERVED_LAYERS as u32,
         );
+        write_identity_layers(queue, &face_texture, [MIN_TARGET_DIM, MIN_TARGET_DIM]);
         let face_texture_view = face_array_view(&face_texture);
 
         let frame_uniforms = uniform_buffer("openforge-frame-uniforms");
@@ -756,7 +759,7 @@ impl GpuRenderer {
             face_texture_view,
             face_sampler,
             texture_size: [MIN_TARGET_DIM, MIN_TARGET_DIM],
-            layer_count: 1,
+            layer_count: RESERVED_LAYERS as u32,
             scene_pipeline,
             grid_pipeline,
             edge_pipeline,
@@ -821,7 +824,7 @@ impl GpuRenderer {
             Some(l) => (l.width.max(1), l.height.max(1)),
             None => (MIN_TARGET_DIM, MIN_TARGET_DIM),
         };
-        let layer_count = 1 + layers.len() as u32;
+        let layer_count = RESERVED_LAYERS as u32 + layers.len() as u32;
 
         if [width, height] != self.texture_size || layer_count != self.layer_count {
             self.face_texture = create_face_texture(device, width, height, layer_count);
@@ -848,9 +851,16 @@ impl GpuRenderer {
             );
         }
 
-        let white = vec![255u8; (width as usize) * (height as usize) * 4];
-        for layer in 0..layer_count {
-            write_face_layer(queue, &self.face_texture, self.texture_size, layer, &white);
+        // The reserved identity layers first, so every map a face does *not*
+        // have samples a texel that leaves the face alone.
+        write_identity_layers(queue, &self.face_texture, self.texture_size);
+        // Then every caller layer starts white: a layer whose pixels are the
+        // wrong size (or empty) would otherwise show whatever the driver had
+        // there, and white is the identity a face still shades through.
+        let texels = (width as usize) * (height as usize);
+        let white = [255u8, 255, 255, 255].repeat(texels);
+        for slot in RESERVED_LAYERS as u32..layer_count {
+            write_face_layer(queue, &self.face_texture, self.texture_size, slot, &white);
         }
         for (i, layer) in layers.iter().enumerate() {
             if layer.width == width && layer.height == height && layer.is_complete() {
@@ -858,7 +868,7 @@ impl GpuRenderer {
                     queue,
                     &self.face_texture,
                     self.texture_size,
-                    i as u32 + 1,
+                    i as u32 + RESERVED_LAYERS as u32,
                     &layer.rgba,
                 );
             }
@@ -1420,6 +1430,24 @@ fn face_bind_group(
 }
 
 /// Write one whole array layer of RGBA8 texels.
+/// The reserved layers' texels, in [`RESERVED_LAYERS`] order: white — the
+/// identity of the diffuse map (which multiplies) and of the specular map
+/// (which scales) — the neutral normal `(0.5, 0.5, 1.0)` for the normal map,
+/// and black, the identity of the emissive map (which is added).
+const IDENTITY_LAYERS: [[u8; 4]; RESERVED_LAYERS] = [
+    [255, 255, 255, 255],
+    [128, 128, 255, 255],
+    [0, 0, 0, 255],
+];
+
+/// Fill a texture array's reserved identity layers (see [`IDENTITY_LAYERS`]).
+fn write_identity_layers(queue: &wgpu::Queue, texture: &wgpu::Texture, size: [u32; 2]) {
+    let texels = (size[0] as usize) * (size[1] as usize);
+    for (layer, rgba) in IDENTITY_LAYERS.iter().enumerate() {
+        write_face_layer(queue, texture, size, layer as u32, &rgba.repeat(texels));
+    }
+}
+
 fn write_face_layer(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
@@ -1761,14 +1789,26 @@ mod tests {
     fn vertex_layout_matches_gpu_vertex_size() {
         let layout = vertex_layout();
         assert_eq!(layout.array_stride, std::mem::size_of::<GpuVertex>() as u64);
-        assert_eq!(layout.attributes.len(), 5);
+        // position, normal, uv, colour, four map layers, specular, emissive.
+        assert_eq!(layout.attributes.len(), 10);
         assert_eq!(layout.attributes[0].shader_location, 0);
         assert_eq!(layout.attributes[3].offset + 16, layout.attributes[4].offset);
-        assert_eq!(layout.attributes[4].shader_location, 4);
         assert_eq!(layout.attributes[4].format, wgpu::VertexFormat::Float32);
+        // The three other map layers follow the diffuse layer, one f32 each.
+        for i in 4..=7 {
+            assert_eq!(layout.attributes[i].shader_location, i as u32);
+            assert_eq!(layout.attributes[i].format, wgpu::VertexFormat::Float32);
+            assert_eq!(
+                layout.attributes[i].offset,
+                layout.attributes[4].offset + 4 * (i - 4) as u64
+            );
+        }
+        assert_eq!(layout.attributes[8].format, wgpu::VertexFormat::Float32x4);
+        assert_eq!(layout.attributes[8].offset, layout.attributes[7].offset + 4);
+        assert_eq!(layout.attributes[9].format, wgpu::VertexFormat::Float32x3);
         // The last attribute lands exactly at the end of the stride: no gaps a
         // shader could read garbage from.
-        assert_eq!(layout.attributes[4].offset + 4, layout.array_stride);
+        assert_eq!(layout.attributes[9].offset + 12, layout.array_stride);
     }
 
     #[test]
@@ -2167,7 +2207,11 @@ mod tests {
             ],
         );
         assert_eq!(renderer.texture_size(), [1, 1]);
-        assert_eq!(renderer.texture_layers(), 3, "white + two textures");
+        assert_eq!(
+            renderer.texture_layers(),
+            5,
+            "three identity layers + two textures"
+        );
 
         // White material colours, so every hue in the frame comes from a texel.
         // The two faces of the Y axis pair carry the green texture: one of them
@@ -2202,6 +2246,217 @@ mod tests {
     }
 
     #[test]
+    fn an_emissive_map_adds_its_own_colour() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU emissive map test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let cube = scene.create_mesh("Cube", unit_cube());
+        let selection = Selection::new();
+        let camera = OrbitCamera::default();
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let size = renderer.size();
+
+        // One 1x1 red texture, worn as the emissive map.
+        renderer.set_textures(&device, &queue, &[TextureLayer::solid(1, 1, [255, 0, 0, 255])]);
+
+        // A black base colour, so the only light a face gives off is the light
+        // its own emissive map adds. Two faces of an axis pair carry the map;
+        // one of any pair faces the camera from any orbit.
+        let black = [0.0, 0.0, 0.0, 1.0];
+        let mut faces = vec![FaceShading::flat(black); 6];
+        faces[4] = faces[4].with_emissive_map(0);
+        faces[5] = faces[5].with_emissive_map(0);
+        let mapped = NodeMaterials::new().with_faces(cube, faces);
+        renderer.render(&device, &queue, &mut scene, &selection, &mapped, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert!(
+            pure_channel_pixels(&pixels, size, 0) > 0,
+            "the emissive map's red never reached the target"
+        );
+
+        // Control: the same black cube without the map gives off nothing at
+        // all, which is what makes the red above the map's doing.
+        let plain = NodeMaterials::new().with_faces(cube, vec![FaceShading::flat(black); 6]);
+        renderer.render(&device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert_eq!(
+            pure_channel_pixels(&pixels, size, 0),
+            0,
+            "red came from somewhere other than the emissive map"
+        );
+        assert_eq!(
+            bright_neutral_pixels(&pixels, size),
+            0,
+            "a black cube has no bright pixels"
+        );
+    }
+
+    #[test]
+    fn a_specular_map_scales_the_materials_highlight() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU specular map test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let cube = scene.create_mesh("Cube", unit_cube());
+        let selection = Selection::new();
+        let camera = OrbitCamera::default();
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let size = renderer.size();
+
+        // Texture 0 is white — the identity a missing specular map already
+        // samples — and texture 1 is black, a highlight switched off.
+        renderer.set_textures(
+            &device,
+            &queue,
+            &[
+                TextureLayer::solid(1, 1, [255, 255, 255, 255]),
+                TextureLayer::solid(1, 1, [0, 0, 0, 255]),
+            ],
+        );
+
+        // A dark grey face with a bright, broad highlight: the grey alone is
+        // too dark to count as a bright pixel, the highlight is not.
+        let grey = [0.1, 0.1, 0.1, 1.0];
+        let highlight = [1.0, 1.0, 1.0, 2.0];
+        let whole_cube = |shading: FaceShading| {
+            NodeMaterials::new().with_faces(cube, vec![shading; 6])
+        };
+        let plain = whole_cube(FaceShading::flat(grey).with_surface(highlight, [0.0; 3]));
+        renderer.render(&device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
+        let without = read_pixels(&device, &queue, &renderer);
+        assert!(
+            bright_neutral_pixels(&without, size) > 0,
+            "the material's own highlight never reached the target"
+        );
+
+        // The identity: a white specular map is the picture without a map.
+        let white = whole_cube(
+            FaceShading::flat(grey)
+                .with_surface(highlight, [0.0; 3])
+                .with_specular_map(0),
+        );
+        renderer.render(&device, &queue, &mut scene, &selection, &white, &camera, 0.0, &[]);
+        assert_eq!(
+            read_pixels(&device, &queue, &renderer),
+            without,
+            "white is the specular map's identity"
+        );
+
+        // A black one takes the highlight away, leaving the bare grey face.
+        let black = whole_cube(
+            FaceShading::flat(grey)
+                .with_surface(highlight, [0.0; 3])
+                .with_specular_map(1),
+        );
+        renderer.render(&device, &queue, &mut scene, &selection, &black, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert_eq!(
+            bright_neutral_pixels(&pixels, size),
+            0,
+            "a black specular map should have taken the highlight away"
+        );
+        assert!(
+            bright_neutral_pixels(&without, size) > bright_neutral_pixels(&pixels, size),
+            "the map made no difference to the frame"
+        );
+    }
+
+    /// A quad in the XY plane facing `+Z`, with UVs that give its fragments a
+    /// tangent frame. The shared cube's corners all point at one UV, so they
+    /// have no frame for a normal map to lean against.
+    fn uv_quad() -> openforge_core::mesh::Mesh {
+        use glam::Vec2;
+        let mut m = openforge_core::mesh::Mesh::new();
+        for p in [
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ] {
+            m.add_vertex(p);
+        }
+        m.add_face(&[0, 1, 2, 3]);
+        // The face's corners all point at the seeded UV slot; each gets its own,
+        // so the fragment stage's UV derivatives are not zero.
+        m.uvs = vec![
+            Vec2::new(0.0, 0.0),
+            Vec2::new(1.0, 0.0),
+            Vec2::new(1.0, 1.0),
+            Vec2::new(0.0, 1.0),
+        ];
+        for (i, corner) in m.faces[0].corners.iter_mut().enumerate() {
+            corner.uv = i as u32;
+        }
+        m.compute_flat_normals();
+        m
+    }
+
+    #[test]
+    fn a_normal_map_tilts_the_shading_through_the_faces_own_frame() {
+        let Some((_adapter, device, queue)) = headless_device() else {
+            eprintln!("skipping GPU normal map test: no wgpu adapter available");
+            return;
+        };
+        let mut scene = Scene::new();
+        let quad = scene.create_mesh("Quad", uv_quad());
+        let selection = Selection::new();
+        let camera = OrbitCamera::default();
+        let mut renderer = GpuRenderer::new(&device, &queue, 1);
+        renderer.resize(&device, [TARGET, TARGET]);
+        let size = renderer.size();
+
+        // Texture 0 is the neutral normal (0.5, 0.5, 1.0: straight out) and
+        // texture 1 leans 45 degrees towards the tangent.
+        renderer.set_textures(
+            &device,
+            &queue,
+            &[
+                TextureLayer::solid(1, 1, [128, 128, 255, 255]),
+                TextureLayer::solid(1, 1, [255, 128, 255, 255]),
+            ],
+        );
+
+        // Bright enough that its lit pixels read as "bright" with room to
+        // spare, whatever the light and camera directions are.
+        let grey = [0.8, 0.8, 0.8, 1.0];
+        let one_face = |shading: FaceShading| {
+            NodeMaterials::new().with_faces(quad, vec![shading])
+        };
+        let plain = one_face(FaceShading::flat(grey));
+        renderer.render(&device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
+        let without = read_pixels(&device, &queue, &renderer);
+        assert!(
+            bright_neutral_pixels(&without, size) > 0,
+            "the quad is not in view"
+        );
+
+        // The neutral texel is the identity, byte for byte: it is the same
+        // "no tilt" the reserved layer gives a face with no map at all.
+        let neutral = one_face(FaceShading::flat(grey).with_normal_map(0));
+        renderer.render(&device, &queue, &mut scene, &selection, &neutral, &camera, 0.0, &[]);
+        assert_eq!(
+            read_pixels(&device, &queue, &renderer),
+            without,
+            "the neutral normal texel is the identity"
+        );
+
+        // A 45 degree lean changes the shading, which it can only do through a
+        // frame the fragment stage read back from the quad's own UVs.
+        let tilted = one_face(FaceShading::flat(grey).with_normal_map(1));
+        renderer.render(&device, &queue, &mut scene, &selection, &tilted, &camera, 0.0, &[]);
+        assert_ne!(
+            read_pixels(&device, &queue, &renderer),
+            without,
+            "the normal map never reached the shading"
+        );
+    }
+
+    #[test]
     fn set_textures_rebuilds_the_array_and_falls_back_to_white() {
         let Some((_adapter, device, queue)) = headless_device() else {
             eprintln!("skipping GPU texture test: no wgpu adapter available");
@@ -2222,7 +2477,7 @@ mod tests {
             &[TextureLayer::solid(4, 4, [255, 0, 0, 255]), TextureLayer::new(4, 4, vec![0, 255, 0, 255])],
         );
         assert_eq!(renderer.texture_size(), [4, 4]);
-        assert_eq!(renderer.texture_layers(), 3);
+        assert_eq!(renderer.texture_layers(), 5, "three identities + two textures");
 
         let white = [1.0, 1.0, 1.0, 1.0];
         let materials =
@@ -2236,12 +2491,26 @@ mod tests {
         );
         assert!(bright_neutral_pixels(&pixels, [TARGET, TARGET]) > 0);
 
-        // An empty set goes back to a single white layer, and the bind groups
-        // that hold the old array are rebuilt with it.
+        // An empty set goes back to just the identity layers, and the bind
+        // groups that hold the old array are rebuilt with it.
         renderer.set_textures(&device, &queue, &[]);
         assert_eq!(renderer.texture_size(), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
-        assert_eq!(renderer.texture_layers(), 1);
+        assert_eq!(renderer.texture_layers(), RESERVED_LAYERS as u32);
+        // The materials still name texture 1, which the library no longer has:
+        // the sample clamps to the last reserved layer, black, so the white the
+        // last frame showed is gone — which is what says the rebuilt array is
+        // the one being sampled.
         renderer.render(&device, &queue, &mut scene, &selection, &materials, &camera, 0.0, &[]);
+        let pixels = read_pixels(&device, &queue, &renderer);
+        assert_eq!(
+            bright_neutral_pixels(&pixels, [TARGET, TARGET]),
+            0,
+            "the white layer the map named is gone with the array"
+        );
+        // A face with no map at all still comes out white: the diffuse identity
+        // layer is one of the reserved ones.
+        let flat = NodeMaterials::new().with_faces(cube, vec![FaceShading::flat(white); 6]);
+        renderer.render(&device, &queue, &mut scene, &selection, &flat, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert!(bright_neutral_pixels(&pixels, [TARGET, TARGET]) > 0);
     }

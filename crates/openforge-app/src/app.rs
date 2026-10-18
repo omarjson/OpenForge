@@ -24,7 +24,7 @@ use openforge_core::tool::{
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
-use openforge_materials::{Material, MaterialLibrary, Texture};
+use openforge_materials::{MapKind, Material, MaterialLibrary, Texture};
 use openforge_plugin::{builtin_plugins, PluginHost};
 use openforge_project::{Project, ProjectRig};
 use openforge_render::{FaceShading, FrameStats, NodeMaterials, PickElement, TextureLayer};
@@ -1809,14 +1809,29 @@ impl OpenForgeApp {
                         .map(|s| s.contains(&(face as u32)))
                         .unwrap_or(false);
                     let slot = node.face_material_slot(face);
+                    let material = self.materials.resolve(slot);
                     let base = viewport::material_base(
-                        self.materials.resolve(slot),
+                        material,
                         selected,
                         face_selected,
                     );
+                    // Every map the material carries reaches the GPU as a
+                    // layer; the shader reads the identity layer where there
+                    // is none. The highlight and the glow ride the vertex in
+                    // the material's own linear terms.
                     FaceShading {
                         color: openforge_render::gpu::linear_from_srgb_u8([base[0], base[1], base[2]]),
                         layer: viewport::face_texture(&self.materials, slot),
+                        normal_layer: viewport::face_map(&self.materials, slot, MapKind::Normal),
+                        specular_layer: viewport::face_map(&self.materials, slot, MapKind::Specular),
+                        emissive_layer: viewport::face_map(&self.materials, slot, MapKind::Emissive),
+                        specular: [
+                            material.specular.x,
+                            material.specular.y,
+                            material.specular.z,
+                            material.shininess,
+                        ],
+                        emissive: material.emissive.to_array(),
                     }
                 })
                 .collect();
@@ -2987,16 +3002,38 @@ impl OpenForgeApp {
             }
             // The face's resolved material is the surface colour; selection
             // tints it towards the highlight colours.
-            let base = viewport::material_base(
-                self.materials.resolve(t.material),
-                t.selected,
-                t.face_selected,
-            );
-            // Phong shade using the shared materials crate (diffuse + specular).
+            let material = self.materials.resolve(t.material);
+            let base = viewport::material_base(material, t.selected, t.face_selected);
+            // The maps at the triangle's middle. Its one per-pixel feature is
+            // the diffuse texel the egui mesh interpolates, so the normal,
+            // specular and emissive maps are sampled once here — resolution,
+            // not behaviour: the GPU samples the same maps per fragment and
+            // both take their "no map" values from `MapTexels::IDENTITY`.
+            let uv_mid = (t.v[0].uv + t.v[1].uv + t.v[2].uv) / 3.0;
+            let maps = openforge_materials::MapTexels::sample(&self.materials, material, uv_mid);
+            // Phong shade using the shared materials crate: the material's own
+            // specular colour and exponent, scaled by any specular map, with
+            // its self-illumination and any emissive map added.
             let centroid = (t.v[0].pos + t.v[1].pos + t.v[2].pos) / 3.0;
             let view_dir = (cam - centroid).normalize_or_zero();
-            let [r, g, b, _] =
-                openforge_materials::shade_phong(t.v[0].normal, light, view_dir, 24.0, base);
+            // A normal map is relative to the triangle's own tangent frame,
+            // built from its positions and UVs; a triangle without one keeps
+            // the face's normal.
+            let frame = openforge_materials::tangent_frame(
+                (t.v[0].pos, t.v[0].uv),
+                (t.v[1].pos, t.v[1].uv),
+                (t.v[2].pos, t.v[2].uv),
+            );
+            let normal = openforge_materials::apply_normal_map(t.v[0].normal, frame, maps.normal);
+            let [r, g, b, _] = openforge_materials::shade_surface(
+                base,
+                material.specular * maps.specular,
+                material.emissive + maps.emissive,
+                material.shininess,
+                normal,
+                light,
+                view_dir,
+            );
             let color = egui::Color32::from_rgb(r, g, b);
             // A textured face paints its texels through an egui mesh, which
             // multiplies them by the vertex colour (the shaded material colour
@@ -4645,36 +4682,47 @@ impl OpenForgeApp {
                 self.dirty = true;
             }
         });
-        ui.horizontal(|ui| {
-            ui.label("Texture");
-            let mut map = material.diffuse_map;
-            let selected = match map.and_then(|i| texture_names.get(i)) {
-                Some(name) => name.clone(),
-                None => "None".to_owned(),
+        // One row per map: what the material wears, with a thumbnail of it.
+        // Every map the shaders read has a row here, so the four of them
+        // cannot drift apart in the UI.
+        for kind in MapKind::ALL {
+            let combo_id = match kind {
+                MapKind::Diffuse => "material-map-diffuse",
+                MapKind::Normal => "material-map-normal",
+                MapKind::Specular => "material-map-specular",
+                MapKind::Emissive => "material-map-emissive",
             };
-            egui::ComboBox::from_id_salt("material-texture")
-                .selected_text(selected)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut map, None, "None");
-                    for (i, name) in texture_names.iter().enumerate() {
-                        ui.selectable_value(&mut map, Some(i), name);
-                    }
-                });
-            if map != material.diffuse_map {
-                material.diffuse_map = map;
+            let mut map = material.map(kind);
+            ui.horizontal(|ui| {
+                ui.label(kind.label());
+                let selected = match map.and_then(|i| texture_names.get(i)) {
+                    Some(name) => name.clone(),
+                    None => "None".to_owned(),
+                };
+                egui::ComboBox::from_id_salt(combo_id)
+                    .selected_text(selected)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut map, None, "None");
+                        for (i, name) in texture_names.iter().enumerate() {
+                            ui.selectable_value(&mut map, Some(i), name);
+                        }
+                    });
+                // A thumbnail of what the map looks like, when there is one.
+                if let Some(tex) = map.and_then(|i| texture_ids.get(i).copied().flatten()) {
+                    ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                        tex,
+                        egui::vec2(20.0, 20.0),
+                    )));
+                }
+            });
+            if map != material.map(kind) {
+                material.set_map(kind, map);
                 self.dirty = true;
             }
-            // A thumbnail of what the map looks like, when there is one.
-            if let Some(id) = map.and_then(|i| texture_ids.get(i).copied().flatten()) {
-                ui.add(egui::Image::new(egui::load::SizedTexture::new(
-                    id,
-                    egui::vec2(20.0, 20.0),
-                )));
-            }
-            if texture_names.is_empty() {
-                ui.label("(no textures yet)");
-            }
-        });
+        }
+        if texture_names.is_empty() {
+            ui.label("(no textures yet — import one in the Textures list)");
+        }
         let mut rgba = egui::Color32::from_rgba_unmultiplied(
             (material.diffuse.x.clamp(0.0, 1.0) * 255.0).round() as u8,
             (material.diffuse.y.clamp(0.0, 1.0) * 255.0).round() as u8,
@@ -7993,6 +8041,29 @@ mod tests {
         });
     }
 
+    /// Every text label the frame painted, in paint order.
+    ///
+    /// A panel's rows are text, so reading the galleys back is how a test sees
+    /// what a panel offered without driving its widgets.
+    fn painted_labels(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(inner) => {
+                    for s in inner {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
     /// Every fill colour the frame painted.
     fn painted_fills(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Color32> {
         fn walk(shape: &egui::Shape, out: &mut Vec<egui::Color32>) {
@@ -8223,6 +8294,137 @@ mod tests {
         // With nothing selected it falls back to the material the panel edits.
         app.selection.clear();
         assert_eq!(app.uv_background_texture(), Some(index));
+    }
+
+    #[test]
+    fn the_material_panel_offers_a_row_for_every_map_kind() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        let index = app.add_checker_texture();
+        app.current_material = 1;
+        app.map_texture_to_current(index);
+
+        // The panel on its own, so the labels read back are its own.
+        let output = ctx.run(frame(0.0, egui::pos2(500.0, 350.0), None), |ctx| {
+            app.handle_side_panels(ctx);
+        });
+        let labels = painted_labels(&output.shapes);
+        for kind in MapKind::ALL {
+            assert!(
+                labels.iter().any(|label| label == kind.label()),
+                "no {kind:?} row was drawn: {labels:?}"
+            );
+        }
+        // The row the shortcut just filled is the diffuse one.
+        assert_eq!(app.materials.resolve(1).diffuse_map, Some(index));
+    }
+
+    #[test]
+    fn the_gpu_face_data_carries_every_map_of_its_material() {
+        let (mut app, id) = app_ready_to_move();
+        let index = app.add_checker_texture();
+        app.current_material = 1;
+        app.map_texture_to_current(index);
+        // The same texture stands in for each of the other kinds, so every
+        // layer slot is filled from the field its kind reads.
+        let material = &mut app.materials.materials[1];
+        material.normal_map = Some(index);
+        material.specular_map = Some(index);
+        material.emissive_map = Some(index);
+        material.specular = Vec3::new(0.25, 0.5, 0.75);
+        material.shininess = 64.0;
+        material.emissive = Vec3::new(0.1, 0.2, 0.3);
+        app.selection.select_node(id);
+        app.assign_material_to_selection(1);
+        app.selection.clear();
+
+        let faces = app.node_materials();
+        let shading = faces.faces(id).expect("the mesh's faces are uploaded")[0];
+        assert_eq!(shading.layer, Some(index), "the diffuse map is layer 0");
+        assert_eq!(shading.normal_layer, Some(index));
+        assert_eq!(shading.specular_layer, Some(index));
+        assert_eq!(shading.emissive_layer, Some(index));
+        assert_eq!(shading.specular, [0.25, 0.5, 0.75, 64.0]);
+        assert_eq!(shading.emissive, [0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn the_cpu_preview_paints_a_diffuse_map_and_adds_an_emissive_one() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        app.selection.select_node(id);
+        app.assign_material_to_selection(1);
+        app.selection.clear();
+        let pos = egui::pos2(500.0, 350.0);
+
+        // The material's own shading, with no map at all.
+        let plain = painted_fills(&paint_once(&ctx, &mut app, frame(0.0, pos, None)));
+        assert!(!plain.is_empty(), "the sphere painted faces");
+
+        // A checkerboard emissive map adds its texel to every painted face, so
+        // the picture warms towards the checker's own colours.
+        let index = app.add_checker_texture();
+        app.materials.materials[1].emissive_map = Some(index);
+        let glowing = painted_fills(&paint_once(&ctx, &mut app, frame(1.0, pos, None)));
+        let warmth = |fills: &[egui::Color32]| {
+            fills
+                .iter()
+                .map(|c| c.r() as i32 - c.b() as i32)
+                .max()
+                .unwrap_or(0)
+        };
+        assert!(
+            warmth(&glowing) > warmth(&plain),
+            "the emissive map should have warmed the faces ({} -> {})",
+            warmth(&plain),
+            warmth(&glowing)
+        );
+
+        // Taking the emissive map off and putting it on the diffuse slot
+        // instead turns the faces into texture-painted meshes, which egui
+        // draws as mesh shapes rather than flat fills.
+        let material = &mut app.materials.materials[1];
+        material.emissive_map = None;
+        material.diffuse_map = Some(index);
+        let mapped = paint_once(&ctx, &mut app, frame(2.0, pos, None));
+        assert!(
+            painted_fills(&mapped).len() < plain.len(),
+            "a textured face is painted from the texture, not as a flat fill"
+        );
+        let texel = app
+            .cpu_texture(&ctx, index)
+            .expect("the checker has a handle");
+        assert!(
+            painted_textured_meshes(&mapped, texel) > 0,
+            "the face should be painted from the checker"
+        );
+    }
+
+    /// How many mesh shapes a frame painted from one texture handle.
+    fn painted_textured_meshes(
+        shapes: &[egui::epaint::ClippedShape],
+        texture: egui::TextureId,
+    ) -> usize {
+        fn walk(
+            shape: &egui::Shape,
+            texture: egui::TextureId,
+            out: &mut usize,
+        ) {
+            match shape {
+                egui::Shape::Mesh(m) if m.texture_id == texture => *out += 1,
+                egui::Shape::Vec(inner) => {
+                    for s in inner {
+                        walk(s, texture, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = 0;
+        for clipped in shapes {
+            walk(&clipped.shape, texture, &mut out);
+        }
+        out
     }
 
     /// Two quads sharing the position edge `{1, 2}` whose shared-edge UVs

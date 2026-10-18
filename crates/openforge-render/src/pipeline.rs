@@ -69,36 +69,52 @@ struct VsIn {
     @location(2) uv: vec2<f32>,
     @location(3) color: vec4<f32>,
     @location(4) layer: f32,
+    @location(5) normal_layer: f32,
+    @location(6) specular_layer: f32,
+    @location(7) emissive_layer: f32,
+    @location(8) specular: vec4<f32>,
+    @location(9) emissive: vec3<f32>,
 };
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
-    @location(0) world_normal: vec3<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) uv: vec2<f32>,
-    @location(3) layer: f32,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) uv: vec2<f32>,
+    @location(4) layers: vec4<f32>,
+    @location(5) specular: vec4<f32>,
+    @location(6) emissive: vec3<f32>,
 };
 
 @vertex
 fn vs_main(in: VsIn) -> VsOut {
     var out: VsOut;
     out.clip_pos = frame.view_proj * vec4<f32>(in.position, 1.0);
+    out.world_pos = in.position;
     out.world_normal = in.normal;
     out.color = in.color;
     out.uv = in.uv;
-    out.layer = in.layer;
+    out.layers = vec4<f32>(in.layer, in.normal_layer, in.specular_layer, in.emissive_layer);
+    out.specular = in.specular;
+    out.emissive = in.emissive;
     return out;
 }
 "#
 }
 
-/// Fragment stage: N·L Lambert diffuse plus a small ambient term, modulated
-/// by the interpolated vertex color and the face's texel. `frame.light_dir`
-/// points from the scene toward the light.
+/// Fragment stage: N·L Lambert diffuse plus a small ambient term, the
+/// material's own Phong highlight and self-illumination, all modulated by the
+/// interpolated vertex color and the face's four map texels.
+/// `frame.light_dir` points from the scene toward the light.
 ///
-/// Array layer 0 is a white texel (the [`WHITE_LAYER`] the backend reserves),
-/// so untextured faces sample it and come out as the vertex color alone —
-/// no branch, and no derivative non-uniformity for the array index.
+/// Each map has a reserved identity layer — white for the diffuse and specular
+/// maps (one multiplies a colour, the other scales the highlight), the neutral
+/// normal `(0.5, 0.5, 1.0)` for the normal map and black for the emissive map
+/// (which is *added*, so nothing to add is black) — so a face without a map
+/// samples its identity and no branch is needed to decide that. The normal
+/// map's frame comes from the position and UV derivatives of the fragment
+/// itself, so the mesh needs no tangent attribute.
 ///
 /// [`WHITE_LAYER`]: crate::gpu_types::WHITE_LAYER
 pub fn fragment_shader_wgsl() -> &'static str {
@@ -117,23 +133,82 @@ struct FrameUniforms {
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
-    @location(0) world_normal: vec3<f32>,
-    @location(1) color: vec4<f32>,
-    @location(2) uv: vec2<f32>,
-    @location(3) layer: f32,
+    @location(0) world_pos: vec3<f32>,
+    @location(1) world_normal: vec3<f32>,
+    @location(2) color: vec4<f32>,
+    @location(3) uv: vec2<f32>,
+    @location(4) layers: vec4<f32>,
+    @location(5) specular: vec4<f32>,
+    @location(6) emissive: vec3<f32>,
 };
+
+/// Undo the sampling of an sRGB map array.
+///
+/// The array is an sRGB format so that *colour* maps (diffuse, emissive) arrive
+/// as linear light. A normal or specular map is data, not colour: byte 128
+/// means 0.5, not the 0.22 linear the decode gives it. This puts the texel back
+/// where the artist stored it, so the two paths read a map the same way.
+fn raw_texel(c: vec3<f32>) -> vec3<f32> {
+    let low = c * 12.92;
+    let high = 1.055 * pow(c, vec3<f32>(1.0 / 2.4)) - 0.055;
+    return select(low, high, c > vec3<f32>(0.0031308));
+}
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let n = normalize(in.world_normal);
-    let l = normalize(frame.light_dir);
-    let diffuse = max(dot(n, l), 0.0);
-    let ambient = 0.18;
-    let lit = ambient + (1.0 - ambient) * diffuse;
     // `textureSampleLevel` rather than `textureSample`: the layer varies per
     // face, and an explicit level keeps the fetch legal in any control flow.
-    let texel = textureSampleLevel(face_texture, face_sampler, in.uv, i32(in.layer + 0.5), 0.0);
-    return vec4<f32>(in.color.rgb * texel.rgb * lit, in.color.a * texel.a);
+    let base_texel = textureSampleLevel(face_texture, face_sampler, in.uv, i32(in.layers.x + 0.5), 0.0);
+    let normal_texel = textureSampleLevel(face_texture, face_sampler, in.uv, i32(in.layers.y + 0.5), 0.0);
+    let spec_texel = textureSampleLevel(face_texture, face_sampler, in.uv, i32(in.layers.z + 0.5), 0.0);
+    let emissive_texel = textureSampleLevel(face_texture, face_sampler, in.uv, i32(in.layers.w + 0.5), 0.0);
+
+    // The normal map stores a tangent-space direction. The surface's frame is
+    // read back from the fragment's own position and UV derivatives, so the
+    // mesh needs no tangent attribute; a triangle with no UV area keeps its
+    // geometric normal.
+    let n = normalize(in.world_normal);
+    var normal = n;
+    let dp1 = dpdx(in.world_pos);
+    let dp2 = dpdy(in.world_pos);
+    let duv1 = dpdx(in.uv);
+    let duv2 = dpdy(in.uv);
+    let det = duv1.x * duv2.y - duv2.x * duv1.y;
+    if (abs(det) > 1e-8) {
+        let scaled = 1.0 / det;
+        let raw = (dp1 * duv2.y - dp2 * duv1.y) * scaled;
+        let leaning = raw - n * dot(n, raw);
+        // A triangle whose UVs give no frame, or a tangent parallel to the
+        // normal, has nothing to hang the map on; the same three guards the
+        // CPU path applies, so a degenerate map cannot produce a NaN normal.
+        if (length(leaning) > 1e-6) {
+            let tangent = normalize(leaning);
+            let bitangent = cross(n, tangent);
+            let map_n = raw_texel(normal_texel.rgb) * 2.0 - vec3<f32>(1.0);
+            let perturbed = tangent * map_n.x + bitangent * map_n.y + n * map_n.z;
+            if (length(perturbed) > 1e-6) {
+                normal = normalize(perturbed);
+            }
+        }
+    }
+
+    let l = normalize(frame.light_dir);
+    let v = normalize(frame.camera_pos - in.world_pos);
+    let half = normalize(l + v);
+    let diffuse = max(dot(normal, l), 0.0);
+    let ambient = 0.18;
+    let lit = ambient + (1.0 - ambient) * diffuse;
+
+    // The specular map scales the material's own highlight — the mean of its
+    // texel's channels, as the CPU path reads it — and the exponent rides in
+    // `.w`, where a non-positive one means the face has no highlight.
+    let spec_strength = dot(raw_texel(spec_texel.rgb), vec3<f32>(1.0 / 3.0));
+    var specular = vec3<f32>(0.0);
+    if (in.specular.w > 0.0) {
+        specular = in.specular.rgb * spec_strength * pow(max(dot(normal, half), 0.0), in.specular.w);
+    }
+    let emissive = in.emissive + emissive_texel.rgb;
+    return vec4<f32>(in.color.rgb * base_texel.rgb * lit + specular + emissive, in.color.a * base_texel.a);
 }
 "#
 }
@@ -227,10 +302,18 @@ mod tests {
         assert!(src.contains("@group(0) @binding(0)"));
         assert!(src.contains("@location(0) position"));
         assert!(src.contains("@location(3) color"));
-        // The texture layer rides through the vertex stage untouched.
+        // Every map layer and the two surface terms ride through untouched.
         assert!(src.contains("@location(4) layer: f32"));
-        assert!(src.contains("@location(3) layer: f32"));
-        assert!(src.contains("out.layer = in.layer;"));
+        assert!(src.contains("@location(5) normal_layer: f32"));
+        assert!(src.contains("@location(6) specular_layer: f32"));
+        assert!(src.contains("@location(7) emissive_layer: f32"));
+        assert!(src.contains("@location(8) specular: vec4<f32>"));
+        assert!(src.contains("@location(9) emissive: vec3<f32>"));
+        assert!(src.contains("@location(4) layers: vec4<f32>"));
+        assert!(src.contains("out.layers = vec4<f32>(in.layer, in.normal_layer, in.specular_layer, in.emissive_layer);"));
+        assert!(src.contains("out.specular = in.specular;"));
+        assert!(src.contains("out.emissive = in.emissive;"));
+        assert!(src.contains("out.world_pos = in.position;"));
         assert!(src.contains("out.uv = in.uv;"));
     }
 
@@ -242,12 +325,30 @@ mod tests {
         assert!(src.contains("@location(0) vec4<f32>"));
         assert!(src.contains("dot(")); // N·L diffuse
         assert!(src.contains("ambient"));
-        // The face's texel modulates the vertex color.
+        // All four maps come from the one array the bind group carries.
         assert!(src.contains("@group(0) @binding(1) var face_texture: texture_2d_array<f32>;"));
         assert!(src.contains("@group(0) @binding(2) var face_sampler: sampler;"));
         assert!(src.contains("textureSampleLevel("));
         assert!(!src.contains("textureSample("), "a level keeps the fetch legal in any control flow");
-        assert!(src.contains("in.color.rgb * texel.rgb * lit"));
+        // A normal map is put into the surface's own derivative-built frame.
+        assert!(src.contains("dpdx(") && src.contains("dpdy("));
+        assert!(src.contains("cross(n, tangent)"));
+        // The specular map scales the material's own highlight, and the
+        // exponent is the one the material carries.
+        assert!(src.contains("spec_strength"));
+        assert!(src.contains("in.specular.w"));
+        assert!(src.contains("pow("));
+        // Self-illumination is added, not multiplied.
+        assert!(src.contains("in.emissive + emissive_texel.rgb"));
+        assert!(src.contains(
+            "in.color.rgb * base_texel.rgb * lit + specular + emissive"
+        ));
+        // A normal or specular map is data, not colour: the sRGB decode the
+        // array applies to every texel is undone for those two, so byte 128
+        // means 0.5 the way the CPU path reads it.
+        assert!(src.contains("fn raw_texel("));
+        assert!(src.contains("raw_texel(normal_texel.rgb) * 2.0"));
+        assert!(src.contains("dot(raw_texel(spec_texel.rgb)"));
     }
 
     #[test]
@@ -265,14 +366,17 @@ mod tests {
     #[test]
     fn both_stages_agree_on_the_varying_locations() {
         // The fragment stage reads what the vertex stage wrote; a location
-        // mismatch would silently drop the texture.
+        // mismatch would silently drop a map or a surface term.
         let vs = vertex_shader_wgsl();
         let fs = fragment_shader_wgsl();
         for location in [
-            "@location(0) world_normal: vec3<f32>",
-            "@location(1) color: vec4<f32>",
-            "@location(2) uv: vec2<f32>",
-            "@location(3) layer: f32",
+            "@location(0) world_pos: vec3<f32>",
+            "@location(1) world_normal: vec3<f32>",
+            "@location(2) color: vec4<f32>",
+            "@location(3) uv: vec2<f32>",
+            "@location(4) layers: vec4<f32>",
+            "@location(5) specular: vec4<f32>",
+            "@location(6) emissive: vec3<f32>",
         ] {
             assert!(vs.contains(location), "vertex stage lost {location}");
             assert!(fs.contains(location), "fragment stage lost {location}");

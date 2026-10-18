@@ -8,23 +8,29 @@
 //! The main pieces are:
 //!
 //! - [`Material`] — colors, optional texture maps and flags for a surface.
+//! - [`MapKind`] — the four maps a material can carry, so code loops over them
+//!   instead of branching on each field.
 //! - [`Texture`] — an RGBA8 image with `solid`/`checkerboard` constructors
 //!   and wrap-addressed nearest sampling.
 //! - [`MaterialLibrary`] — owns the project's materials and textures, and
 //!   resolves mesh material slots safely.
-//! - [`shade_lambert`] / [`shade_phong`] — small CPU shading helpers for the
-//!   viewport preview.
+//! - [`shade_lambert`] / [`shade_phong`] / [`shade_surface`] — small CPU
+//!   shading helpers for the viewport preview.
+//! - [`maps::MapTexels`] — what the maps contribute at one sample point, the
+//!   same identity values the GPU path gets from its reserved white layer.
 
 pub mod error;
 pub mod library;
+pub mod maps;
 pub mod material;
 pub mod shading;
 pub mod texture;
 
 pub use error::MaterialError;
 pub use library::MaterialLibrary;
-pub use material::Material;
-pub use shading::{shade_lambert, shade_phong};
+pub use maps::{apply_normal_map, tangent_frame, MapTexels};
+pub use material::{MapKind, Material};
+pub use shading::{shade_lambert, shade_phong, shade_surface};
 pub use texture::{Texture, MISSING_TEXEL};
 
 /// Returns the crate name, used by a smoke test to confirm linkage.
