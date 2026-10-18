@@ -105,47 +105,128 @@ pub fn snap_to_step(value: f32, step: f32) -> f32 {
     (value / step).round() * step
 }
 
-/// Snap `measure` for a drag whose grabbed point is `grab` on `axis`.
+/// Snap `measure` for a drag whose grabbed point is `grab`.
+///
+/// `axes` are the world axes the dragged handle can move along — one for an
+/// axis arm, two for a plane square, none for the centre handle, whose plane
+/// faces the camera and so lines up with no world axis. Cutting the measure
+/// down to those axes is what keeps a snapped drag from nudging a component the
+/// handle was never allowed to touch.
 ///
 /// `vertex` is the world position of the vertex under the cursor, when the app
 /// found one within its radius; that is what [`SnapMode::Vertex`] lands on.
-/// Only the dragged axis moves, so only its component of a target is used.
 pub fn snap_measure(
     snap: Snap,
-    axis: Axis,
+    axes: &[Axis],
     grab: Vec3,
     measure: Measure,
     vertex: Option<Vec3>,
 ) -> Measure {
-    let dir = axis.dir();
     match (snap.mode, measure) {
         (SnapMode::Off, m) => m,
+        // With no world axis to snap to (the centre handle) the point comes
+        // back exactly as it went in, so the drag stays free.
         (SnapMode::Grid, Measure::Translate(d)) => {
-            let along = grab.dot(dir);
-            Measure::Translate(snap_to_step(along + d, snap.grid) - along)
+            Measure::Translate(snap_point(grab + d, axes, snap.grid) - grab)
         }
-        (SnapMode::Vertex, Measure::Translate(d)) => match vertex {
-            Some(v) => Measure::Translate((v - grab).dot(dir)),
+        (SnapMode::Vertex, Measure::Translate(d)) if !axes.is_empty() => match vertex {
+            Some(v) => {
+                // The grabbed point lands on the vertex, but only along the
+                // axes this handle moves: the rest of the vertex is dropped.
+                let mut delta = v - grab;
+                for axis in Axis::ALL {
+                    if !axes.contains(&axis) {
+                        let dir = axis.dir();
+                        delta -= dir * delta.dot(dir);
+                    }
+                }
+                Measure::Translate(delta)
+            }
             None => Measure::Translate(d),
         },
-        (SnapMode::Grid, Measure::Rotate(a)) => Measure::Rotate(snap_to_step(a, snap.angle)),
+        (SnapMode::Grid, Measure::Rotate(axis, a)) => {
+            Measure::Rotate(axis, snap_to_step(a, snap.angle))
+        }
         (SnapMode::Grid, Measure::Scale(f)) => {
-            // Never snap a scale away entirely: the step is the floor.
+            // Never snap a scale away entirely: the step is the floor. Only the
+            // axes the handle scales are snapped, so an axis it leaves alone
+            // stays at exactly 1 rather than drifting to the step's multiple.
             let step = snap.factor.max(1e-3);
-            Measure::Scale(snap_to_step(f, step).max(step))
+            let mut out = f;
+            for &axis in axes {
+                let dir = axis.dir();
+                let v = f.dot(dir);
+                out += dir * (snap_to_step(v, step).max(step) - v);
+            }
+            Measure::Scale(out)
         }
         // Vertex snapping has nothing to say about rotating or scaling.
         (SnapMode::Vertex, m) => m,
     }
 }
 
-/// A measure as the status bar reads it out: a signed distance, a multiplier,
-/// or degrees.
+/// `p` with the components on `axes` snapped to the nearest multiple of
+/// `step`, and every other component left exactly as it was.
+fn snap_point(p: Vec3, axes: &[Axis], step: f32) -> Vec3 {
+    let mut out = p;
+    for &axis in axes {
+        let dir = axis.dir();
+        let v = out.dot(dir);
+        out += dir * (snap_to_step(v, step) - v);
+    }
+    out
+}
+
+/// Whether a factor leaves its axis alone.
+fn is_unity(f: f32) -> bool {
+    (f - 1.0).abs() < 1e-4
+}
+
+/// A measure as the status bar reads it out: a distance, a multiplier, or
+/// degrees.
+///
+/// A handle that moves a single axis or scales a single axis prints just that
+/// number with its axis named; a plane handle prints the pair; the centre
+/// handle, which moves in no world axis, prints all three components.
 pub fn format_measure(measure: Measure) -> String {
     match measure {
-        Measure::Translate(d) => format!("Δ {d:.3}"),
-        Measure::Scale(f) => format!("× {f:.3}"),
-        Measure::Rotate(a) => format!("{:.1}°", a.to_degrees()),
+        Measure::Translate(d) => {
+            // Only the axes the drag is actually moving get named, so a plane
+            // drag does not read out the axis it is not allowed to touch.
+            let moved: Vec<String> = [(Axis::X, d.x), (Axis::Y, d.y), (Axis::Z, d.z)]
+                .into_iter()
+                .filter(|(_, v)| *v != 0.0)
+                .map(|(axis, v)| format!("{} {:.3}", axis.label(), v))
+                .collect();
+            match moved.len() {
+                0 => "Δ 0.000".to_string(),
+                1 | 2 => format!("Δ {}", moved.join(" ")),
+                // Three axes at once is what the centre handle does: in the
+                // screen plane every world axis can move, so the vector itself
+                // is the clearest thing to show.
+                _ => format!("Δ ({:.3}, {:.3}, {:.3})", d.x, d.y, d.z),
+            }
+        }
+        Measure::Scale(f) => {
+            if (f.x - f.y).abs() < 1e-4 && (f.y - f.z).abs() < 1e-4 {
+                format!("× {:.3}", f.x)
+            } else if is_unity(f.y) && is_unity(f.z) {
+                format!("× X {:.3}", f.x)
+            } else if is_unity(f.x) && is_unity(f.z) {
+                format!("× Y {:.3}", f.y)
+            } else if is_unity(f.x) && is_unity(f.y) {
+                format!("× Z {:.3}", f.z)
+            } else if is_unity(f.x) {
+                format!("× YZ {:.3}", f.y)
+            } else if is_unity(f.y) {
+                format!("× ZX {:.3}", f.z)
+            } else if is_unity(f.z) {
+                format!("× XY {:.3}", f.x)
+            } else {
+                format!("× ({:.3}, {:.3}, {:.3})", f.x, f.y, f.z)
+            }
+        }
+        Measure::Rotate(_, a) => format!("{:.1}°", a.to_degrees()),
     }
 }
 
@@ -171,8 +252,8 @@ mod tests {
     fn off_snapping_changes_nothing() {
         let snap = Snap { mode: SnapMode::Off, ..Snap::default() };
         let grab = Vec3::new(0.37, 0.0, 0.0);
-        let m = Measure::Translate(0.9);
-        assert_eq!(snap_measure(snap, Axis::X, grab, m, None), m);
+        let m = Measure::Translate(Vec3::new(0.9, 0.0, 0.0));
+        assert_eq!(snap_measure(snap, &[Axis::X], grab, m, None), m);
         assert!(!snap.is_on());
     }
 
@@ -180,27 +261,63 @@ mod tests {
     fn grid_move_lands_on_a_grid_value_wherever_it_started() {
         let snap = Snap { mode: SnapMode::Grid, grid: 0.25, ..Snap::default() };
         let grab = Vec3::new(0.37, 2.0, 0.0);
-        let Measure::Translate(d) = snap_measure(snap, Axis::X, grab, Measure::Translate(0.9), None)
+        let delta = |d: f32| Measure::Translate(Vec3::X * d);
+        let Measure::Translate(d) =
+            snap_measure(snap, &[Axis::X], grab, delta(0.9), None)
         else {
             panic!("still a translation")
         };
-        let landed = grab.x + d;
+        let landed = grab.x + d.x;
         assert!((landed - 1.25).abs() < 1e-6, "landed on {landed}");
+        assert_eq!(d.y, 0.0, "the other axes are not touched");
 
         // Idempotent: feeding the snapped delta back changes nothing.
-        let Measure::Translate(again) = snap_measure(snap, Axis::X, grab, Measure::Translate(d), None)
+        let Measure::Translate(again) =
+            snap_measure(snap, &[Axis::X], grab, Measure::Translate(d), None)
         else {
             panic!("still a translation")
         };
-        assert!((again - d).abs() < 1e-6, "{again} vs {d}");
+        assert!((again - d).length() < 1e-6, "{again} vs {d}");
 
         // The dragged axis is the one that snaps: a Y drag lands on a Y grid
         // value too.
-        let Measure::Translate(dy) = snap_measure(snap, Axis::Y, grab, Measure::Translate(0.3), None)
+        let Measure::Translate(dy) =
+            snap_measure(snap, &[Axis::Y], grab, Measure::Translate(Vec3::Y * 0.3), None)
         else {
             panic!("still a translation")
         };
-        assert!((grab.y + dy - 2.25).abs() < 1e-6, "y landed on {}", grab.y + dy);
+        assert!((grab.y + dy.y - 2.25).abs() < 1e-6, "y landed on {}", grab.y + dy.y);
+    }
+
+    #[test]
+    fn a_plane_move_snaps_both_of_its_axes_and_leaves_the_third_alone() {
+        let snap = Snap { mode: SnapMode::Grid, grid: 0.25, ..Snap::default() };
+        let grab = Vec3::new(0.37, 0.6, 5.0);
+        // An XY plane drag: the delta has no Z component at all.
+        let measure = Measure::Translate(Vec3::new(0.9, 0.7, 0.0));
+        let Measure::Translate(d) = snap_measure(snap, &[Axis::X, Axis::Y], grab, measure, None)
+        else {
+            panic!("still a translation")
+        };
+        assert!((grab.x + d.x - 1.25).abs() < 1e-6, "x landed on {}", grab.x + d.x);
+        assert!((grab.y + d.y - 1.25).abs() < 1e-6, "y landed on {}", grab.y + d.y);
+        assert_eq!(d.z, 0.0, "the plane's normal axis is left alone");
+    }
+
+    #[test]
+    fn a_centre_move_has_no_world_axis_to_snap_to() {
+        // The centre handle works in the plane facing the camera, which lines
+        // up with no world axis, so nothing is snapped in any mode.
+        let grab = Vec3::new(0.37, 0.6, -0.1);
+        let measure = Measure::Translate(Vec3::new(0.13, -0.27, 0.41));
+        for mode in [SnapMode::Grid, SnapMode::Vertex] {
+            let snap = Snap { mode, ..Snap::default() };
+            assert_eq!(
+                snap_measure(snap, &[], grab, measure, Some(Vec3::new(9.0, 9.0, 9.0))),
+                measure,
+                "{mode:?} leaves a centre drag free"
+            );
+        }
     }
 
     #[test]
@@ -209,45 +326,54 @@ mod tests {
         let grab = Vec3::new(-1.0, 0.5, 0.0);
         let vertex = Vec3::new(2.3, 9.0, 4.0);
         let Measure::Translate(d) =
-            snap_measure(snap, Axis::X, grab, Measure::Translate(0.2), Some(vertex))
+            snap_measure(snap, &[Axis::X], grab, Measure::Translate(Vec3::X * 0.2), Some(vertex))
         else {
             panic!("still a translation")
         };
-        assert!((grab.x + d - 2.3).abs() < 1e-6, "landed on {}", grab.x + d);
+        assert!((grab.x + d.x - 2.3).abs() < 1e-6, "landed on {}", grab.x + d.x);
+        assert_eq!(d.y, 0.0, "only the dragged axis follows the vertex");
+        assert_eq!(d.z, 0.0);
 
         // No vertex under the cursor: the drag stays free.
-        let free = snap_measure(snap, Axis::X, grab, Measure::Translate(0.2), None);
-        assert_eq!(free, Measure::Translate(0.2));
+        let free = snap_measure(snap, &[Axis::X], grab, Measure::Translate(Vec3::new(0.2, 0.3, 0.0)), None);
+        assert_eq!(free, Measure::Translate(Vec3::new(0.2, 0.3, 0.0)));
     }
 
     #[test]
     fn vertex_snapping_leaves_rotate_and_scale_alone() {
         let snap = Snap { mode: SnapMode::Vertex, ..Snap::default() };
         assert_eq!(
-            snap_measure(snap, Axis::Y, Vec3::ZERO, Measure::Rotate(0.4), Some(Vec3::X)),
-            Measure::Rotate(0.4)
+            snap_measure(snap, &[Axis::Y], Vec3::ZERO, Measure::Rotate(Axis::Y, 0.4), Some(Vec3::X)),
+            Measure::Rotate(Axis::Y, 0.4)
         );
         assert_eq!(
-            snap_measure(snap, Axis::Y, Vec3::ZERO, Measure::Scale(1.23), Some(Vec3::X)),
-            Measure::Scale(1.23)
+            snap_measure(
+                snap,
+                &[Axis::Y],
+                Vec3::ZERO,
+                Measure::Scale(Vec3::new(1.0, 1.23, 1.0)),
+                Some(Vec3::X)
+            ),
+            Measure::Scale(Vec3::new(1.0, 1.23, 1.0))
         );
     }
 
     #[test]
     fn grid_snaps_rotation_to_the_angle_step() {
         let snap = Snap { mode: SnapMode::Grid, angle: (15.0f32).to_radians(), ..Snap::default() };
-        let Measure::Rotate(a) =
-            snap_measure(snap, Axis::Z, Vec3::ZERO, Measure::Rotate(0.4), None)
+        let Measure::Rotate(axis, a) =
+            snap_measure(snap, &[Axis::Z], Vec3::ZERO, Measure::Rotate(Axis::Z, 0.4), None)
         else {
             panic!("still a rotation")
         };
+        assert_eq!(axis, Axis::Z, "the rotation keeps its axis");
         let step = 15.0f32.to_radians();
         assert!((a - 2.0 * step).abs() < 1e-5, "{a} is not two steps");
 
         // Exactly PI/2 snaps to itself with a 45 degree step.
         let snap = Snap { mode: SnapMode::Grid, angle: PI / 4.0, ..Snap::default() };
-        let Measure::Rotate(a) =
-            snap_measure(snap, Axis::Z, Vec3::ZERO, Measure::Rotate(PI / 2.0 + 0.01), None)
+        let Measure::Rotate(_, a) =
+            snap_measure(snap, &[Axis::Z], Vec3::ZERO, Measure::Rotate(Axis::Z, PI / 2.0 + 0.01), None)
         else {
             panic!("still a rotation")
         };
@@ -257,18 +383,32 @@ mod tests {
     #[test]
     fn grid_snaps_scale_to_the_factor_step_without_collapsing() {
         let snap = Snap { mode: SnapMode::Grid, factor: 0.1, ..Snap::default() };
-        let Measure::Scale(f) = snap_measure(snap, Axis::X, Vec3::ZERO, Measure::Scale(1.23), None)
-        else {
+        let x_only = |f: f32| Measure::Scale(Vec3::new(f, 1.0, 1.0));
+        let Measure::Scale(f) = snap_measure(snap, &[Axis::X], Vec3::ZERO, x_only(1.23), None) else {
             panic!("still a scale")
         };
-        assert!((f - 1.2).abs() < 1e-6, "{f}");
+        assert!((f.x - 1.2).abs() < 1e-6, "{}", f.x);
+        assert_eq!(f.y, 1.0, "an axis the handle does not scale stays at 1");
 
         // A tiny or negative factor lands on the step rather than on zero.
-        let Measure::Scale(f) = snap_measure(snap, Axis::X, Vec3::ZERO, Measure::Scale(0.001), None)
+        let Measure::Scale(f) = snap_measure(snap, &[Axis::X], Vec3::ZERO, x_only(0.001), None)
         else {
             panic!("still a scale")
         };
-        assert!((f - 0.1).abs() < 1e-6, "{f}");
+        assert!((f.x - 0.1).abs() < 1e-6, "{}", f.x);
+
+        // A plane handle scales its two axes by the same factor.
+        let Measure::Scale(f) = snap_measure(
+            snap,
+            &[Axis::X, Axis::Y],
+            Vec3::ZERO,
+            Measure::Scale(Vec3::new(1.23, 1.23, 1.0)),
+            None,
+        ) else {
+            panic!("still a scale")
+        };
+        assert!((f.x - 1.2).abs() < 1e-6 && (f.y - 1.2).abs() < 1e-6, "{f}");
+        assert!((f.z - 1.0).abs() < 1e-6, "the third axis is left at 1");
     }
 
     #[test]
@@ -288,9 +428,36 @@ mod tests {
 
     #[test]
     fn measures_read_out_the_way_the_status_bar_shows_them() {
-        assert_eq!(format_measure(Measure::Translate(1.25)), "Δ 1.250");
-        assert_eq!(format_measure(Measure::Scale(2.0)), "× 2.000");
-        assert_eq!(format_measure(Measure::Rotate(90.0f32.to_radians())), "90.0°");
+        assert_eq!(
+            format_measure(Measure::Translate(Vec3::new(1.25, 0.0, 0.0))),
+            "Δ X 1.250"
+        );
+        // A plane move names both of its axes, leaves the normal axis out, and
+        // a move of nothing at all still reads as a number.
+        assert_eq!(
+            format_measure(Measure::Translate(Vec3::new(1.25, -0.5, 0.0))),
+            "Δ X 1.250 Y -0.500"
+        );
+        assert_eq!(format_measure(Measure::Translate(Vec3::ZERO)), "Δ 0.000");
+        // The centre handle's view-plane move has a share of all three.
+        assert_eq!(
+            format_measure(Measure::Translate(Vec3::new(0.5, -0.25, 0.125))),
+            "Δ (0.500, -0.250, 0.125)"
+        );
+        assert_eq!(format_measure(Measure::Scale(Vec3::splat(2.0))), "× 2.000");
+        assert_eq!(
+            format_measure(Measure::Scale(Vec3::new(2.0, 1.0, 1.0))),
+            "× X 2.000"
+        );
+        assert_eq!(
+            format_measure(Measure::Scale(Vec3::new(1.0, 1.0, 3.0))),
+            "× Z 3.000"
+        );
+        assert_eq!(
+            format_measure(Measure::Scale(Vec3::new(2.0, 2.0, 1.0))),
+            "× XY 2.000"
+        );
+        assert_eq!(format_measure(Measure::Rotate(Axis::Z, 90.0f32.to_radians())), "90.0°");
     }
 
     #[test]

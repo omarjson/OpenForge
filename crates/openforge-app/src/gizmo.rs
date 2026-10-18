@@ -24,6 +24,14 @@ pub const HANDLE_PIXELS: f32 = 90.0;
 pub const HIT_TOLERANCE: f32 = 8.0;
 /// Number of segments used to draw and hit-test a rotation ring.
 pub const RING_SEGMENTS: usize = 48;
+/// Where a plane handle's square sits along its two axes, as a fraction of the
+/// arm length (its centre, measured from the gizmo origin on both axes).
+pub const PLANE_CENTRE: f32 = 0.38;
+/// Half the side of a plane handle's square, as a fraction of the arm length.
+pub const PLANE_HALF: f32 = 0.13;
+/// Half the side of the centre handle's square, in pixels (it faces the camera,
+/// so a constant screen size is what keeps it usable at any distance).
+pub const CENTRE_PIXELS: f32 = 5.0;
 
 /// One of the three world axes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -63,6 +71,98 @@ impl Axis {
             (Axis::Z, true) => (130, 184, 255),
         };
         egui::Color32::from_rgb(r, g, b)
+    }
+}
+
+/// One of the three coordinate planes, spanned by two axes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Plane {
+    XY,
+    YZ,
+    ZX,
+}
+
+impl Plane {
+    pub const ALL: [Plane; 3] = [Plane::XY, Plane::YZ, Plane::ZX];
+
+    /// The two axes the plane spans, in the order its handle's square is built.
+    pub fn axes(self) -> (Axis, Axis) {
+        match self {
+            Plane::XY => (Axis::X, Axis::Y),
+            Plane::YZ => (Axis::Y, Axis::Z),
+            Plane::ZX => (Axis::Z, Axis::X),
+        }
+    }
+
+    /// The axis the plane is perpendicular to, which is also the normal a drag
+    /// in the plane is resolved against.
+    pub fn normal(self) -> Axis {
+        match self {
+            Plane::XY => Axis::Z,
+            Plane::YZ => Axis::X,
+            Plane::ZX => Axis::Y,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Plane::XY => "XY",
+            Plane::YZ => "YZ",
+            Plane::ZX => "ZX",
+        }
+    }
+
+    /// Handle colour: the two axis colours of the plane it spans, mixed.
+    pub fn color(self, hot: bool) -> egui::Color32 {
+        let (a, b) = self.axes();
+        let (ca, cb) = (a.color(hot), b.color(hot));
+        egui::Color32::from_rgb(
+            ((ca.r() as u16 + cb.r() as u16) / 2) as u8,
+            ((ca.g() as u16 + cb.g() as u16) / 2) as u8,
+            ((ca.b() as u16 + cb.b() as u16) / 2) as u8,
+        )
+    }
+}
+
+/// Which of the gizmo's handles a gesture is on.
+///
+/// The three kinds resolve differently: an axis handle slides along (or spins
+/// about) one world axis, a plane handle moves or scales in two, and the centre
+/// handle works in the plane facing the camera — the screen plane, which has no
+/// world axis to snap to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Handle {
+    /// An axis arm, for a move/scale along it or a spin about it.
+    Axis(Axis),
+    /// A square in one coordinate plane: a move or scale in its two axes.
+    Plane(Plane),
+    /// The square at the middle, which works in the plane facing the camera —
+    /// the screen plane, which no world axis spans.
+    Centre,
+}
+
+impl Handle {
+    /// The world axes this handle can move along. The centre handle has none:
+    /// its plane faces the camera, so no world axis is privileged.
+    pub fn axes(self) -> Vec<Axis> {
+        match self {
+            Handle::Axis(a) => vec![a],
+            Handle::Plane(p) => {
+                let (u, v) = p.axes();
+                vec![u, v]
+            }
+            Handle::Centre => Vec::new(),
+        }
+    }
+
+    /// What the handle is called where a user reads it: the axis it follows,
+    /// the pair of axes its plane spans, or `screen` for the centre.
+    pub fn label(self) -> &'static str {
+        match self {
+            Handle::Axis(a) => a.label(),
+            Handle::Plane(p) => p.label(),
+            Handle::Centre => "screen",
+        }
     }
 }
 
@@ -121,6 +221,23 @@ impl Frame {
             })
             .collect()
     }
+
+    /// The square of the handle for `plane`, in the plane's own two axes,
+    /// offset from the origin along both of them.
+    ///
+    /// Corners run counter-clockwise as seen from the plane's normal side.
+    pub fn plane_quad(&self, plane: Plane) -> [Vec3; 4] {
+        let (u, v) = plane.axes();
+        let (du, dv) = (u.dir(), v.dir());
+        let centre = self.origin + (du + dv) * (self.arm * PLANE_CENTRE);
+        let half = self.arm * PLANE_HALF;
+        [
+            centre - du * half - dv * half,
+            centre + du * half - dv * half,
+            centre + du * half + dv * half,
+            centre - du * half + dv * half,
+        ]
+    }
 }
 
 /// Distance from `p` to the segment `a`–`b`.
@@ -142,6 +259,9 @@ pub struct Layout {
     pub arms: Vec<(Axis, egui::Pos2)>,
     /// One closed screen-space loop per axis, for the rings of Rotate.
     pub rings: Vec<(Axis, Vec<egui::Pos2>)>,
+    /// One screen-space quad per coordinate plane, for the plane handles of
+    /// Move/Scale.
+    pub planes: Vec<(Plane, [egui::Pos2; 4])>,
 }
 
 impl Layout {
@@ -169,7 +289,17 @@ impl Layout {
                 (a, pts)
             })
             .collect();
-        Some(Self { origin, arms, rings })
+        // A plane handle is dropped when any of its corners is off the camera,
+        // so a partly-behind quad can never be grabbed where it is not drawn.
+        let planes = Plane::ALL
+            .iter()
+            .filter_map(|&p| {
+                let corners = frame.plane_quad(p);
+                let pts: Vec<egui::Pos2> = corners.iter().filter_map(|c| project(*c)).collect();
+                (pts.len() == 4).then(|| (p, [pts[0], pts[1], pts[2], pts[3]]))
+            })
+            .collect();
+        Some(Self { origin, arms, rings, planes })
     }
 
     /// The nearest axis whose arm is within `tol` pixels of `cursor`.
@@ -202,6 +332,75 @@ impl Layout {
         }
         best.map(|(_, axis)| axis)
     }
+
+    /// The plane handle whose square is under `cursor`, if any.
+    pub fn hit_plane(&self, cursor: egui::Pos2, tol: f32) -> Option<Plane> {
+        self.planes
+            .iter()
+            .find(|(_, quad)| quad_contains(quad, cursor, tol))
+            .map(|(plane, _)| *plane)
+    }
+
+    /// Whether the cursor is over the centre square (`tol` pixels of slack).
+    pub fn hit_centre(&self, cursor: egui::Pos2, tol: f32) -> bool {
+        let reach = CENTRE_PIXELS + tol;
+        let d = cursor - self.origin;
+        d.x.abs() <= reach && d.y.abs() <= reach
+    }
+
+    /// The handle under `cursor` for `mode`.
+    ///
+    /// The order is the order the handles are painted — the centre square over
+    /// the plane squares over the arms — so what the cursor picks is what it
+    /// appears to be over. Rotate has only its rings.
+    pub fn hit(&self, mode: TransformMode, cursor: egui::Pos2, tol: f32) -> Option<Handle> {
+        match mode {
+            TransformMode::Rotate => self.hit_ring(cursor, tol).map(Handle::Axis),
+            _ => {
+                if self.hit_centre(cursor, tol) {
+                    return Some(Handle::Centre);
+                }
+                if let Some(plane) = self.hit_plane(cursor, tol) {
+                    return Some(Handle::Plane(plane));
+                }
+                self.hit_axis(cursor, tol).map(Handle::Axis)
+            }
+        }
+    }
+}
+
+/// Whether `p` is inside the convex quad `quad`, or within `tol` of an edge.
+///
+/// A plane handle seen nearly edge-on projects to a sliver, so the tolerance is
+/// what keeps it grabbable. A quad that has collapsed to a line or a point has
+/// no inside at all, which is why the edge distance is checked as well as the
+/// side of each edge.
+fn quad_contains(quad: &[egui::Pos2; 4], p: egui::Pos2, tol: f32) -> bool {
+    let mut side = 0.0f32;
+    let mut usable = 0;
+    let mut same_side = true;
+    let mut edge_distance = f32::INFINITY;
+    for i in 0..4 {
+        let a = quad[i];
+        let b = quad[(i + 1) % 4];
+        edge_distance = edge_distance.min(distance_to_segment(p, a, b));
+        let ab = b - a;
+        let len = ab.length();
+        if len <= 1e-6 {
+            continue;
+        }
+        usable += 1;
+        // Positive on one side of the edge, negative on the other.
+        let d = (ab.x * (p.y - a.y) - ab.y * (p.x - a.x)) / len;
+        if d.abs() > tol {
+            if side == 0.0 {
+                side = d.signum();
+            } else if d.signum() != side {
+                same_side = false;
+            }
+        }
+    }
+    (usable > 0 && same_side) || edge_distance <= tol
 }
 
 /// Closest point between `ray` and the infinite line `origin + t * dir`.
@@ -270,23 +469,51 @@ pub fn angle_delta(from: f32, to: f32) -> f32 {
 }
 
 /// How far a drag has travelled, in the unit its mode consumes.
+///
+/// A translation carries its world-space vector and a scale its per-axis
+/// factors, so a handle that works in one axis and a handle that works in a
+/// plane are the same shape to everything downstream: `1` in the factor of an
+/// axis a scale handle does not touch, `0` in the component a move does not.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Measure {
-    /// Move: world-space distance along the axis.
-    Translate(f32),
-    /// Scale: multiplier relative to the drag start.
-    Scale(f32),
+    /// Move: the world-space translation.
+    Translate(Vec3),
+    /// Scale: a multiplier per world axis, relative to the drag start.
+    Scale(Vec3),
     /// Rotate: radians around the axis.
-    Rotate(f32),
+    Rotate(Axis, f32),
+}
+
+/// Per-axis scale factors that leave every axis alone except those in `axes`,
+/// which all take `f`.
+fn factors(axes: &[Axis], f: f32) -> Vec3 {
+    let f = f.clamp(0.01, 1000.0);
+    let mut out = Vec3::ONE;
+    for &axis in axes {
+        match axis {
+            Axis::X => out.x = f,
+            Axis::Y => out.y = f,
+            Axis::Z => out.z = f,
+        }
+    }
+    out
 }
 
 /// Apply a drag measure to one node's drag-start transform.
-pub fn apply_measure(axis: Axis, start: &Transform, measure: Measure) -> Transform {
+pub fn apply_measure(start: &Transform, measure: Measure) -> Transform {
     let mut out = *start;
     match measure {
-        Measure::Translate(d) => out.translation = start.translation + axis.dir() * d,
-        Measure::Scale(f) => out.scale = start.scale * f.clamp(0.01, 1000.0),
-        Measure::Rotate(a) => out.rotation = Quat::from_axis_angle(axis.dir(), a) * start.rotation,
+        Measure::Translate(d) => out.translation = start.translation + d,
+        Measure::Scale(f) => {
+            out.scale = start.scale * Vec3::new(
+                f.x.clamp(0.01, 1000.0),
+                f.y.clamp(0.01, 1000.0),
+                f.z.clamp(0.01, 1000.0),
+            )
+        }
+        Measure::Rotate(axis, a) => {
+            out.rotation = Quat::from_axis_angle(axis.dir(), a) * start.rotation
+        }
     }
     out
 }
@@ -296,9 +523,12 @@ pub fn apply_measure(axis: Axis, start: &Transform, measure: Measure) -> Transfo
 #[derive(Clone, Copy, Debug)]
 pub struct Anchor {
     pub mode: TransformMode,
-    pub axis: Axis,
+    pub handle: Handle,
     pub origin: Vec3,
-    /// World point on the axis line where the drag began (Move/Scale).
+    /// The plane a non-axis drag is resolved in: the plane's own normal for a
+    /// plane handle, the camera's view direction for the centre handle.
+    plane_normal: Vec3,
+    /// World point on the axis (or in the plane) where the drag began.
     start_point: Vec3,
     /// Angle around the axis where the drag began (Rotate).
     start_angle: f32,
@@ -307,40 +537,81 @@ pub struct Anchor {
 impl Anchor {
     /// Resolve a drag that is starting now, from the ray under the cursor.
     ///
-    /// `None` when the ray cannot be resolved against the axis (parallel, or
-    /// pointing away from the rotation plane).
-    pub fn new(mode: TransformMode, axis: Axis, origin: Vec3, ray: Ray) -> Option<Self> {
-        match mode {
-            TransformMode::Rotate => {
+    /// `view` is the camera's view direction, which is the plane the centre
+    /// handle works in. `None` when the ray cannot be resolved against the
+    /// handle (parallel to the axis, or pointing away from its plane).
+    pub fn new(
+        mode: TransformMode,
+        handle: Handle,
+        origin: Vec3,
+        ray: Ray,
+        view: Vec3,
+    ) -> Option<Self> {
+        let plane_normal = match handle {
+            Handle::Axis(axis) => axis.dir(),
+            Handle::Plane(plane) => plane.normal().dir(),
+            Handle::Centre => view.normalize_or_zero(),
+        };
+        match (mode, handle) {
+            (TransformMode::Rotate, Handle::Axis(axis)) => {
                 let p = ray_plane(ray, origin, axis.dir())?;
                 Some(Self {
                     mode,
-                    axis,
+                    handle,
                     origin,
+                    plane_normal,
                     start_point: origin,
                     start_angle: plane_angle(origin, axis, p),
                 })
             }
-            _ => {
+            (TransformMode::Rotate, _) => None,
+            (_, Handle::Axis(axis)) => {
                 let p = closest_point_on_line(ray, origin, axis.dir())?;
-                Some(Self { mode, axis, origin, start_point: p, start_angle: 0.0 })
+                Some(Self {
+                    mode,
+                    handle,
+                    origin,
+                    plane_normal,
+                    start_point: p,
+                    start_angle: 0.0,
+                })
+            }
+            (_, _) => {
+                let p = ray_plane(ray, origin, plane_normal)?;
+                Some(Self {
+                    mode,
+                    handle,
+                    origin,
+                    plane_normal,
+                    start_point: p,
+                    start_angle: 0.0,
+                })
             }
         }
     }
 
     pub fn measure(&self, ray: Ray) -> Option<Measure> {
-        let dir = self.axis.dir();
-        match self.mode {
-            TransformMode::Rotate => {
-                let p = ray_plane(ray, self.origin, dir)?;
-                let angle = angle_delta(self.start_angle, plane_angle(self.origin, self.axis, p));
-                Some(Measure::Rotate(angle))
+        match (self.mode, self.handle) {
+            (TransformMode::Rotate, Handle::Axis(axis)) => {
+                let p = ray_plane(ray, self.origin, axis.dir())?;
+                let angle = angle_delta(self.start_angle, plane_angle(self.origin, axis, p));
+                Some(Measure::Rotate(axis, angle))
             }
-            TransformMode::Move => {
+            (TransformMode::Move, Handle::Axis(axis)) => {
+                let dir = axis.dir();
                 let p = closest_point_on_line(ray, self.origin, dir)?;
-                Some(Measure::Translate((p - self.start_point).dot(dir)))
+                Some(Measure::Translate(dir * (p - self.start_point).dot(dir)))
             }
-            TransformMode::Scale => {
+            (TransformMode::Move, _) => {
+                // A plane or centre handle: the cursor's own point in the
+                // drag's plane, relative to where the grab began. Both points
+                // lie in that plane, so their difference lies in no axis the
+                // handle must not move.
+                let p = ray_plane(ray, self.origin, self.plane_normal)?;
+                Some(Measure::Translate(p - self.start_point))
+            }
+            (TransformMode::Scale, Handle::Axis(axis)) => {
+                let dir = axis.dir();
                 let p = closest_point_on_line(ray, self.origin, dir)?;
                 let start = (self.start_point - self.origin).dot(dir);
                 let now = (p - self.origin).dot(dir);
@@ -348,19 +619,38 @@ impl Anchor {
                 // near the centre that ratio explodes, so fall back to an
                 // additive factor there.
                 let factor = if start.abs() > 1e-3 { now / start } else { 1.0 + (now - start) };
-                Some(Measure::Scale(factor))
+                Some(Measure::Scale(factors(&[axis], factor)))
             }
+            (TransformMode::Scale, Handle::Plane(plane)) => {
+                // Both axes of the plane scale together, by how much further
+                // from the origin the cursor has travelled within the plane.
+                let p = ray_plane(ray, self.origin, self.plane_normal)?;
+                let start = (self.start_point - self.origin).length();
+                let now = (p - self.origin).length();
+                let factor = if start > 1e-3 { now / start } else { 1.0 };
+                let (u, v) = plane.axes();
+                Some(Measure::Scale(factors(&[u, v], factor)))
+            }
+            (TransformMode::Scale, Handle::Centre) => {
+                let p = ray_plane(ray, self.origin, self.plane_normal)?;
+                let start = (self.start_point - self.origin).length();
+                let now = (p - self.origin).length();
+                let factor = if start > 1e-3 { now / start } else { 1.0 };
+                Some(Measure::Scale(Vec3::splat(factor.clamp(0.01, 1000.0))))
+            }
+            // Rotate has only its rings: no plane square, no centre.
+            (TransformMode::Rotate, _) => None,
         }
     }
 }
 
 /// The world-space transform a measure describes, about `pivot`.
-pub fn measure_matrix(axis: Axis, measure: Measure, pivot: Vec3) -> Mat4 {
+pub fn measure_matrix(measure: Measure, pivot: Vec3) -> Mat4 {
     let about_pivot = |m: Mat4| Mat4::from_translation(pivot) * m * Mat4::from_translation(-pivot);
     match measure {
-        Measure::Translate(d) => Mat4::from_translation(axis.dir() * d),
-        Measure::Scale(f) => about_pivot(Mat4::from_scale(Vec3::splat(f))),
-        Measure::Rotate(a) => about_pivot(Mat4::from_axis_angle(axis.dir(), a)),
+        Measure::Translate(d) => Mat4::from_translation(d),
+        Measure::Scale(f) => about_pivot(Mat4::from_scale(f)),
+        Measure::Rotate(axis, a) => about_pivot(Mat4::from_axis_angle(axis.dir(), a)),
     }
 }
 
@@ -405,11 +695,11 @@ impl Targets {
     }
 }
 
-/// An in-progress axis-constrained drag.
+/// An in-progress handle drag.
 #[derive(Clone, Debug)]
 pub struct Drag {
     pub mode: TransformMode,
-    pub axis: Axis,
+    pub handle: Handle,
     pub anchor: Anchor,
     pub targets: Targets,
 }
@@ -428,9 +718,9 @@ impl Drag {
 /// its handles were laid out for the frame being drawn.
 #[derive(Default)]
 pub struct Gizmo {
-    pub hovered: Option<Axis>,
-    /// The axis being dragged, held for the whole gesture.
-    pub active: Option<Axis>,
+    pub hovered: Option<Handle>,
+    /// The handle being dragged, held for the whole gesture.
+    pub active: Option<Handle>,
     pub drag: Option<Drag>,
     /// This frame's screen layout, refreshed by the input pass and consumed by
     /// the painting pass so both agree on where the handles are.
@@ -442,13 +732,14 @@ impl Gizmo {
         self.drag.is_some()
     }
 
-    /// The axis to highlight: the dragged one while dragging, otherwise hover.
-    pub fn highlight(&self) -> Option<Axis> {
+    /// The handle to highlight: the dragged one while dragging, otherwise
+    /// whatever the cursor is over.
+    pub fn highlight(&self) -> Option<Handle> {
         self.active.or(self.hovered)
     }
 
     pub fn begin(&mut self, drag: Drag) {
-        self.active = Some(drag.axis);
+        self.active = Some(drag.handle);
         self.hovered = None;
         self.drag = Some(drag);
     }
@@ -459,7 +750,7 @@ impl Gizmo {
         self.drag.take().map(|d| d.undo_label())
     }
 
-    /// Move the dragged targets along the dragged axis, using the cursor ray.
+    /// Move the dragged targets by the dragged handle, using the cursor ray.
     ///
     /// `snap` and `vertex` come from the app, which resolves the vertex under
     /// the cursor (if any) against the scene's other geometry: [`apply_measure`]
@@ -477,18 +768,24 @@ impl Gizmo {
     ) -> bool {
         let Some(drag) = self.drag.as_ref() else { return false };
         let Some(measure) = drag.anchor.measure(ray) else { return false };
-        let measure = crate::snap::snap_measure(snap, drag.axis, drag.anchor.origin, measure, vertex);
+        let measure = crate::snap::snap_measure(
+            snap,
+            &drag.handle.axes(),
+            drag.anchor.origin,
+            measure,
+            vertex,
+        );
         match &drag.targets {
             Targets::Nodes(nodes) => {
                 for (id, start) in nodes {
                     let Ok(node) = scene.get_mut(*id) else { continue };
-                    node.transform = apply_measure(drag.axis, start, measure);
+                    node.transform = apply_measure(start, measure);
                 }
             }
             Targets::Vertices(targets) => {
                 // The measure is world-space; the vertices are mesh-local, so
                 // the transform is carried through each node's world matrix.
-                let world_space = measure_matrix(drag.axis, measure, drag.anchor.origin);
+                let world_space = measure_matrix(measure, drag.anchor.origin);
                 for target in targets {
                     let Ok(world) = scene.world_matrix(target.node) else { continue };
                     if world.determinant().abs() < 1e-12 {
@@ -514,6 +811,10 @@ mod tests {
     use super::*;
     use crate::snap::Snap;
     use openforge_core::mesh::Mesh;
+
+    /// A view direction for the tests that do not exercise the centre handle:
+    /// looking straight down -Z, so screen space is the XY plane.
+    const VIEW: Vec3 = Vec3::NEG_Z;
 
     /// Apply a drag with snapping off — the app's default, and what these pure
     /// gizmo tests exercise. Snapped drags are covered by `snap.rs` and the
@@ -637,6 +938,124 @@ mod tests {
     }
 
     #[test]
+    fn plane_and_handle_names_describe_their_axes() {
+        for plane in Plane::ALL {
+            let (u, v) = plane.axes();
+            let normal = plane.normal();
+            assert_ne!(u, v);
+            assert_ne!(u, normal);
+            assert_ne!(v, normal, "{plane:?} is spanned by two axes and misses the third");
+            // The normal is the one axis the plane does not span.
+            let spanned = [u, v];
+            assert!(!spanned.contains(&normal));
+            assert_eq!(plane.label().len(), 2);
+            // The handle that grabs it reports the plane's own two axes.
+            assert_eq!(Handle::Plane(plane).axes(), vec![u, v]);
+            assert_eq!(Handle::Axis(normal).axes(), vec![normal]);
+            assert!(Handle::Centre.axes().is_empty(), "the centre has no world axis");
+            assert_eq!(Handle::Plane(plane).label(), plane.label());
+        }
+        assert_eq!(Handle::Centre.label(), "screen");
+        assert_eq!(Handle::Axis(Axis::Y).label(), "Y");
+    }
+
+    #[test]
+    fn a_plane_quad_sits_between_its_two_axes_and_off_the_third() {
+        let frame = Frame { origin: Vec3::new(1.0, 0.0, -2.0), arm: 2.0, radius: 2.0 };
+        for plane in Plane::ALL {
+            let (u, v) = plane.axes();
+            let quad = frame.plane_quad(plane);
+            let centre: Vec3 = quad.iter().sum::<Vec3>() / 4.0;
+            let offset = centre - frame.origin;
+            // Halfway out along both axes of the plane, and nowhere else.
+            let expected = (u.dir() + v.dir()) * (frame.arm * PLANE_CENTRE);
+            assert!((offset - expected).length() < 1e-5, "{plane:?}: {offset:?}");
+            assert!(
+                offset.dot(plane.normal().dir()).abs() < 1e-5,
+                "{plane:?} stays out of its own normal"
+            );
+
+            // Every corner lies in the plane, and the sides are square.
+            for corner in quad {
+                let off = corner - frame.origin;
+                assert!(off.dot(plane.normal().dir()).abs() < 1e-5);
+            }
+            let side = (quad[1] - quad[0]).length();
+            assert!((side - frame.arm * PLANE_HALF * 2.0).abs() < 1e-5, "{plane:?} side {side}");
+            assert!((quad[0] - quad[3]).length() < (side + 1e-5), "{plane:?} is a square");
+            assert!((quad[2] - quad[1]).length() < (side + 1e-5));
+        }
+    }
+
+    #[test]
+    fn the_cursor_picks_the_handle_it_appears_to_be_over() {
+        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0 };
+        let layout = layout_for(&frame);
+        let tol = HIT_TOLERANCE;
+
+        // The centre square wins over everything, even though the plane quads
+        // and the arms all start under it.
+        assert_eq!(layout.hit(TransformMode::Move, layout.origin, tol), Some(Handle::Centre));
+        assert_eq!(layout.hit(TransformMode::Scale, layout.origin, tol), Some(Handle::Centre));
+
+        // A plane square wins over an arm that runs through it.
+        let (plane, quad) = layout.planes.first().expect("a plane square projects");
+        let middle = egui::pos2(
+            (quad[0].x + quad[1].x + quad[2].x + quad[3].x) / 4.0,
+            (quad[0].y + quad[1].y + quad[2].y + quad[3].y) / 4.0,
+        );
+        assert_eq!(layout.hit(TransformMode::Move, middle, tol), Some(Handle::Plane(*plane)));
+        // Dragging the plane square in the Scale tool too.
+        assert_eq!(layout.hit(TransformMode::Scale, middle, tol), Some(Handle::Plane(*plane)));
+
+        // Well away from every handle, nothing is grabbed.
+        let away = layout.origin + egui::vec2(400.0, 400.0);
+        assert_eq!(layout.hit(TransformMode::Move, away, tol), None);
+        assert_eq!(layout.hit(TransformMode::Scale, away, tol), None);
+    }
+
+    #[test]
+    fn a_rotate_gizmo_offers_only_its_rings() {
+        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0 };
+        let layout = layout_for(&frame);
+        // Rotate has no plane square and no centre handle: the origin is free,
+        // even though it is the middle of every ring.
+        assert_eq!(layout.hit(TransformMode::Rotate, layout.origin, HIT_TOLERANCE), None);
+        // A point on a ring is still grabbed.
+        let (axis, pts) = layout
+            .rings
+            .iter()
+            .find(|(a, pts)| *a == Axis::Z && pts.len() >= 8)
+            .expect("the Z ring projects");
+        assert_eq!(
+            layout.hit(TransformMode::Rotate, pts[2], HIT_TOLERANCE),
+            Some(Handle::Axis(*axis))
+        );
+    }
+
+    #[test]
+    fn a_plane_square_is_grab_able_even_seen_nearly_edge_on() {
+        // A square whose corners all project to the same pixel is degenerate,
+        // and must not swallow the whole screen.
+        let degenerate = [egui::pos2(10.0, 10.0); 4];
+        assert!(!quad_contains(&degenerate, egui::pos2(500.0, 500.0), HIT_TOLERANCE));
+        // A cursor right on the collapsed square still counts.
+        assert!(quad_contains(&degenerate, egui::pos2(10.0, 10.0), HIT_TOLERANCE));
+
+        // A normal square: inside, just outside an edge within tolerance, and
+        // far outside.
+        let square = [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(20.0, 0.0),
+            egui::pos2(20.0, 20.0),
+            egui::pos2(0.0, 20.0),
+        ];
+        assert!(quad_contains(&square, egui::pos2(10.0, 10.0), HIT_TOLERANCE));
+        assert!(quad_contains(&square, egui::pos2(26.0, 10.0), HIT_TOLERANCE), "6px off the edge");
+        assert!(!quad_contains(&square, egui::pos2(60.0, 10.0), HIT_TOLERANCE), "far off the edge");
+    }
+
+    #[test]
     fn closest_point_slides_along_the_axis() {
         // A ray perpendicular to the X axis, sweeping down at x = 5. The point
         // of the X axis closest to it is therefore the origin of that sweep.
@@ -686,42 +1105,46 @@ mod tests {
 
     #[test]
     fn measure_translates_along_the_axis() {
-        let anchor = Anchor::new(TransformMode::Move, Axis::X, Vec3::ZERO, Ray {
+        let anchor = Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, Ray {
             origin: Vec3::new(2.0, 5.0, 0.0),
             direction: -Vec3::Y,
-        })
+        }, VIEW)
         .unwrap();
         // Move the cursor to X = 4 and the drag has travelled 2 units.
         let m = anchor
             .measure(Ray { origin: Vec3::new(4.0, 5.0, 0.0), direction: -Vec3::Y })
             .unwrap();
-        assert_eq!(m, Measure::Translate(2.0));
+        assert_eq!(m, Measure::Translate(Vec3::X * 2.0));
 
         let start = Transform::from_translation(Vec3::new(1.0, 1.0, 1.0));
-        let moved = apply_measure(Axis::X, &start, m);
+        let moved = apply_measure(&start, m);
         assert!((moved.translation - Vec3::new(3.0, 1.0, 1.0)).length() < 1e-5);
     }
 
     #[test]
     fn measure_scales_relative_to_the_grab_point() {
         let origin = Vec3::ZERO;
-        let anchor = Anchor::new(TransformMode::Scale, Axis::Y, origin, Ray {
+        let anchor = Anchor::new(TransformMode::Scale, Handle::Axis(Axis::Y), origin, Ray {
             origin: Vec3::new(6.0, 1.0, 0.0),
             direction: -Vec3::X,
-        })
+        }, VIEW)
         .unwrap();
         // Grabbed at Y = 1, now over Y = 2: a 2x scale.
         let m = anchor
             .measure(Ray { origin: Vec3::new(6.0, 2.0, 0.0), direction: -Vec3::X })
             .unwrap();
-        assert_eq!(m, Measure::Scale(2.0));
+        assert_eq!(m, Measure::Scale(Vec3::new(1.0, 2.0, 1.0)));
 
         let start = Transform::identity();
-        let scaled = apply_measure(Axis::Y, &start, m);
-        assert!((scaled.scale - Vec3::splat(2.0)).length() < 1e-5);
+        let scaled = apply_measure(&start, m);
+        assert!(
+            (scaled.scale - Vec3::new(1.0, 2.0, 1.0)).length() < 1e-5,
+            "only the grabbed axis scales: {:?}",
+            scaled.scale
+        );
 
         // Shrinking towards the centre is clamped, never inverted.
-        let tiny = apply_measure(Axis::Y, &start, Measure::Scale(-3.0));
+        let tiny = apply_measure(&start, Measure::Scale(Vec3::new(1.0, -3.0, 1.0)));
         assert!(tiny.scale.y > 0.0);
     }
 
@@ -729,18 +1152,106 @@ mod tests {
     fn measure_rotates_around_the_axis() {
         // Look straight down -Z at the XY plane, where a Z rotation happens.
         let ray_at = |x: f32, y: f32| Ray { origin: Vec3::new(x, y, 5.0), direction: -Vec3::Z };
-        let anchor = Anchor::new(TransformMode::Rotate, Axis::Z, Vec3::ZERO, ray_at(1.0, 0.0)).unwrap();
+        let anchor = Anchor::new(
+            TransformMode::Rotate,
+            Handle::Axis(Axis::Z),
+            Vec3::ZERO,
+            ray_at(1.0, 0.0),
+            VIEW,
+        )
+        .unwrap();
         // Sweeping from +X to +Y is a quarter turn about Z.
         let m = anchor.measure(ray_at(0.0, 1.0)).unwrap();
         match m {
-            Measure::Rotate(a) => assert!((a - std::f32::consts::FRAC_PI_2).abs() < 1e-4, "got {a}"),
-            other => panic!("expected a rotation, got {other:?}"),
+            Measure::Rotate(Axis::Z, a) => {
+                assert!((a - std::f32::consts::FRAC_PI_2).abs() < 1e-4, "got {a}")
+            }
+            other => panic!("expected a Z rotation, got {other:?}"),
         }
 
         let start = Transform::identity();
-        let spun = apply_measure(Axis::Z, &start, m);
+        let spun = apply_measure(&start, m);
         let rotated = spun.rotation * Vec3::X;
         assert!((rotated - Vec3::Y).length() < 1e-4, "X rotated into Y, got {rotated:?}");
+    }
+
+    #[test]
+    fn a_plane_drag_moves_in_the_plane_and_leaves_its_normal_alone() {
+        // Looking down -Z at the origin, which is where an XY plane move is at
+        // its most visible: the plane faces the camera.
+        let ray_at = |x: f32, y: f32| Ray { origin: Vec3::new(x, y, 5.0), direction: -Vec3::Z };
+        let anchor = Anchor::new(
+            TransformMode::Move,
+            Handle::Plane(Plane::XY),
+            Vec3::ZERO,
+            ray_at(1.0, 1.0),
+            VIEW,
+        )
+        .unwrap();
+        let m = anchor.measure(ray_at(3.0, -1.0)).unwrap();
+        assert_eq!(m, Measure::Translate(Vec3::new(2.0, -2.0, 0.0)));
+
+        let moved = apply_measure(&Transform::from_translation(Vec3::new(0.0, 0.0, 7.0)), m);
+        assert!((moved.translation - Vec3::new(2.0, -2.0, 7.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn a_plane_scale_scales_its_two_axes_and_not_the_third() {
+        let anchor = Anchor::new(
+            TransformMode::Scale,
+            Handle::Plane(Plane::ZX),
+            Vec3::ZERO,
+            Ray { origin: Vec3::new(1.0, 6.0, 0.0), direction: -Vec3::Y },
+            VIEW,
+        )
+        .unwrap();
+        // Grabbed one unit out in the ZX plane, now three: a 3x scale.
+        let m = anchor
+            .measure(Ray { origin: Vec3::new(3.0, 6.0, 0.0), direction: -Vec3::Y })
+            .unwrap();
+        assert_eq!(m, Measure::Scale(Vec3::new(3.0, 1.0, 3.0)));
+
+        let scaled = apply_measure(&Transform::identity(), m);
+        assert!((scaled.scale - Vec3::new(3.0, 1.0, 3.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn the_centre_handle_works_in_the_plane_facing_the_camera() {
+        // Looking down -Z, so the centre handle's plane *is* the XY plane, and
+        // its view normal is +Z: the same maths as the XY plane handle.
+        let ray_at = |x: f32, y: f32| Ray { origin: Vec3::new(x, y, 5.0), direction: -Vec3::Z };
+        let move_anchor = Anchor::new(
+            TransformMode::Move,
+            Handle::Centre,
+            Vec3::ZERO,
+            ray_at(1.0, 0.0),
+            VIEW,
+        )
+        .unwrap();
+        let m = move_anchor.measure(ray_at(1.0, 4.0)).unwrap();
+        assert_eq!(m, Measure::Translate(Vec3::new(0.0, 4.0, 0.0)));
+
+        // A centre scale is uniform, in all three axes at once.
+        let scale_anchor = Anchor::new(
+            TransformMode::Scale,
+            Handle::Centre,
+            Vec3::ZERO,
+            ray_at(2.0, 0.0),
+            VIEW,
+        )
+        .unwrap();
+        let m = scale_anchor.measure(ray_at(4.0, 0.0)).unwrap();
+        assert_eq!(m, Measure::Scale(Vec3::splat(2.0)));
+
+        // Rotate has no centre handle: the grab cannot even be anchored.
+        assert!(Anchor::new(
+            TransformMode::Rotate,
+            Handle::Centre,
+            Vec3::ZERO,
+            ray_at(1.0, 0.0),
+            VIEW
+        )
+        .is_none());
     }
 
     #[test]
@@ -756,11 +1267,12 @@ mod tests {
 
         let mut gizmo = Gizmo::default();
         let ray = Ray { origin: Vec3::new(0.0, 0.0, 5.0), direction: -Vec3::Z };
-        let anchor = Anchor::new(TransformMode::Move, Axis::X, Vec3::ZERO, ray).unwrap();
+        let anchor =
+            Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, ray, VIEW).unwrap();
         let start = scene.get(id).unwrap().transform;
         gizmo.begin(Drag {
             mode: TransformMode::Move,
-            axis: Axis::X,
+            handle: Handle::Axis(Axis::X),
             anchor,
             targets: Targets::Nodes(vec![(id, start)]),
         });
@@ -781,16 +1293,20 @@ mod tests {
         let pivot = Vec3::new(1.0, 0.0, 0.0);
         let p = Vec3::new(2.0, 0.0, 0.0);
 
-        let moved = measure_matrix(Axis::X, Measure::Translate(3.0), pivot).transform_point3(p);
+        let moved = measure_matrix(Measure::Translate(Vec3::X * 3.0), pivot).transform_point3(p);
         assert!((moved - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5, "got {moved:?}");
 
         // Scaling about the pivot: x = 1 + (2 - 1) * 2.
-        let scaled = measure_matrix(Axis::Y, Measure::Scale(2.0), pivot).transform_point3(p);
+        let scaled =
+            measure_matrix(Measure::Scale(Vec3::new(2.0, 1.0, 1.0)), pivot).transform_point3(p);
         assert!((scaled - Vec3::new(3.0, 0.0, 0.0)).length() < 1e-5, "got {scaled:?}");
 
         // A quarter turn about Z around the pivot sends +X to +Y.
-        let spun = measure_matrix(Axis::Z, Measure::Rotate(std::f32::consts::FRAC_PI_2), pivot)
-            .transform_point3(p);
+        let spun = measure_matrix(
+            Measure::Rotate(Axis::Z, std::f32::consts::FRAC_PI_2),
+            pivot,
+        )
+        .transform_point3(p);
         assert!((spun - Vec3::new(1.0, 1.0, 0.0)).length() < 1e-4, "got {spun:?}");
     }
 
@@ -809,11 +1325,12 @@ mod tests {
 
     fn vertex_drag(node: NodeId, positions: Vec<(u32, Vec3)>) -> (Gizmo, Vec3) {
         let ray = Ray { origin: Vec3::new(0.0, 5.0, 0.0), direction: -Vec3::Y };
-        let anchor = Anchor::new(TransformMode::Move, Axis::X, Vec3::ZERO, ray).unwrap();
+        let anchor =
+            Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, ray, VIEW).unwrap();
         let mut gizmo = Gizmo::default();
         gizmo.begin(Drag {
             mode: TransformMode::Move,
-            axis: Axis::X,
+            handle: Handle::Axis(Axis::X),
             anchor,
             targets: Targets::Vertices(vec![VertexTarget { node, positions }]),
         });
@@ -888,15 +1405,16 @@ mod tests {
         // y = 2 for a 2x scale.
         let anchor = Anchor::new(
             TransformMode::Scale,
-            Axis::Y,
+            Handle::Axis(Axis::Y),
             Vec3::ZERO,
             Ray { origin: Vec3::new(5.0, 1.0, 0.0), direction: -Vec3::X },
+            VIEW,
         )
         .unwrap();
         let mut gizmo = Gizmo::default();
         gizmo.begin(Drag {
             mode: TransformMode::Scale,
-            axis: Axis::Y,
+            handle: Handle::Axis(Axis::Y),
             anchor,
             targets: Targets::Vertices(vec![VertexTarget {
                 node: id,
@@ -909,15 +1427,17 @@ mod tests {
             Ray { origin: Vec3::new(5.0, 2.0, 0.0), direction: -Vec3::X }
         ));
 
+        // The Y arm scales the vertices along Y only, exactly as an axis scale
+        // does on a node's own transform: the other axes keep their size.
         let mesh = scene.get(id).unwrap().mesh().unwrap();
-        assert!((mesh.positions[2] - Vec3::new(2.0, 2.0, 0.0)).length() < 1e-4, "got {:?}", mesh.positions[2]);
+        assert!((mesh.positions[2] - Vec3::new(1.0, 2.0, 0.0)).length() < 1e-4, "got {:?}", mesh.positions[2]);
         assert!((mesh.positions[3] - Vec3::new(0.0, 2.0, 0.0)).length() < 1e-4, "got {:?}", mesh.positions[3]);
     }
 
     #[test]
     fn a_lone_axis_grab_does_not_move_the_other_axes() {
         let start = Transform::from_translation(Vec3::new(4.0, 4.0, 4.0));
-        let moved = apply_measure(Axis::Z, &start, Measure::Translate(-2.0));
+        let moved = apply_measure(&start, Measure::Translate(Vec3::new(0.0, 0.0, -2.0)));
         assert!((moved.translation - Vec3::new(4.0, 4.0, 2.0)).length() < 1e-5);
     }
 

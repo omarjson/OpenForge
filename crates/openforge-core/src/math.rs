@@ -1,6 +1,6 @@
 //! Small math helpers layered on top of `glam`.
 
-use glam::{Mat4, Quat, Vec3};
+use glam::{EulerRot, Mat4, Quat, Vec3};
 
 /// A TRS (translate/rotate/scale) transform, the unit most scene nodes use.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -44,6 +44,28 @@ impl Transform {
     /// The inverse, suitable for transforming normals (ignores non-uniform scale shear).
     pub fn inverse_matrix(&self) -> Mat4 {
         self.to_matrix().inverse()
+    }
+
+    /// This transform's rotation as XYZ Euler angles in degrees — the numbers a
+    /// properties panel shows and edits.
+    ///
+    /// An Euler triple is not a lossless view of a rotation: the same rotation
+    /// reads back one way round, and a gimbal-locked one has no unique triple at
+    /// all. That is fine for a field that replaces the rotation outright, which
+    /// is what [`Transform::set_euler_degrees`] does.
+    pub fn euler_degrees(&self) -> [f32; 3] {
+        let (x, y, z) = self.rotation.to_euler(EulerRot::XYZ);
+        [x.to_degrees(), y.to_degrees(), z.to_degrees()]
+    }
+
+    /// Replace the rotation with the one XYZ Euler angles in degrees describe.
+    pub fn set_euler_degrees(&mut self, degrees: [f32; 3]) {
+        self.rotation = Quat::from_euler(
+            EulerRot::XYZ,
+            degrees[0].to_radians(),
+            degrees[1].to_radians(),
+            degrees[2].to_radians(),
+        );
     }
 }
 
@@ -154,6 +176,27 @@ impl Ray {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn euler_degrees_read_and_write_the_rotation() {
+        let mut t = Transform::identity();
+        assert_eq!(t.euler_degrees(), [0.0, 0.0, 0.0]);
+
+        t.set_euler_degrees([30.0, 0.0, 0.0]);
+        let [x, y, z] = t.euler_degrees();
+        assert!((x - 30.0).abs() < 1e-3, "x = {x}");
+        assert!(y.abs() < 1e-3 && z.abs() < 1e-3, "{y} {z}");
+
+        // It is the same rotation, not merely the same reading: +Y swings the
+        // way a 30 degree turn about X swings it.
+        let expected = Quat::from_rotation_x(30f32.to_radians());
+        assert!((t.rotation * Vec3::Y - expected * Vec3::Y).length() < 1e-4);
+
+        // Two axes at once, so the triple is not just one field talking.
+        t.set_euler_degrees([0.0, 90.0, 0.0]);
+        let turned = t.rotation * Vec3::Z;
+        assert!((turned - Vec3::X).length() < 1e-4, "got {turned:?}");
+    }
 
     #[test]
     fn aabb_grows_and_centers() {

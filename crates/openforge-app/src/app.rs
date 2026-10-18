@@ -2445,8 +2445,8 @@ impl OpenForgeApp {
         viewport::nearest_candidate(&candidates, local, snap::SNAP_RADIUS_PIXELS)
     }
 
-    /// The status bar's readout for a live snapped drag — `Move · snap grid
-    /// 0.25 · Δ 1.250` — or `None` when this frame is not snapping.
+    /// The status bar's readout for a live snapped drag — `Move X · snap grid
+    /// 0.25 · Δ X 1.250` — or `None` when this frame is not snapping.
     fn snap_readout(
         &self,
         snap: snap::Snap,
@@ -2460,7 +2460,7 @@ impl OpenForgeApp {
         let measure = drag.anchor.measure(ray)?;
         let measure = snap::snap_measure(
             snap,
-            drag.axis,
+            &drag.handle.axes(),
             drag.anchor.origin,
             measure,
             target.map(|c| c.world),
@@ -2475,7 +2475,11 @@ impl OpenForgeApp {
             SnapMode::Vertex => "snap vertex".to_string(),
             SnapMode::Off => return None,
         };
-        Some(format!("{tool} · {what} · {}", snap::format_measure(measure)))
+        Some(format!(
+            "{tool} {} · {what} · {}",
+            drag.handle.label(),
+            snap::format_measure(measure)
+        ))
     }
 
     /// A world-space picking ray for a screen position inside the viewport.
@@ -2722,10 +2726,7 @@ impl OpenForgeApp {
             )
         });
         let hovered = match (gizmo_mode, self.gizmo.layout.as_ref(), cursor) {
-            (Some(TransformMode::Rotate), Some(layout), Some(pos)) => {
-                layout.hit_ring(pos, gizmo::HIT_TOLERANCE)
-            }
-            (Some(_), Some(layout), Some(pos)) => layout.hit_axis(pos, gizmo::HIT_TOLERANCE),
+            (Some(mode), Some(layout), Some(pos)) => layout.hit(mode, pos, gizmo::HIT_TOLERANCE),
             _ => None,
         };
         if !self.gizmo.is_dragging() && hovered != self.gizmo.hovered {
@@ -2773,18 +2774,16 @@ impl OpenForgeApp {
             }
         } else if pressed {
             if let (Some(mode), Some(frame), Some(pos)) = (gizmo_mode, frame, press_pos) {
-                let axis = match self.gizmo.layout.as_ref() {
-                    Some(layout) if mode == TransformMode::Rotate => {
-                        layout.hit_ring(pos, gizmo::HIT_TOLERANCE)
-                    }
-                    Some(layout) => layout.hit_axis(pos, gizmo::HIT_TOLERANCE),
+                let handle = match self.gizmo.layout.as_ref() {
+                    Some(layout) => layout.hit(mode, pos, gizmo::HIT_TOLERANCE),
                     None => None,
                 };
-                if let Some(axis) = axis {
+                if let Some(handle) = handle {
                     let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
-                    if let Some(anchor) = gizmo::Anchor::new(mode, axis, frame.origin, ray) {
+                    let view = self.camera.forward();
+                    if let Some(anchor) = gizmo::Anchor::new(mode, handle, frame.origin, ray, view) {
                         let targets = self.gizmo_targets(&ids);
-                        self.gizmo.begin(gizmo::Drag { mode, axis, anchor, targets });
+                        self.gizmo.begin(gizmo::Drag { mode, handle, anchor, targets });
                         if self.edit_before.is_none() {
                             self.edit_before = Some(self.scene.clone());
                         }
@@ -4853,21 +4852,58 @@ impl OpenForgeApp {
                 }
             });
             let before = self.scene.clone();
-            let mut changed = false;
+            let mut moved = false;
+            let mut turned = false;
+            let mut scaled = false;
             if let Ok(node) = self.scene.get_mut(id) {
                 ui.label("Transform");
-                let mut t = node.transform.translation;
-                let resp = ui.add(egui::DragValue::new(&mut t.x).prefix("X ").speed(0.05))
-                    .changed()
-                    | ui.add(egui::DragValue::new(&mut t.y).prefix("Y ").speed(0.05)).changed()
-                    | ui.add(egui::DragValue::new(&mut t.z).prefix("Z ").speed(0.05)).changed();
-                if resp {
-                    node.transform.translation = t;
-                    changed = true;
-                }
+                ui.horizontal(|ui| {
+                    let mut t = node.transform.translation;
+                    moved |= ui.add(egui::DragValue::new(&mut t.x).prefix("X ").speed(0.05)).changed();
+                    moved |= ui.add(egui::DragValue::new(&mut t.y).prefix("Y ").speed(0.05)).changed();
+                    moved |= ui.add(egui::DragValue::new(&mut t.z).prefix("Z ").speed(0.05)).changed();
+                    if moved {
+                        node.transform.translation = t;
+                    }
+                });
+                // The rotation is edited as XYZ Euler degrees, the same numbers
+                // the gizmo's rotation rings read out, and turned back into the
+                // quaternion only when one of them actually changed.
+                ui.horizontal(|ui| {
+                    let [mut dx, mut dy, mut dz] = node.transform.euler_degrees();
+                    turned |=
+                        ui.add(egui::DragValue::new(&mut dx).prefix("X ").suffix("°").speed(1.0))
+                            .changed();
+                    turned |=
+                        ui.add(egui::DragValue::new(&mut dy).prefix("Y ").suffix("°").speed(1.0))
+                            .changed();
+                    turned |=
+                        ui.add(egui::DragValue::new(&mut dz).prefix("Z ").suffix("°").speed(1.0))
+                            .changed();
+                    if turned {
+                        node.transform.set_euler_degrees([dx, dy, dz]);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let mut s = node.transform.scale;
+                    scaled |= ui.add(egui::DragValue::new(&mut s.x).prefix("X ").speed(0.01)).changed();
+                    scaled |= ui.add(egui::DragValue::new(&mut s.y).prefix("Y ").speed(0.01)).changed();
+                    scaled |= ui.add(egui::DragValue::new(&mut s.z).prefix("Z ").speed(0.01)).changed();
+                    if scaled {
+                        node.transform.scale = s;
+                    }
+                });
             }
-            if changed {
-                self.push_scene_edit("Move", before);
+            if moved || turned || scaled {
+                // One undo entry for the whole edit, named for what it was —
+                // and only one, even when a frame changes several fields.
+                let label = match (moved, turned, scaled) {
+                    (true, false, false) => "Move",
+                    (false, true, false) => "Rotate",
+                    (false, false, true) => "Scale",
+                    _ => "Transform",
+                };
+                self.push_scene_edit(label, before);
                 self.dirty = true;
             }
         }
@@ -5149,7 +5185,7 @@ impl OpenForgeApp {
                 if pts.len() < 2 {
                     continue;
                 }
-                let on = Some(*axis) == hot;
+                let on = Some(gizmo::Handle::Axis(*axis)) == hot;
                 let mut closed = pts.clone();
                 closed.push(pts[0]);
                 painter.add(egui::Shape::line(
@@ -5160,8 +5196,37 @@ impl OpenForgeApp {
             return;
         }
 
+        // The plane squares, under the arms: a filled quad in the two axis
+        // colours of the plane it spans.
+        for (plane, quad) in &layout.planes {
+            let on = Some(gizmo::Handle::Plane(*plane)) == hot;
+            let color = plane.color(on);
+            painter.add(egui::Shape::convex_polygon(
+                quad.to_vec(),
+                if on {
+                    color.gamma_multiply(0.55)
+                } else {
+                    color.gamma_multiply(0.25)
+                },
+                egui::Stroke::new(if on { 2.0_f32 } else { 1.0_f32 }, color),
+            ));
+            if on {
+                let centre = egui::pos2(
+                    (quad[0].x + quad[1].x + quad[2].x + quad[3].x) / 4.0,
+                    (quad[0].y + quad[1].y + quad[2].y + quad[3].y) / 4.0,
+                );
+                painter.text(
+                    centre + egui::vec2(0.0, -10.0),
+                    egui::Align2::CENTER_BOTTOM,
+                    plane.label(),
+                    egui::FontId::monospace(11.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+
         for (axis, tip) in &layout.arms {
-            let on = Some(*axis) == hot;
+            let on = Some(gizmo::Handle::Axis(*axis)) == hot;
             let color = axis.color(on);
             painter.line_segment(
                 [layout.origin, *tip],
@@ -5188,7 +5253,28 @@ impl OpenForgeApp {
                 );
             }
         }
-        painter.circle_filled(layout.origin, 3.5, egui::Color32::from_gray(235));
+
+        // The centre handle, over everything: it faces the camera, so it stays
+        // the same size on screen however far away the gizmo is.
+        let on = hot == Some(gizmo::Handle::Centre);
+        let reach = gizmo::CENTRE_PIXELS;
+        let rect = egui::Rect::from_center_size(layout.origin, egui::vec2(reach, reach) * 2.0);
+        let (fill, stroke) = if on {
+            (egui::Color32::from_rgb(255, 214, 102), egui::Color32::WHITE)
+        } else {
+            (egui::Color32::from_gray(235), egui::Color32::from_gray(120))
+        };
+        painter.rect_filled(rect, 1.0, fill);
+        painter.rect_stroke(rect, 1.0, egui::Stroke::new(1.4_f32, stroke));
+        if on {
+            painter.text(
+                layout.origin + egui::vec2(reach + 6.0, -reach - 2.0),
+                egui::Align2::LEFT_BOTTOM,
+                gizmo::Handle::Centre.label(),
+                egui::FontId::monospace(11.0),
+                egui::Color32::WHITE,
+            );
+        }
     }
 
     fn handle_status_bar(&self, ctx: &egui::Context) {
@@ -6729,6 +6815,38 @@ mod tests {
             .expect("the axis projects on screen")
     }
 
+    /// A grab on one axis handle, the way the gizmo records it.
+    fn on_axis(axis: gizmo::Axis) -> Option<gizmo::Handle> {
+        Some(gizmo::Handle::Axis(axis))
+    }
+
+    /// The middle of a plane handle's square on screen, as laid out this frame.
+    fn plane_centre(app: &OpenForgeApp, plane: gizmo::Plane) -> egui::Pos2 {
+        let quad = app
+            .gizmo
+            .layout
+            .as_ref()
+            .expect("a transform tool with a selection lays the handles out")
+            .planes
+            .iter()
+            .find(|(p, _)| *p == plane)
+            .map(|(_, q)| *q)
+            .expect("the plane square projects on screen");
+        egui::pos2(
+            (quad[0].x + quad[1].x + quad[2].x + quad[3].x) / 4.0,
+            (quad[0].y + quad[1].y + quad[2].y + quad[3].y) / 4.0,
+        )
+    }
+
+    /// The gizmo's own origin on screen this frame.
+    fn laid_out_pivot(app: &OpenForgeApp) -> egui::Pos2 {
+        app.gizmo
+            .layout
+            .as_ref()
+            .expect("a transform tool with a selection lays the handles out")
+            .origin
+    }
+
     #[test]
     fn the_gizmo_appears_only_for_a_transform_tool_over_a_selection() {
         let ctx = egui::Context::default();
@@ -6754,7 +6872,7 @@ mod tests {
 
         let tip = arm_tip(&app, gizmo::Axis::X);
         step(&ctx, &mut app, frame(1.0, tip, None));
-        assert_eq!(app.gizmo.hovered, Some(gizmo::Axis::X));
+        assert_eq!(app.gizmo.hovered, on_axis(gizmo::Axis::X));
 
         // A corner of the viewport is nowhere near a handle.
         step(&ctx, &mut app, frame(2.0, egui::pos2(20.0, 660.0), None));
@@ -6774,7 +6892,7 @@ mod tests {
         // time the pointer has moved egui calls it a drag, not a hover.
         step(&ctx, &mut app, frame(1.0, tip, Some(true)));
         assert!(app.gizmo.is_dragging(), "pressing a handle starts a drag");
-        assert_eq!(app.gizmo.active, Some(gizmo::Axis::X));
+        assert_eq!(app.gizmo.active, on_axis(gizmo::Axis::X));
 
         // Drag clear of the handle and the selection follows the axis.
         let dragged = tip + egui::vec2(140.0, 0.0);
@@ -7373,7 +7491,7 @@ mod tests {
         let (vx, vy, _) = viewport::project(vp, target, size).expect("the marker is in front");
         let tip = arm_tip(&app, gizmo::Axis::X);
         step(&ctx, &mut app, frame(1.0, tip, Some(true)));
-        assert_eq!(app.gizmo.active, Some(gizmo::Axis::X));
+        assert_eq!(app.gizmo.active, on_axis(gizmo::Axis::X));
 
         // Drag with the cursor over the marker's vertex.
         let over = egui::pos2(vx, vy);
@@ -7442,7 +7560,7 @@ mod tests {
         );
 
         step(&ctx, &mut app, frame(1.0, tip, Some(true)));
-        assert_eq!(app.gizmo.active, Some(gizmo::Axis::X), "the arm was grabbed");
+        assert_eq!(app.gizmo.active, on_axis(gizmo::Axis::X), "the arm was grabbed");
         step(&ctx, &mut app, frame(2.0, tip + egui::vec2(120.0, 0.0), None));
         step(&ctx, &mut app, frame(3.0, tip + egui::vec2(120.0, 0.0), Some(false)));
         assert!(!app.gizmo.is_dragging());
@@ -7515,11 +7633,11 @@ mod tests {
             .expect("the Z ring projects");
         let on_ring = ring[2];
         step(&ctx, &mut app, frame(1.0, on_ring, None));
-        assert_eq!(app.gizmo.hovered, Some(gizmo::Axis::Z));
+        assert_eq!(app.gizmo.hovered, on_axis(gizmo::Axis::Z));
 
         let before = app.scene.get(_id).unwrap().transform;
         step(&ctx, &mut app, frame(2.0, on_ring, Some(true)));
-        assert_eq!(app.gizmo.active, Some(gizmo::Axis::Z));
+        assert_eq!(app.gizmo.active, on_axis(gizmo::Axis::Z));
         // Sweep a quarter of the way round the ring and release.
         let quarter = ring[ring.len() / 4];
         step(&ctx, &mut app, frame(3.0, quarter, None));
@@ -7548,7 +7666,7 @@ mod tests {
         let tip = arm_tip(&app, gizmo::Axis::Y);
         let before = app.scene.get(id).unwrap().transform;
         step(&ctx, &mut app, frame(1.0, tip, Some(true)));
-        assert_eq!(app.gizmo.active, Some(gizmo::Axis::Y));
+        assert_eq!(app.gizmo.active, on_axis(gizmo::Axis::Y));
         // Push the handle further from the gizmo origin.
         let out = tip + (tip - app.gizmo.layout.as_ref().unwrap().origin) * 0.5;
         step(&ctx, &mut app, frame(2.0, out, None));
@@ -7568,21 +7686,161 @@ mod tests {
     }
 
     #[test]
+    fn a_plane_handle_moves_the_selection_inside_its_own_plane() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        let grab = plane_centre(&app, gizmo::Plane::XY);
+        let origin = laid_out_pivot(&app);
+        let tip_x = arm_tip(&app, gizmo::Axis::X);
+        let tip_y = arm_tip(&app, gizmo::Axis::Y);
+
+        // The square, not the arms threading through it, is what the cursor is
+        // over — and the press grabs it for the whole gesture.
+        step(&ctx, &mut app, frame(1.0, grab, None));
+        assert_eq!(
+            app.gizmo.hovered,
+            Some(gizmo::Handle::Plane(gizmo::Plane::XY)),
+            "the square wins over the arms"
+        );
+        let before = app.scene.get(id).unwrap().transform;
+        step(&ctx, &mut app, frame(2.0, grab, Some(true)));
+        assert_eq!(app.gizmo.active, Some(gizmo::Handle::Plane(gizmo::Plane::XY)));
+
+        // Drag out along both of the plane's arms at once.
+        let out = grab + (tip_x - origin) + (tip_y - origin);
+        step(&ctx, &mut app, frame(3.0, out, None));
+        step(&ctx, &mut app, frame(4.0, out, Some(false)));
+        assert!(!app.gizmo.is_dragging());
+
+        let d = app.scene.get(id).unwrap().transform.translation - before.translation;
+        assert!(d.length() > 0.05, "the square moved the node: {d:?}");
+        assert!(d.z.abs() < 1e-3, "an XY drag leaves Z alone: {d:?}");
+        assert!(
+            d.x > 0.02 && d.y > 0.02,
+            "and travels along both of the plane's axes: {d:?}"
+        );
+
+        // The whole gesture is one undo entry, and it puts the node back.
+        app.undo_edit();
+        assert!(
+            (app.scene.get(id).unwrap().transform.translation - before.translation).length()
+                < 1e-6
+        );
+    }
+
+    #[test]
+    fn the_centre_handle_moves_the_selection_across_the_screen() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        let origin = laid_out_pivot(&app);
+        let before = app.scene.get(id).unwrap().transform;
+        step(&ctx, &mut app, frame(1.0, origin, None));
+        assert_eq!(app.gizmo.hovered, Some(gizmo::Handle::Centre));
+        step(&ctx, &mut app, frame(2.0, origin, Some(true)));
+        assert_eq!(app.gizmo.active, Some(gizmo::Handle::Centre));
+
+        let out = origin + egui::vec2(90.0, -50.0);
+        step(&ctx, &mut app, frame(3.0, out, None));
+        step(&ctx, &mut app, frame(4.0, out, Some(false)));
+
+        let d = app.scene.get(id).unwrap().transform.translation - before.translation;
+        assert!(d.length() > 0.05, "the centre handle moved the node: {d:?}");
+        // It works in the plane facing the camera: nothing goes towards or
+        // away from the eye, however the view is orbited.
+        let forward = app.camera.forward();
+        assert!(d.dot(forward).abs() < 0.02, "stays in the view plane: {d:?}");
+        // A view plane is not a world plane, so the motion has a share of at
+        // least two world axes.
+        let busy = [d.x, d.y, d.z].iter().filter(|v| v.abs() > 1e-3).count();
+        assert!(busy >= 2, "the drag is not along one world axis: {d:?}");
+        // And it follows the screen: right and down does not undo itself.
+        assert!(d.length() > 0.2, "the drag went a distance: {d:?}");
+    }
+
+    #[test]
+    fn the_scale_gizmo_scales_in_a_plane_and_uniformly_from_its_centre() {
+        let ctx = egui::Context::default();
+
+        // A plane square scales its own two axes and leaves the third at 1.
+        let (mut app, id) = app_ready_to_move();
+        app.tool = ActiveTool::Scale;
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        let grab = plane_centre(&app, gizmo::Plane::XY);
+        step(&ctx, &mut app, frame(1.0, grab, Some(true)));
+        assert_eq!(app.gizmo.active, Some(gizmo::Handle::Plane(gizmo::Plane::XY)));
+        // Push the square away from the gizmo origin, so the ratio grows.
+        let origin = laid_out_pivot(&app);
+        let out = grab + (grab - origin) * 0.6;
+        step(&ctx, &mut app, frame(2.0, out, None));
+        step(&ctx, &mut app, frame(3.0, out, Some(false)));
+
+        let scaled = app.scene.get(id).unwrap().transform.scale;
+        let before = app.scene.get(id).unwrap().transform.translation;
+        assert!(scaled.x > 1.05 && scaled.y > 1.05, "both of its axes grew: {scaled:?}");
+        assert!((scaled.x - scaled.y).abs() < 1e-3, "by the same factor: {scaled:?}");
+        assert!((scaled.z - 1.0).abs() < 1e-4, "the third axis is untouched: {scaled:?}");
+        assert!(
+            (app.scene.get(id).unwrap().transform.translation - before).length() < 1e-5,
+            "scaling does not move the node"
+        );
+
+        // The centre handle scales all three at once.
+        let (mut app, id) = app_ready_to_move();
+        app.tool = ActiveTool::Scale;
+        step(&ctx, &mut app, frame(4.0, egui::pos2(500.0, 350.0), None));
+        let origin = laid_out_pivot(&app);
+        // Grab just off the middle — right on it there is no ratio to measure.
+        let grab = origin + egui::vec2(7.0, 7.0);
+        step(&ctx, &mut app, frame(5.0, grab, Some(true)));
+        assert_eq!(app.gizmo.active, Some(gizmo::Handle::Centre), "the centre wins");
+        let out = origin + egui::vec2(70.0, 70.0);
+        step(&ctx, &mut app, frame(6.0, out, None));
+        step(&ctx, &mut app, frame(7.0, out, Some(false)));
+
+        let scaled = app.scene.get(id).unwrap().transform.scale;
+        assert!(scaled.x > 1.2, "the centre scaled the node up: {scaled:?}");
+        assert!(
+            (scaled.x - scaled.y).abs() < 1e-3 && (scaled.y - scaled.z).abs() < 1e-3,
+            "uniformly, in all three axes: {scaled:?}"
+        );
+    }
+
+
+    #[test]
     fn the_move_gizmo_paints_one_stroke_per_axis() {
         let ctx = egui::Context::default();
         let (mut app, _id) = app_ready_to_move();
 
         // With no gizmo drawn, the frame is just the grid and the mesh.
         app.tool = ActiveTool::Select;
-        let (plain, _) = stroked(&paint_once(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None)));
+        let (plain, plain_paths) =
+            stroked(&paint_once(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None)));
 
         app.tool = ActiveTool::Move;
-        let (armed, _) = stroked(&paint_once(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None)));
+        let (armed, armed_paths) =
+            stroked(&paint_once(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None)));
         assert_eq!(
             armed,
             plain + 3,
             "the Move gizmo adds exactly three axis arms"
         );
+        assert_eq!(
+            armed_paths,
+            plain_paths + 3,
+            "and exactly the three plane squares the cursor can grab"
+        );
+
+        // Every plane square the layout hit-tests is also one that gets painted,
+        // so a square can never be grabbed where it is not drawn.
+        let layout = app.gizmo.layout.as_ref().expect("handles are laid out");
+        assert_eq!(layout.planes.len(), 3, "one square per coordinate plane");
+        for plane in gizmo::Plane::ALL {
+            assert!(layout.planes.iter().any(|(p, _)| *p == plane), "{plane:?} is drawn");
+        }
     }
 
     #[test]
@@ -8294,6 +8552,40 @@ mod tests {
         // With nothing selected it falls back to the material the panel edits.
         app.selection.clear();
         assert_eq!(app.uv_background_texture(), Some(index));
+    }
+
+    #[test]
+    fn the_properties_panel_shows_rotation_and_scale_as_editable_numbers() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        // Turn the node a quarter turn about Y and stretch it unevenly, so the
+        // fields under test cannot be reading a default.
+        {
+            let node = app.scene.get_mut(id).unwrap();
+            node.transform.set_euler_degrees([0.0, 45.0, 0.0]);
+            node.transform.scale = Vec3::new(2.0, 3.0, 4.0);
+        }
+
+        // The panel on its own, so the labels read back are its own.
+        let output = ctx.run(frame(0.0, egui::pos2(500.0, 350.0), None), |ctx| {
+            app.handle_side_panels(ctx);
+        });
+        let labels = painted_labels(&output.shapes);
+
+        // One rotation field per axis, in degrees, reading the node's own
+        // rotation back as the Euler triple that wrote it.
+        let degree_fields: Vec<&String> =
+            labels.iter().filter(|label| label.ends_with('°')).collect();
+        assert_eq!(degree_fields.len(), 3, "a degree field per axis: {labels:?}");
+        assert!(
+            degree_fields.iter().any(|label| label.contains("45")),
+            "the rotation reads 45 degrees about Y: {degree_fields:?}"
+        );
+        // And one scale field per axis, showing the node's own scale.
+        assert!(
+            labels.iter().filter(|label| label.contains("3.0")).count() >= 1,
+            "the scale row shows the node's scale: {labels:?}"
+        );
     }
 
     #[test]

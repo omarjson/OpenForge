@@ -51,6 +51,14 @@ impl Camera {
         self.target + Vec3::new(cy * cp, sp, sy * cp) * self.distance
     }
 
+    /// The direction the camera looks in, from the eye towards the target.
+    ///
+    /// This is the normal of the screen plane, which is what the gizmo's centre
+    /// handle drags in: a move there follows the cursor across the image.
+    pub fn forward(&self) -> Vec3 {
+        (self.target - self.eye()).normalize_or_zero()
+    }
+
     pub fn view_matrix(&self) -> Mat4 {
         Mat4::look_at_rh(self.eye(), self.target, Vec3::Y)
     }
