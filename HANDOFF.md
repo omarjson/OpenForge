@@ -23,8 +23,8 @@ deepening the host (dynamic plugin loading, behaviour-carrying services).
 - **Clean-room only.** Never decompile, reverse, or bypass the `zmStoneGuard.dll`
   DRM. Never copy proprietary ZModeler code. Inspiration from public behavior/
   architecture is fine; transliterating protected code is not.
-- **Standard formats only.** Support OBJ, glTF/GLB, PLY, STL, COLLADA and OFF (and other open
-  formats). Do **not** implement the proprietary `.z3d` format.
+- **Standard formats only.** Support OBJ, glTF/GLB, PLY, STL, COLLADA, OFF and FBX
+  (ASCII) (and other open formats). Do **not** implement the proprietary `.z3d` format.
 - **Cross-platform.** Must build and test on Windows, macOS, and Linux. CI runs
   all three.
 - Push to `https://github.com/omarjson/OpenForge.git` (private repo, default
@@ -42,12 +42,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 13 crates (640 `#[test]` fns; 643 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 13 crates (650 `#[test]` fns; 653 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
 | `openforge-core` | 50 | `Mesh`, `Scene`, nodes, selection, undo (a stack generic over its snapshot, so the app restores a scene and its clip library together), tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). |
-| `openforge-io` | 23 | Import/export: OBJ, glTF/GLB, PLY, STL, COLLADA (a hand-written XML subset reader) and OFF. |
+| `openforge-io` | 33 | Import/export: OBJ, glTF/GLB, PLY, STL, COLLADA (a hand-written XML subset reader), OFF and FBX ASCII (a hand-written reader for the FBX text schema — node tree, complement-closed n-gons, the normal/UV/material layers — plus a writer for the same subset). |
 | `openforge-ops` | 19 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**, and **grid-cluster decimation** (`decimate_clustered`) for LOD chains. |
 | `openforge-materials` | 35 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays). |
 | `openforge-render` | 102 | Camera/vertex/uniform plumbing **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples**, **an ID pass that resolves exactly what the frame draws when picking — faces as triangles, edges as lines, vertices as points, through a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
@@ -396,12 +396,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **643 tests pass** (640 `#[test]`
+workspace builds with **0 warnings**, **653 tests pass** (650 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Thirty-three work-streams are done — the engine layer from the **wgpu
+Thirty-four work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
-through the **preferences file** (#33), each narrated further down — plus a
+through **FBX (ASCII)** (#34), each narrated further down — plus a
 progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
@@ -512,7 +512,7 @@ progress report:
   (named capabilities), a tool registry of **factories** (`fn() -> Box<dyn Tool>`,
   because a `Tool` carries an in-progress drag and sharing it would leak that
   state) and a `FilterRegistry` that dispatches import/export on a file's
-  extension. The engine's own four tools and six formats are ordinary plugins
+  extension. The engine's own four tools and seven formats are ordinary plugins
   (`CoreToolsPlugin`, `InterchangePlugin`) registered by `builtin_host()`, so
   the app never names a tool or a format again: `active_tool()` asks
   `host.make_tool(name)` and `import_file`/`export_selected` call
@@ -539,7 +539,7 @@ progress report:
   import until one plugin is registered and works afterwards, a plugin trying to
   steal `obj` being rejected with the host unchanged, the active tool coming
   from `make_tool`, and the Plugins panel's report listing exactly the two
-  built-ins, three services, four tools and six formats.
+  built-ins, three services, four tools and seven formats.
 
 - **Materials are wired through to the pixels.** `openforge-materials` already
   had `Material`, `MaterialLibrary` and textures; nothing used them, and
@@ -1026,11 +1026,11 @@ progress report:
   - **Formats come from the registry** in the UI as well as in the plumbing:
     the open dialog carries one filter group per registered format, **Export
     selected as ▸** lists them by label (Wavefront OBJ, glTF 2.0, Stanford PLY,
-    STL, COLLADA, OFF) and saves with a matching default file name, so a plugin's format
+    STL, COLLADA, OFF, FBX (ASCII)) and saves with a matching default file name, so a plugin's format
     appears in the menus with no app change.
   - **Refusals name what would have worked**: a path no filter knows is turned
     down before anything is read or written — "Skipped a.foo — no filter knows
-    it (dae, glb, gltf, obj, off, ply, stl)." / "Can't export to a.foo — …" — and every
+    it (dae, fbx, glb, gltf, obj, off, ply, stl)." / "Can't export to a.foo — …" — and every
     status names the file and the format ("Imported 2 mesh(es) from scene.obj
     (Wavefront OBJ).", "Exported Cube to cube.obj (Wavefront OBJ).").
   - **Export refuses ambiguity**: more than one selected mesh node is "Select
@@ -1115,7 +1115,7 @@ progress report:
     them while the plugin is off, so a user sees what re-enabling restores.
   - **The refusals follow the active set.** `unknown_format_line` (shared by
     the import and the export path) names the known formats ("no filter knows
-    it (glb, gltf, obj, ply, stl).") or, with every format plugin off, says
+    it (dae, fbx, glb, gltf, obj, off, ply, stl).") or, with every format plugin off, says
     exactly that ("Skipped x.stl — every format plugin is disabled (see the
     Plugins panel).").
 
@@ -1444,9 +1444,55 @@ progress report:
   with no path, which stays in memory and says so) plus the
   close-the-window-writes-it rule — an open window writes nothing.
 
+- **FBX (ASCII)** (work-stream #34). The seventh format, and the first that
+  arrives as a text *schema* rather than a line list or an XML tree: FBX is a
+  tree of nodes written `Name: prop { … }`, its arrays a `*count` over an `a:`
+  list, and its long lists wrapped over several lines.
+  - **`openforge-io` grew a hand-written reader for that tree** — nested
+    blocks, quoted strings (escapes included), `;` comments that stop at a
+    quote, the `~i` complement some writers use where others write the
+    negative directly, and a value line that is joined back onto the array it
+    continues. It reads the parts of the schema a mesh needs: `Objects` →
+    `Geometry` with `Vertices`, `PolygonVertexIndex` — where the last corner
+    of every polygon is its bitwise complement, a negative number, and that is
+    what closes an n-gon — and the `LayerElementNormal`, `LayerElementUV` and
+    `LayerElementMaterial` layers. A layer names its values **per polygon
+    vertex or per control point**, directly or through its index array; all
+    four combinations read, and a layer that does not cover its corners is a
+    refusal rather than a guess. Corners de-duplicate by (position, normal,
+    uv) into parallel arrays exactly as the OBJ reader does, a file with no
+    normals gets smooth ones, and a `Model`'s transforms, the `Materials`
+    section and its connections and animation stay out of scope — the same
+    line COLLADA draws, and the same honest gap named below.
+  - **The writer emits one Y-up geometry per mesh** with a `Model` connected
+    to it: `Vertices`, `PolygonVertexIndex` closing each polygon with a
+    complement (the mesh's own n-gons kept), a `ByPolygonVertex` normal layer,
+    a UV layer when the mesh has UVs, and a material layer that is `AllSame`,
+    or `ByPolygon` when the faces carry different slots. Export then import
+    keeps positions, n-gons, per-corner normals and UVs and the material
+    slots.
+  - **`openforge-plugin` registers it as an ordinary engine filter** (`fbx`,
+    label `FBX (ASCII)`, both directions), so the dialogs, the extension
+    dispatch, the refusal messages and the Plugins panel pick it up with no
+    app change. The format counts and the interchange plugin's description
+    move from six to seven, and the app's own round-trip test now drives FBX
+    beside COLLADA and OFF.
+- **10 new tests**: a realistic document with a quad and a triangle sharing
+  control points (complement-split polygons, a direct normal layer, a UV layer
+  through `UVIndex`, per-polygon slots, and the shared control point *not*
+  merging the two polygons' corners), wrapped arrays with a comment between
+  the values, control-point UVs, several geometries becoming several meshes,
+  an export/import round trip of a quad with its own normals and UVs, n-gons
+  and material slots surviving a round trip, the single-material layer, a
+  table of eight refusals (an empty file, a comment-only file, no `Objects`,
+  a `Vertices` list that is not a multiple of three, an index past the end, a
+  two-corner polygon, an unclosed polygon, an unterminated block) plus a layer
+  that runs off its corners, and the integration test's real file, written and
+  read back through the registry.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **643 pass, 0 failures**
+build too); `cargo test --workspace` → **653 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The #30 windows are
 measured headless too: the theme is asserted on a bare egui context, the
 grid's lines are counted through a real view-projection with the grid on and
@@ -1525,9 +1571,10 @@ plugin goes, the full list when it returns. And a key edit is a step of the
 scene's own stack now: the snapshot carries the clip library, so undo after a
 retime or a delete puts the *clip* back, not just the scene. The weight tools
 are measured the same way: assign, blend and smooth in the rig crate, the
-app's refusals and counts, and undo restoring the weights. The six formats are
-measured through the registry and the filesystem: both new ones round-trip the
-app's own export/import statuses and the integration test's real files.
+app's refusals and counts, and undo restoring the weights. The seven formats
+are measured through the registry and the filesystem: the COLLADA, OFF and
+FBX ones round-trip the app's own export/import statuses, and every format the
+integration test carries goes out to a real file and back.
 **Not verified:** how the window actually looks, and the gizmo, the UV canvas,
 the new Plugins panel, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **per-face material shading on the GPU
@@ -1600,7 +1647,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **74.8%**, shown as 74%). The engine
+16 curated areas is **75.0%**, shown as 75%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1628,7 +1675,9 @@ shell (theme, ground grid, camera speeds, the key table) as of #30, and the
 project format (the whole document — scene, materials and clips, and the rig
 since #32 — in one versioned file) as of #31, and the preferences file (the
 window's choices surviving a restart, in the platform's config directory) as
-of #33.
+of #33, and FBX ASCII (a hand-written reader and writer for the FBX text
+schema: node tree, complement-closed n-gons, per-corner normals and UVs,
+material slots, seven formats) as of #34.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1659,7 +1708,9 @@ Prioritized next steps:
    behaviour, and plugins are compiled in rather than *loaded* — a
    `cdylib`/WASM filter discovered at runtime is the real prize. That is the
    long road to true parity.
-5. **IO expansion.** COLLADA/DAE and OFF landed in #29; ASCII FBX, USDZ and
+5. **IO expansion.** COLLADA/DAE and OFF landed in #29 and ASCII FBX in #34
+   (the geometry subset: node transforms, the `Materials` section and its
+   connections and animation are out of scope); USDZ, FBX's binary form and
    more of the COLLADA schema (node transforms, effects, animation) widen
    coverage next.
 6. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
@@ -1687,7 +1738,7 @@ window-layout memory, and ZModeler's deeper dialogs have no home yet), the
 project file's own conveniences (a recent-projects list, a dirty marker in
 the title), animation *authoring* beyond the key row (per-key
 easing edits, a curve view, clip-level tools), and exact format breadth
-(six formats, none proprietary; COLLADA is the geometry subset, without
+(seven formats, none proprietary; COLLADA and FBX are geometry subsets, without
 node transforms, effects or animation) remain the largest deltas and are many
 work-streams, not one push.
 

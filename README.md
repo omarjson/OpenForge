@@ -9,7 +9,7 @@ A clean-room, open-source 3D modeling application written in Rust, targeting
 > copies **no proprietary code**, assets, or file-format secrets. Concepts and UI
 > layouts are not copyrightable; the code here is written from scratch. It uses
 > only **standard, openly-documented interchange formats** (OBJ, glTF 2.0, PLY,
-> STL, COLLADA, OFF). It does **not** implement any proprietary/DRM-protected game formats and
+> STL, COLLADA, OFF, FBX ASCII). It does **not** implement any proprietary/DRM-protected game formats and
 > does not interact with any anti-tamper system.
 
 ## Architecture
@@ -19,7 +19,7 @@ The project is a Cargo workspace of thirteen crates; these are the main layers:
 | Crate | Role | Notes |
 |-------|------|-------|
 | `openforge-core` | Scene graph, geometry, editing model | GUI- and renderer-agnostic. Nodes, meshes, selection, undo/redo, interactive tools, ray picking. |
-| `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL, COLLADA, OFF. Clean-room readers and writers. |
+| `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII. Clean-room readers and writers. |
 | `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per face, and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew, down to single faces, edges and vertices. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-project` | Project files | One versioned JSON document — the scene, the material library (textures as base64) and the animation clips — with its own document structs and a bridge to the engine types. Ids never reach the file: references are positions in a parents-first node list. |
@@ -245,8 +245,8 @@ A sample GitHub Actions matrix is shown below.
   duplicate it. Assigned meshes are shaded with that material in both viewports.
   The outliner's **Visible** box hides or shows one node — one undo step, the
   same edit H makes.
-- **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY, STL, COLLADA
-  and OFF. Both go
+- **File → Import/Export** loads and saves OBJ, glTF/GLB, PLY, STL, COLLADA,
+  OFF and FBX ASCII. Both go
   through the plugin host's filter registry, so a third-party filter for another
   extension needs no change to the app: the open dialog is grouped by format,
   **Export selected as ▸** picks the format by name, and dropping files on the
@@ -303,8 +303,9 @@ mostly application surface. Natural next steps:
 - The app's settings persist across runs now (the platform's config
   directory); what remains here is window-layout memory, an asset browser and
   the deeper panel/dialog surface.
-- More standard formats (FBX-ascii, USDZ, glTF extensions) and a fuller
-  COLLADA (node transforms, effects, animation) behind the same `openforge-io` traits.
+- More standard formats (USDZ, binary FBX, glTF extensions) and a fuller
+  COLLADA and FBX (node transforms, effects, animation, the FBX `Materials`
+  section) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) behind the host seam, which already
   mirrors the study architecture's service/tool/filter split.
 
