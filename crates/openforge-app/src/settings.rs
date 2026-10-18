@@ -67,6 +67,10 @@ pub struct Settings {
     pub orbit_speed: f32,
     pub pan_speed: f32,
     pub zoom_speed: f32,
+    /// Project files opened or saved recently, most recent first. Machine
+    /// state like the rest of the file — the File menu's Open Recent reads
+    /// it — so it follows the user rather than the document.
+    pub recent_files: Vec<String>,
 }
 
 impl Default for Settings {
@@ -79,6 +83,7 @@ impl Default for Settings {
             orbit_speed: 1.0,
             pan_speed: 1.0,
             zoom_speed: 1.0,
+            recent_files: Vec::new(),
         }
     }
 }
@@ -153,6 +158,42 @@ impl Settings {
     /// Back to the startup choices.
     pub fn reset(&mut self) {
         *self = Settings::default();
+    }
+
+    /// How many recent projects the list keeps.
+    pub const RECENT_LIMIT: usize = 8;
+
+    /// Note `path` as the most recently used project: it moves to the front
+    /// (or is added there), the list is de-duplicated by path and capped.
+    /// `true` when the list actually changed, so a caller can skip a
+    /// redundant write.
+    pub fn remember_recent(&mut self, path: &Path) -> bool {
+        let entry = path.to_string_lossy().into_owned();
+        let before = self.recent_files.clone();
+        self.recent_files.retain(|recent| recent != &entry);
+        self.recent_files.insert(0, entry);
+        self.recent_files.truncate(Self::RECENT_LIMIT);
+        self.recent_files != before
+    }
+
+    /// Drop one path from the list (a file that turned out to be gone).
+    pub fn forget_recent(&mut self, path: &Path) -> bool {
+        let entry = path.to_string_lossy();
+        let before = self.recent_files.len();
+        self.recent_files.retain(|recent| recent.as_str() != entry.as_ref());
+        self.recent_files.len() != before
+    }
+
+    /// Empty the list (File ▸ Open Recent ▸ Clear the list).
+    pub fn clear_recent(&mut self) -> bool {
+        let changed = !self.recent_files.is_empty();
+        self.recent_files.clear();
+        changed
+    }
+
+    /// The recent projects as paths, newest first.
+    pub fn recent_paths(&self) -> Vec<PathBuf> {
+        self.recent_files.iter().map(PathBuf::from).collect()
     }
 
     /// The file name the preferences live under, inside the platform's
@@ -387,6 +428,51 @@ mod tests {
     }
 
     #[test]
+    fn the_recent_list_moves_dedupes_and_caps() {
+        let mut settings = Settings::default();
+        assert!(settings.recent_files.is_empty());
+        assert!(!settings.clear_recent(), "nothing to clear changes nothing");
+
+        let first = Path::new("/work/one.ofproj");
+        assert!(settings.remember_recent(first), "a new entry changes the list");
+        assert_eq!(settings.recent_paths(), vec![PathBuf::from(first)]);
+        assert!(!settings.remember_recent(first), "the same path is not a second entry");
+        assert_eq!(settings.recent_files.len(), 1);
+
+        let second = Path::new("/work/two.ofproj");
+        settings.remember_recent(second);
+        assert_eq!(
+            settings.recent_paths(),
+            vec![PathBuf::from(second), PathBuf::from(first)],
+            "newest first"
+        );
+        settings.remember_recent(first);
+        assert_eq!(
+            settings.recent_paths(),
+            vec![PathBuf::from(first), PathBuf::from(second)],
+            "re-using one moves it to the front"
+        );
+
+        for i in 0..Settings::RECENT_LIMIT + 3 {
+            settings.remember_recent(Path::new(&format!("/work/{i}.ofproj")));
+        }
+        assert_eq!(settings.recent_files.len(), Settings::RECENT_LIMIT, "the list is capped");
+        assert_eq!(
+            settings.recent_paths()[0],
+            PathBuf::from("/work/10.ofproj"),
+            "and keeps the newest"
+        );
+
+        assert!(settings.forget_recent(Path::new("/work/10.ofproj")));
+        assert!(
+            !settings.forget_recent(Path::new("/work/nothing.ofproj")),
+            "forgetting a path that is not in the list changes nothing"
+        );
+        assert!(settings.clear_recent());
+        assert!(settings.recent_files.is_empty());
+    }
+
+    #[test]
     fn settings_survive_a_json_round_trip() {
         let settings = Settings {
             theme: Theme::Light,
@@ -396,11 +482,13 @@ mod tests {
             orbit_speed: 1.5,
             pan_speed: 0.5,
             zoom_speed: 2.0,
+            recent_files: vec!["/work/thing.ofproj".to_string()],
         };
         let json = settings.to_json();
         assert!(json.ends_with('\n'), "the file ends its last line");
         assert!(json.contains("\"light\""), "the theme is stored by name: {json}");
         assert!(json.contains("\"grid_step\": 2.5"), "{json}");
+        assert!(json.contains("\"recent_files\""), "the recent list rides the file: {json}");
         let back = Settings::from_json(&json).expect("the writer's own output parses");
         assert_eq!(back, settings);
         assert_eq!(

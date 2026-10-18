@@ -126,6 +126,21 @@ struct PendingFile {
     options: FileOptions,
 }
 
+/// An action the discard guard is holding until the user answers.
+///
+/// The guard is the one place that asks before unsaved edits are thrown
+/// away: New, a chosen project file, and closing the window all pass through
+/// it. Discard runs the action, Cancel forgets it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Guard {
+    /// File ▸ New.
+    New,
+    /// A project file chosen from the dialog or the recent list.
+    Open(PathBuf),
+    /// File ▸ Quit, or the window's own close button.
+    Quit,
+}
+
 fn default_materials() -> MaterialLibrary {
     let mut library = MaterialLibrary::new();
     for (name, rgb, shininess, specular) in [
@@ -288,6 +303,13 @@ pub struct OpenForgeApp {
     edit_before: Option<Scene>,
     status: String,
     current_file: Option<PathBuf>,
+    /// Whether the document holds edits that are not in a file yet: the
+    /// title's star, and what the discard guard asks about.
+    modified: bool,
+    /// The title the window was last handed, so a change is sent once.
+    window_title: Option<String>,
+    /// An action the discard guard is holding until the user answers.
+    pending_guard: Option<Guard>,
     /// Cached triangles for the frame being painted (CPU viewport only).
     tris: Vec<viewport::Tri>,
     /// The wgpu viewport, when eframe is running the wgpu backend.
@@ -427,6 +449,9 @@ impl OpenForgeApp {
                 "{backend} viewport. Left-drag selects; W/E/R show the transform gizmo; middle-drag orbits; scroll zooms."
             ),
             current_file: None,
+            modified: false,
+            window_title: None,
+            pending_guard: None,
             tris: Vec::new(),
             gpu,
             uv: UvEditor::default(),
@@ -531,6 +556,7 @@ impl OpenForgeApp {
         if !after.same(&before) {
             self.undo.push(label, before, after);
             self.dirty = true;
+            self.modified = true;
         }
     }
 
@@ -563,6 +589,8 @@ impl OpenForgeApp {
             rig: after.rig.clone(),
         };
         self.undo.push(label, before, after);
+        self.dirty = true;
+        self.modified = true;
     }
 
     /// Put a snapshot's rig back into the app's rig fields.
@@ -590,6 +618,7 @@ impl OpenForgeApp {
         self.selection.clear();
         self.undo.clear();
         self.current_file = None;
+        self.modified = false;
         self.status = "New scene.".into();
         self.dirty = true;
     }
@@ -1205,6 +1234,7 @@ impl OpenForgeApp {
             self.key_selected = None;
             self.key_drag = None;
             self.dirty = true;
+            self.modified = true;
             self.status = format!(
                 "Undo{}",
                 self.undo.undo_label().map(|l| format!(": {}", l)).unwrap_or_default()
@@ -1221,6 +1251,7 @@ impl OpenForgeApp {
             self.key_selected = None;
             self.key_drag = None;
             self.dirty = true;
+            self.modified = true;
             self.status = format!(
                 "Redo{}",
                 self.undo.redo_label().map(|l| format!(": {}", l)).unwrap_or_default()
@@ -1345,11 +1376,38 @@ impl OpenForgeApp {
                     Self::file_label(&path),
                     project.summary().describe()
                 );
-                self.current_file = Some(path);
+                self.current_file = Some(path.clone());
+                self.modified = false;
+                self.remember_recent(&path);
             }
             Err(error) => {
                 self.status =
                     format!("Could not save project to {}: {error}.", Self::file_label(&path));
+            }
+        }
+    }
+
+    /// Note a project file as recently used, filing the list away between
+    /// runs. Quiet: the caller's own status line (the save or open message)
+    /// is the one the user should read.
+    fn remember_recent(&mut self, path: &Path) {
+        if self.settings.remember_recent(path) {
+            self.store_settings();
+        }
+    }
+
+    /// Write the settings file without touching the status line. `false`
+    /// when there is nowhere to write, or the write failed (the reason is
+    /// logged); [`Self::save_settings`] is the version that says so.
+    fn store_settings(&mut self) -> bool {
+        let Some(path) = self.settings_path.clone() else {
+            return false;
+        };
+        match self.settings.save(&path) {
+            Ok(()) => true,
+            Err(error) => {
+                log::warn!("could not save settings at {}: {error}", path.display());
+                false
             }
         }
     }
@@ -1372,13 +1430,49 @@ impl OpenForgeApp {
     }
 
     /// Ask for a project file and open it (File ▸ Open Project…, Ctrl+O).
+    ///
+    /// The file is picked before the guard asks anything, so a cancelled
+    /// dialog never leaves a question behind.
     fn open_project(&mut self) {
         let groups = vec![(
             "OpenForge project".to_string(),
             vec![openforge_project::EXTENSION.to_string()],
         )];
         if let Some(path) = rfd_pick_file(groups) {
+            self.open_or_guard(path);
+        }
+    }
+
+    /// Open a project file now, or park it behind the discard guard when the
+    /// document has unsaved edits.
+    fn open_or_guard(&mut self, path: PathBuf) {
+        if self.modified {
+            self.pending_guard = Some(Guard::Open(path));
+        } else {
             self.open_project_from(path);
+        }
+    }
+
+    /// Open one of the recent projects. A file that is no longer there says
+    /// so and drops off the list rather than opening nothing.
+    fn open_recent(&mut self, path: PathBuf) {
+        if !path.exists() {
+            self.settings.forget_recent(&path);
+            self.store_settings();
+            self.status = format!(
+                "{} is no longer there — it was dropped from the recent list.",
+                Self::file_label(&path)
+            );
+            return;
+        }
+        self.open_or_guard(path);
+    }
+
+    /// Empty the recent list (File ▸ Open Recent ▸ Clear the list).
+    fn clear_recent(&mut self) {
+        if self.settings.clear_recent() {
+            self.status = "Cleared the recent project list.".into();
+            self.store_settings();
         }
     }
 
@@ -1407,7 +1501,9 @@ impl OpenForgeApp {
                 self.undo.clear();
                 self.key_selected = None;
                 self.key_drag = None;
-                self.current_file = Some(path);
+                self.current_file = Some(path.clone());
+                self.modified = false;
+                self.remember_recent(&path);
                 self.dirty = true;
                 self.status = format!("Opened project {label} ({summary}).");
             }
@@ -1558,6 +1654,111 @@ impl OpenForgeApp {
         path.file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string())
+    }
+
+    /// The window title: the document's name, a star while it holds edits
+    /// that are not in a file yet, and `Untitled` for a document that has
+    /// never been saved.
+    fn title(&self) -> String {
+        let name = match &self.current_file {
+            Some(path) => Self::file_label(path),
+            None => "Untitled".to_string(),
+        };
+        let star = if self.modified { " *" } else { "" };
+        format!("OpenForge — {name}{star}")
+    }
+
+    /// Hand the window its title when it has changed, so a frame that does
+    /// not touch the document sends nothing.
+    fn sync_title(&mut self, ctx: &egui::Context) {
+        let title = self.title();
+        if self.window_title.as_deref() != Some(title.as_str()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.window_title = Some(title);
+        }
+    }
+
+    /// Ask to quit (File ▸ Quit), through the discard guard.
+    fn request_quit(&mut self, ctx: &egui::Context) {
+        if self.modified {
+            self.pending_guard = Some(Guard::Quit);
+        } else {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    /// Run the action the discard guard was holding.
+    fn run_guard(&mut self, action: Guard, ctx: &egui::Context) {
+        match action {
+            Guard::New => self.new_scene(),
+            Guard::Open(path) => self.open_project_from(path),
+            Guard::Quit => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+        }
+    }
+
+    /// The guard's Discard: let the held action run.
+    fn discard_guard(&mut self, ctx: &egui::Context) {
+        if let Some(action) = self.pending_guard.take() {
+            self.run_guard(action, ctx);
+        }
+    }
+
+    /// The guard's Cancel: keep the document and say so.
+    fn cancel_guard(&mut self) {
+        if self.pending_guard.take().is_some() {
+            self.status = format!("Kept the unsaved changes to {}.", self.document_name());
+        }
+    }
+
+    /// What the status line and the guard call the document: its file's
+    /// name, or "This scene" while it has never been saved.
+    fn document_name(&self) -> String {
+        match &self.current_file {
+            Some(path) => Self::file_label(path),
+            None => "This scene".to_string(),
+        }
+    }
+
+    /// The unsaved-changes guard: a modal that holds New, Open and Quit
+    /// until the user says the edits may go.
+    ///
+    /// Discard runs the action and Cancel puts it back, so a stray click
+    /// never loses work. There is no Save button here: saving is Ctrl+S, and
+    /// a guard that opened a file dialog would have to answer what happens
+    /// when *that* is cancelled.
+    fn handle_guard(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.pending_guard.clone() else {
+            return;
+        };
+        let name = self.document_name();
+        let mut discard = false;
+        let mut cancel = false;
+        egui::Window::new("Unsaved changes")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .show(ctx, |ui| {
+                ui.label(format!("{name} has unsaved changes."));
+                ui.label(if matches!(action, Guard::Quit) {
+                    "Quit and discard them?"
+                } else {
+                    "Discard them?"
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Discard").clicked() {
+                        discard = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if discard {
+            self.discard_guard(ctx);
+        } else if cancel {
+            self.cancel_guard();
+        }
     }
 
     /// The registered formats as file-dialog filter groups, `(label,
@@ -2916,6 +3117,16 @@ impl OpenForgeApp {
 
 impl eframe::App for OpenForgeApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.draw(ctx, frame.wgpu_render_state());
+    }
+}
+
+impl OpenForgeApp {
+    /// One frame of the whole application surface: everything the window
+    /// draws and handles, with the wgpu render state passed in rather than
+    /// read from `eframe::Frame`, so a headless test drives the same frame
+    /// the window does.
+    fn draw(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) {
         // Preferences first: the theme has to be on the context before
         // anything styles itself this frame.
         self.apply_settings(ctx);
@@ -2935,12 +3146,21 @@ impl eframe::App for OpenForgeApp {
         self.handle_uv_editor(ctx);
         self.handle_timeline(ctx);
         self.handle_file_dialog(ctx);
+        self.handle_guard(ctx);
         self.handle_side_panels(ctx);
         self.handle_preferences(ctx);
         self.handle_shortcuts_window(ctx);
         self.handle_about_window(ctx);
-        self.handle_central_viewport(ctx, frame.wgpu_render_state());
+        self.handle_central_viewport(ctx, render_state);
         self.import_dropped_files(ctx);
+        // The window's own close button goes through the same guard as File
+        // ▸ Quit: hold the close, ask, and close on Discard. Without edits
+        // the close simply goes through.
+        if ctx.input(|input| input.viewport().close_requested()) && self.modified {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_guard = Some(Guard::Quit);
+        }
+        self.sync_title(ctx);
         if self.dirty {
             ctx.request_repaint();
             self.dirty = false;
@@ -2953,8 +3173,16 @@ impl OpenForgeApp {
         egui::TopBottomPanel::top("menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() {
-                        self.new_scene();
+                    if ui
+                        .button("New")
+                        .on_hover_text("Start an empty document")
+                        .clicked()
+                    {
+                        if self.modified {
+                            self.pending_guard = Some(Guard::New);
+                        } else {
+                            self.new_scene();
+                        }
                         ui.close_menu();
                     }
                     ui.separator();
@@ -2968,6 +3196,29 @@ impl OpenForgeApp {
                         self.open_project();
                         ui.close_menu();
                     }
+                    ui.menu_button("Open Recent", |ui| {
+                        if self.settings.recent_files.is_empty() {
+                            ui.add_enabled(false, egui::Button::new("No recent projects"));
+                        }
+                        for path in self.settings.recent_paths() {
+                            let label = Self::file_label(&path);
+                            if ui
+                                .button(label)
+                                .on_hover_text(path.display().to_string())
+                                .clicked()
+                            {
+                                self.open_recent(path);
+                                ui.close_menu();
+                            }
+                        }
+                        if !self.settings.recent_files.is_empty() {
+                            ui.separator();
+                            if ui.button("Clear the list").clicked() {
+                                self.clear_recent();
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     if ui
                         .button("Save Project")
                         .on_hover_text(
@@ -3014,8 +3265,12 @@ impl OpenForgeApp {
                         }
                     });
                     ui.separator();
-                    if ui.button("Quit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    if ui
+                        .button("Quit")
+                        .on_hover_text("Close the window (edits are guarded)")
+                        .clicked()
+                    {
+                        self.request_quit(ctx);
                     }
                 });
                 ui.menu_button("Edit", |ui| {
@@ -8568,7 +8823,7 @@ mod tests {
         // Ctrl+S goes to the path the first save remembered.
         app.create_primitive("Sphere");
         let ctx = egui::Context::default();
-        ctx.run(key_frame_mods(0.0, egui::Key::S, egui::Modifiers::COMMAND), |ctx| {
+        let _ = ctx.run(key_frame_mods(0.0, egui::Key::S, egui::Modifiers::COMMAND), |ctx| {
             app.handle_shortcuts(ctx);
         });
         assert!(path.exists(), "Ctrl+S wrote the project back");
@@ -9800,5 +10055,229 @@ mod tests {
         assert_eq!(filed.theme, Theme::Light);
         assert_eq!(filed.grid_step, 2.5);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// One whole frame, driven the way the window drives it.
+    fn run_frame(
+        app: &mut OpenForgeApp,
+        ctx: &egui::Context,
+        input: egui::RawInput,
+    ) -> egui::FullOutput {
+        ctx.run(input, |ctx| app.draw(ctx, None))
+    }
+
+    /// The commands one whole frame sent to the window.
+    fn window_commands(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default()
+    }
+
+    /// A frame whose window was asked to close (the title bar's X).
+    fn close_frame(time: f64) -> egui::RawInput {
+        let mut input = frame(time, egui::pos2(500.0, 350.0), None);
+        input.viewports.insert(
+            egui::ViewportId::ROOT,
+            egui::ViewportInfo {
+                events: vec![egui::ViewportEvent::Close],
+                ..Default::default()
+            },
+        );
+        input
+    }
+
+    #[test]
+    fn the_title_names_the_document_and_stars_unsaved_edits() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        assert_eq!(app.title(), "OpenForge — Untitled");
+        assert!(!app.modified, "the seeded scene is not unsaved work");
+
+        // The first frame hands the window its title; a frame that changes
+        // nothing does not repeat itself.
+        let first = run_frame(&mut app, &ctx, frame(0.0, egui::pos2(500.0, 350.0), None));
+        assert!(
+            window_commands(&first)
+                .contains(&egui::ViewportCommand::Title("OpenForge — Untitled".into())),
+            "{:?}",
+            window_commands(&first)
+        );
+        let quiet = run_frame(&mut app, &ctx, frame(0.1, egui::pos2(500.0, 350.0), None));
+        assert!(
+            !window_commands(&quiet)
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Title(_))),
+            "a still frame sends nothing: {:?}",
+            window_commands(&quiet)
+        );
+
+        // An edit puts the star on, and the next frame carries it.
+        app.create_primitive("Box");
+        assert!(app.modified, "a primitive is an edit");
+        let starred = run_frame(&mut app, &ctx, frame(0.2, egui::pos2(500.0, 350.0), None));
+        assert!(
+            window_commands(&starred)
+                .contains(&egui::ViewportCommand::Title("OpenForge — Untitled *".into())),
+            "{:?}",
+            window_commands(&starred)
+        );
+
+        // Saving names the document and clears the star; the next edit brings
+        // the star back, against the file's own name.
+        let path = temp_path("ofproj");
+        app.save_project_to(path.clone());
+        assert!(!app.modified, "the edits are in the file now");
+        assert!(
+            app.status.starts_with("Saved project"),
+            "{}",
+            app.status
+        );
+        let name = OpenForgeApp::file_label(&path);
+        assert_eq!(app.title(), format!("OpenForge — {name}"));
+        app.create_primitive("Sphere");
+        assert_eq!(app.title(), format!("OpenForge — {name} *"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_saved_project_lands_on_the_recent_list_and_a_missing_one_drops_off() {
+        let settings_path = temp_path("recent-settings.json");
+        let _ = std::fs::remove_file(&settings_path);
+        let project = temp_path("ofproj");
+
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.settings_path = Some(settings_path.clone());
+        assert!(app.settings.recent_files.is_empty(), "a fresh list is empty");
+        let nodes = app.scene.node_count();
+
+        app.save_project_to(project.clone());
+        assert_eq!(
+            app.settings.recent_paths(),
+            vec![project.clone()],
+            "the save lands on the list"
+        );
+        assert!(
+            settings_path.exists(),
+            "and the list is filed away between runs"
+        );
+        assert!(
+            app.status.starts_with("Saved project"),
+            "the recent note does not steal the status: {}",
+            app.status
+        );
+
+        // Another run reads the list back.
+        let mut reopened = OpenForgeApp::with_gpu(None);
+        reopened.settings_path = Some(settings_path.clone());
+        assert!(reopened.load_settings());
+        assert_eq!(reopened.settings.recent_paths(), vec![project.clone()]);
+
+        // Opening it from the list replaces the document, and re-notes it.
+        reopened.scene = Scene::new();
+        reopened.open_recent(project.clone());
+        assert!(
+            reopened.status.starts_with("Opened project"),
+            "{}",
+            reopened.status
+        );
+        assert_eq!(reopened.scene.node_count(), nodes, "the saved scene is back");
+        assert!(!reopened.modified, "and the document is not unsaved work");
+        assert_eq!(reopened.settings.recent_paths(), vec![project.clone()]);
+
+        // A file that is gone is refused and forgotten.
+        std::fs::remove_file(&project).expect("the project was written");
+        reopened.open_recent(project.clone());
+        assert!(
+            reopened.status.contains("no longer there"),
+            "{}",
+            reopened.status
+        );
+        assert!(
+            reopened.settings.recent_files.is_empty(),
+            "it drops off the list"
+        );
+
+        reopened.clear_recent();
+        let _ = std::fs::remove_file(&settings_path);
+    }
+
+    #[test]
+    fn unsaved_edits_are_guarded_before_new_open_and_quit() {
+        let ctx = egui::Context::default();
+        let project = temp_path("ofproj");
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.save_project_to(project.clone());
+        assert!(!app.modified, "a saved document is clean");
+
+        // Clean: the chosen project opens straight away, with no question.
+        app.open_or_guard(project.clone());
+        assert!(app.pending_guard.is_none(), "no question for a clean document");
+        assert!(app.status.starts_with("Opened project"), "{}", app.status);
+
+        // Edited: the next New is parked behind the guard, and the modal
+        // paints while it waits.
+        let nodes = app.scene.node_count();
+        app.create_primitive("Box");
+        assert!(app.modified);
+        app.pending_guard = Some(Guard::New);
+        let output = ctx.run(frame(0.0, egui::pos2(500.0, 350.0), None), |ctx| {
+            app.handle_guard(ctx)
+        });
+        assert!(!output.shapes.is_empty(), "the guard painted");
+        assert_eq!(app.pending_guard, Some(Guard::New), "and is still asking");
+
+        // Cancel keeps the document and says so.
+        app.cancel_guard();
+        assert!(app.pending_guard.is_none());
+        assert!(
+            app.status.contains("Kept the unsaved changes"),
+            "{}",
+            app.status
+        );
+        assert_eq!(app.scene.node_count(), nodes + 1, "the Box is still there");
+
+        // Discard runs the action: New empties the scene and the star goes.
+        app.pending_guard = Some(Guard::New);
+        app.discard_guard(&ctx);
+        assert_eq!(app.scene.node_count(), 0);
+        assert!(!app.modified);
+
+        // A close request with edits is held back rather than closing.
+        app.create_primitive("Box");
+        let output = run_frame(&mut app, &ctx, close_frame(0.1));
+        let commands = window_commands(&output);
+        assert!(
+            commands.contains(&egui::ViewportCommand::CancelClose),
+            "{commands:?}"
+        );
+        assert_eq!(app.pending_guard, Some(Guard::Quit));
+        assert!(
+            !commands.contains(&egui::ViewportCommand::Close),
+            "the window stayed open: {commands:?}"
+        );
+        assert!(app.title().ends_with(" *"), "{}", app.title());
+
+        // Discarding the quit closes the window.
+        app.discard_guard(&ctx);
+        let output = run_frame(&mut app, &ctx, frame(0.2, egui::pos2(500.0, 350.0), None));
+        assert!(
+            window_commands(&output).contains(&egui::ViewportCommand::Close),
+            "{:?}",
+            window_commands(&output)
+        );
+
+        // A clean document is not held back at all: the close is simply left
+        // to the window.
+        let mut clean = OpenForgeApp::with_gpu(None);
+        let output = run_frame(&mut clean, &ctx, close_frame(0.3));
+        assert!(
+            !window_commands(&output).contains(&egui::ViewportCommand::CancelClose),
+            "a clean close is not cancelled: {:?}",
+            window_commands(&output)
+        );
+        assert!(clean.pending_guard.is_none(), "and asks nothing");
+        let _ = std::fs::remove_file(&project);
     }
 }
