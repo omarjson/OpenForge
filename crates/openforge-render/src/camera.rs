@@ -11,6 +11,13 @@ use openforge_core::math::{Aabb, Ray};
 /// Maximum pitch, kept just short of the poles so the view basis never
 /// degenerates at exactly ±90°.
 const MAX_PITCH: f32 = std::f32::consts::PI * 89.0 / 180.0;
+/// How far back along the view direction an orthographic view's eye sits. The
+/// projection ignores it; it only has to keep the scene in front of the eye,
+/// between the near and far planes.
+const ORTHO_EYE: f32 = 500.0;
+/// Near clip plane of an orthographic view. The rest of the depth range is
+/// filled to just past the far side of [`ORTHO_EYE`].
+const ORTHO_NEAR: f32 = 0.1;
 /// Nearest the camera may dolly in.
 const MIN_DISTANCE: f32 = 0.1;
 /// Farthest the camera may dolly out.
@@ -43,6 +50,13 @@ pub struct OrbitCamera {
     pub near: f32,
     /// Far clip plane distance.
     pub far: f32,
+    /// Draw with a parallel (orthographic) projection instead. `distance` is
+    /// then the zoom — how much of the world fits the frame — rather than how
+    /// far the eye sits from the target.
+    pub ortho: bool,
+    /// Which way is up on screen. An axis-aligned view looking straight down
+    /// or straight up cannot use world up, which is parallel to its view.
+    pub up: Vec3,
 }
 
 impl Default for OrbitCamera {
@@ -55,26 +69,53 @@ impl Default for OrbitCamera {
             fov_y: 55f32.to_radians(),
             near: 0.05,
             far: 1000.0,
+            ortho: false,
+            up: Vec3::Y,
         }
     }
 }
 
 impl OrbitCamera {
+    /// How far the eye sits back along the view direction. An orthographic
+    /// view stands well clear of the scene so the whole of it is in front of
+    /// the near plane.
+    fn eye_distance(&self) -> f32 {
+        if self.ortho {
+            ORTHO_EYE
+        } else {
+            self.distance
+        }
+    }
+
     /// World-space position of the eye.
     pub fn eye(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
-        self.target + Vec3::new(cy * cp, sp, sy * cp) * self.distance
+        self.target + Vec3::new(cy * cp, sp, sy * cp) * self.eye_distance()
     }
 
     /// Right-handed view matrix (world → view space).
     pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.eye(), self.target, Vec3::Y)
+        Mat4::look_at_rh(self.eye(), self.target, self.up)
     }
 
-    /// Right-handed perspective projection with a `[0, 1]` depth range.
+    /// Right-handed projection with a `[0, 1]` depth range: perspective, or an
+    /// orthographic box with the extent this camera's perspective view has at
+    /// the same distance, so switching between the two does not jump.
     pub fn proj_matrix(&self, aspect: f32) -> Mat4 {
         let aspect = aspect.max(0.01);
+        if self.ortho {
+            let half_h = (self.distance * (self.fov_y * 0.5).tan()).max(0.01);
+            let half_w = half_h * aspect;
+            return Mat4::orthographic_rh(
+                -half_w,
+                half_w,
+                -half_h,
+                half_h,
+                ORTHO_NEAR,
+                2.0 * ORTHO_EYE,
+            );
+        }
         let near = self.near.max(1e-4);
         let far = self.far.max(near + 1e-3);
         Mat4::perspective_rh(self.fov_y, aspect, near, far)

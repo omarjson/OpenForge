@@ -18,7 +18,110 @@ use openforge_core::NodeId;
 use openforge_render::PickElement;
 use std::collections::BTreeSet;
 
-/// A perspective orbit camera.
+/// Where an orthographic view's eye sits along its view direction. The
+/// projection ignores the distance (parallel rays), so the value only has to
+/// keep the scene between the near and far planes.
+const ORTHO_EYE: f32 = 500.0;
+
+/// Which projection a viewport shows.
+///
+/// A modeller works in the six axis-aligned orthographic views as much as in
+/// free perspective. Each is the same camera at a fixed pair of angles with a
+/// different projection, so picking, the gizmo and the grid all keep working:
+/// they only ever read [`Camera::view_proj`] and [`Camera::ray_from_ndc`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ViewKind {
+    /// The free orbit camera.
+    #[default]
+    Perspective,
+    /// Looking along -Z, with +Y up and +X right: the side an object faces.
+    Front,
+    /// Looking along +Z.
+    Back,
+    /// Looking along +X, seen from -X.
+    Left,
+    /// Looking along -X, seen from +X.
+    Right,
+    /// Looking straight down, from above.
+    Top,
+    /// Looking straight up, from below.
+    Bottom,
+}
+
+impl ViewKind {
+    /// Every kind, in menu order, perspective first.
+    pub const ALL: [ViewKind; 7] = [
+        ViewKind::Perspective,
+        ViewKind::Front,
+        ViewKind::Back,
+        ViewKind::Left,
+        ViewKind::Right,
+        ViewKind::Top,
+        ViewKind::Bottom,
+    ];
+
+    /// What the menu, the viewport corner and the status bar call it.
+    pub fn label(self) -> &'static str {
+        match self {
+            ViewKind::Perspective => "Perspective",
+            ViewKind::Front => "Front",
+            ViewKind::Back => "Back",
+            ViewKind::Left => "Left",
+            ViewKind::Right => "Right",
+            ViewKind::Top => "Top",
+            ViewKind::Bottom => "Bottom",
+        }
+    }
+
+    /// The digit that selects it — `0` for perspective, then the six views on
+    /// `1`–`6`, which is how a modeller reaches for them.
+    pub fn hotkey(self) -> egui::Key {
+        match self {
+            ViewKind::Perspective => egui::Key::Num0,
+            ViewKind::Front => egui::Key::Num1,
+            ViewKind::Back => egui::Key::Num2,
+            ViewKind::Left => egui::Key::Num3,
+            ViewKind::Right => egui::Key::Num4,
+            ViewKind::Top => egui::Key::Num5,
+            ViewKind::Bottom => egui::Key::Num6,
+        }
+    }
+
+    /// Whether the view is orthographic. Perspective is the only one that is
+    /// not.
+    pub fn is_ortho(self) -> bool {
+        self != ViewKind::Perspective
+    }
+
+    /// The yaw and pitch the view sits at. `None` for perspective, which keeps
+    /// wherever the user left it.
+    pub fn angles(self) -> Option<(f32, f32)> {
+        use std::f32::consts::{FRAC_PI_2, PI};
+        match self {
+            ViewKind::Perspective => None,
+            // `Camera::eye` places the eye at
+            // `(cos(yaw)cos(pitch), sin(pitch), sin(yaw)cos(pitch))`.
+            ViewKind::Front => Some((FRAC_PI_2, 0.0)),
+            ViewKind::Back => Some((-FRAC_PI_2, 0.0)),
+            ViewKind::Right => Some((0.0, 0.0)),
+            ViewKind::Left => Some((PI, 0.0)),
+            ViewKind::Top => Some((0.0, FRAC_PI_2)),
+            ViewKind::Bottom => Some((0.0, -FRAC_PI_2)),
+        }
+    }
+
+    /// Which way is up on screen. A view looking straight down (or up) cannot
+    /// use world up, which is parallel to the view direction.
+    pub fn up(self) -> Vec3 {
+        match self {
+            ViewKind::Top => Vec3::NEG_Z,
+            ViewKind::Bottom => Vec3::Z,
+            _ => Vec3::Y,
+        }
+    }
+}
+
+/// A perspective orbit camera, or an axis-aligned orthographic view.
 #[derive(Clone, Copy, Debug)]
 pub struct Camera {
     pub target: Vec3,
@@ -28,6 +131,7 @@ pub struct Camera {
     pub fov_y: f32,
     pub near: f32,
     pub far: f32,
+    pub view: ViewKind,
 }
 
 impl Default for Camera {
@@ -40,15 +144,32 @@ impl Default for Camera {
             fov_y: 55f32.to_radians(),
             near: 0.05,
             far: 1000.0,
+            view: ViewKind::Perspective,
         }
     }
 }
 
 impl Camera {
-    pub fn eye(&self) -> Vec3 {
+    /// The unit direction from the target towards the eye.
+    fn eye_dir(&self) -> Vec3 {
         let (sy, cy) = self.yaw.sin_cos();
         let (sp, cp) = self.pitch.sin_cos();
-        self.target + Vec3::new(cy * cp, sp, sy * cp) * self.distance
+        Vec3::new(cy * cp, sp, sy * cp)
+    }
+
+    /// How far back along the view direction the eye sits. An orthographic
+    /// view puts it far enough back that the whole scene is in front of it;
+    /// `distance` is then only the zoom.
+    fn eye_distance(&self) -> f32 {
+        if self.view.is_ortho() {
+            ORTHO_EYE
+        } else {
+            self.distance
+        }
+    }
+
+    pub fn eye(&self) -> Vec3 {
+        self.target + self.eye_dir() * self.eye_distance()
     }
 
     /// The direction the camera looks in, from the eye towards the target.
@@ -60,19 +181,43 @@ impl Camera {
     }
 
     pub fn view_matrix(&self) -> Mat4 {
-        Mat4::look_at_rh(self.eye(), self.target, Vec3::Y)
+        Mat4::look_at_rh(self.eye(), self.target, self.view.up())
     }
 
+    /// The projection: perspective, or an orthographic box with the extent the
+    /// perspective view has at the same distance, so switching between them
+    /// does not jump.
     pub fn proj_matrix(&self, aspect: f32) -> Mat4 {
-        Mat4::perspective_rh(self.fov_y, aspect.max(0.01), self.near, self.far)
+        let aspect = aspect.max(0.01);
+        if self.view.is_ortho() {
+            let half_h = (self.distance * (self.fov_y * 0.5).tan()).max(0.01);
+            let half_w = half_h * aspect;
+            Mat4::orthographic_rh(-half_w, half_w, -half_h, half_h, 0.1, 2.0 * ORTHO_EYE)
+        } else {
+            Mat4::perspective_rh(self.fov_y, aspect, self.near, self.far)
+        }
+    }
+
+    /// Switch the viewport to a projection. An orthographic view snaps the
+    /// angles to exactly its own; going back to perspective keeps the angles,
+    /// so the orbit carries on from where the view sits.
+    pub fn set_view(&mut self, view: ViewKind) {
+        if let Some((yaw, pitch)) = view.angles() {
+            self.yaw = yaw;
+            self.pitch = pitch;
+        }
+        self.view = view;
     }
 
     pub fn view_proj(&self, aspect: f32) -> Mat4 {
         self.proj_matrix(aspect) * self.view_matrix()
     }
 
-    /// Orbit by pixel deltas.
+    /// Orbit by pixel deltas. Orbiting out of an orthographic view turns the
+    /// viewport back into a perspective one, from the same direction — an
+    /// orthographic view has no perspective to rotate.
     pub fn orbit(&mut self, dx: f32, dy: f32) {
+        self.view = ViewKind::Perspective;
         self.yaw += dx * 0.01;
         self.pitch = (self.pitch + dy * 0.01).clamp(-1.5, 1.5);
     }
@@ -90,9 +235,13 @@ impl Camera {
     }
 
     /// Build a picking ray from normalized device coords in [-1, 1].
+    ///
+    /// The origin is on the near plane and runs to the far one. In perspective
+    /// the two points are the same view ray, and in an orthographic view they
+    /// are parallel — both give the direction the cursor points in.
     pub fn ray_from_ndc(&self, ndc_x: f32, ndc_y: f32, aspect: f32) -> Ray {
         let inv = self.view_proj(aspect).inverse();
-        let near = inv * Vec4::new(ndc_x, ndc_y, -1.0, 1.0);
+        let near = inv * Vec4::new(ndc_x, ndc_y, 0.0, 1.0);
         let far = inv * Vec4::new(ndc_x, ndc_y, 1.0, 1.0);
         let near = near.truncate() / near.w;
         let far = far.truncate() / far.w;
@@ -2019,5 +2168,191 @@ mod tests {
             egui::Rect::from_min_max(egui::pos2(x + 1.0, y + 1.0), egui::pos2(x + 51.0, y + 51.0));
         assert!(marquee_elements(&mut scene, vp, size, pulled_in, SelectLevel::Vertex).is_empty());
     }
+    #[test]
+    fn every_view_names_itself_and_the_six_orthographic_ones_are_parallel() {
+        assert_eq!(ViewKind::ALL.len(), 7);
+        assert!(!ViewKind::Perspective.is_ortho());
+        assert_eq!(ViewKind::Perspective.angles(), None, "the user keeps their angle");
+        let mut labels = Vec::new();
+        for view in ViewKind::ALL {
+            labels.push(view.label());
+            assert_eq!(view.is_ortho(), view != ViewKind::Perspective);
+            assert_eq!(view.angles().is_some(), view.is_ortho());
+        }
+        assert_eq!(
+            labels,
+            vec!["Perspective", "Front", "Back", "Left", "Right", "Top", "Bottom"]
+        );
+        // Every orthographic view looks along one signed world axis, and no
+        // two of them look the same way.
+        let mut seen: Vec<[i32; 3]> = Vec::new();
+        for view in ViewKind::ALL.iter().filter(|v| v.is_ortho()) {
+            let mut camera = Camera::default();
+            camera.set_view(*view);
+            let dir = camera.forward();
+            let along = dir.to_array().iter().filter(|c| c.abs() > 1e-4).count();
+            assert_eq!(along, 1, "{view:?} looks along one axis, not {dir:?}");
+            assert!((dir.length() - 1.0).abs() < 1e-4);
+            seen.push(dir.to_array().map(|c| {
+                if c > 1e-4 {
+                    1
+                } else if c < -1e-4 {
+                    -1
+                } else {
+                    0
+                }
+            }));
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "one direction per view");
+    }
+
+    #[test]
+    fn a_view_puts_the_world_axes_where_a_modeller_expects_them() {
+        // Right and up on screen, read out of the view matrix, for each view.
+        let cases: [(ViewKind, Vec3, Vec3); 6] = [
+            (ViewKind::Front, Vec3::X, Vec3::Y),
+            (ViewKind::Back, Vec3::NEG_X, Vec3::Y),
+            (ViewKind::Right, Vec3::NEG_Z, Vec3::Y),
+            (ViewKind::Left, Vec3::Z, Vec3::Y),
+            (ViewKind::Top, Vec3::X, Vec3::NEG_Z),
+            (ViewKind::Bottom, Vec3::X, Vec3::Z),
+        ];
+        for (view, right, up) in cases {
+            let mut camera = Camera::default();
+            camera.set_view(view);
+            let m = camera.view_matrix();
+            let screen_right = Vec3::new(m.x_axis.x, m.y_axis.x, m.z_axis.x);
+            let screen_up = Vec3::new(m.x_axis.y, m.y_axis.y, m.z_axis.y);
+            assert!(
+                (screen_right - right).length() < 1e-4,
+                "{view:?} right is {screen_right:?}, wanted {right:?}"
+            );
+            assert!(
+                (screen_up - up).length() < 1e-4,
+                "{view:?} up is {screen_up:?}, wanted {up:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_orthographic_view_has_no_perspective() {
+        let mut camera = Camera::default();
+        camera.set_view(ViewKind::Front);
+        let vp = camera.view_proj(1.0);
+        let size = [400.0, 400.0];
+
+        // Two points on the same ray, one twice as far away: the same pixel
+        // and a different depth. A perspective view would spread them apart.
+        let (x1, y1, d1) = project(vp, Vec3::new(1.0, 0.5, -50.0), size).unwrap();
+        let (x2, y2, d2) = project(vp, Vec3::new(1.0, 0.5, 50.0), size).unwrap();
+        let (near_pixel, far_pixel) = ((x1, y1), (x2, y2));
+        assert!(
+            (x1 - x2).abs() < 1e-3 && (y1 - y2).abs() < 1e-3,
+            "{near_pixel:?} vs {far_pixel:?}"
+        );
+        assert!((d1 - d2).abs() > 0.05, "depth still tells them apart");
+        assert!(d1 > d2, "and the one further from the eye is the deeper");
+
+        // The x axis runs across the screen with one scale, however far out.
+        let (ax, _, _) = project(vp, Vec3::new(1.0, 0.0, 0.0), size).unwrap();
+        let (bx, _, _) = project(vp, Vec3::new(2.0, 0.0, 0.0), size).unwrap();
+        let centre = 200.0;
+        assert!((ax - centre - (bx - centre) / 2.0).abs() < 1e-3, "sizes double with distance");
+
+        // And it is flat: the whole extent is `distance * tan(fov/2)`.
+        let half_h = 8.0 * (camera.fov_y * 0.5).tan();
+        let (_, top, _) = project(vp, Vec3::new(0.0, half_h, 0.0), size).unwrap();
+        assert!((top - 0.0).abs() < 0.5, "the top edge lands on the top pixel: {top}");
+    }
+
+    #[test]
+    fn the_orthographic_picking_ray_runs_parallel_to_the_view() {
+        let mut camera = Camera::default();
+        camera.set_view(ViewKind::Top);
+        let aspect = 1.6;
+        let forward = camera.forward();
+        for (ndc_x, ndc_y) in [(-0.5, 0.25), (0.0, 0.0), (0.75, -0.5)] {
+            let ray = camera.ray_from_ndc(ndc_x, ndc_y, aspect);
+            assert!(
+                (ray.direction - forward).length() < 1e-4,
+                "the ray is parallel to the view: {:?}",
+                ray.direction
+            );
+            // The ray starts on the near plane, a hair in front of the eye.
+            assert!(
+                (ray.origin.y - camera.eye().y).abs() < 1.0,
+                "starts at the eye: {:?}",
+                ray.origin
+            );
+        }
+        // Two rays are parallel but not the same line: x still separates them.
+        let left = camera.ray_from_ndc(-0.5, 0.0, aspect);
+        let right = camera.ray_from_ndc(0.5, 0.0, aspect);
+        assert!((left.direction - right.direction).length() < 1e-5);
+        assert!((left.origin - right.origin).length() > 0.5, "they are offset across the image");
+    }
+
+    #[test]
+    fn a_view_keeps_the_scene_the_same_size_it_had_in_perspective() {
+        // Switching projections at the same distance must not jump: the
+        // orthographic extent is the perspective view's own extent, so the
+        // point on the perspective view's top edge is on the top edge of the
+        // orthographic one too.
+        let mut camera = Camera::default();
+        camera.yaw = std::f32::consts::FRAC_PI_2;
+        camera.pitch = 0.0;
+        let aspect = 1.5;
+        let half_h = camera.distance * (camera.fov_y * 0.5).tan();
+        let perspective = camera.view_proj(aspect);
+        camera.set_view(ViewKind::Front);
+        let ortho = camera.view_proj(aspect);
+
+        // A point on the target's own plane, `half_h` above the middle: the
+        // top edge of the frame at this distance and aspect.
+        let on_the_top_edge = Vec3::new(0.0, half_h, camera.target.z);
+        for (vp, name) in [(perspective, "perspective"), (ortho, "orthographic")] {
+            let clip = vp * on_the_top_edge.extend(1.0);
+            let ndc_y = clip.y / clip.w;
+            assert!((ndc_y - 1.0).abs() < 1e-3, "{name} puts it at y = 1: {ndc_y}");
+        }
+    }
+
+    #[test]
+    fn orbiting_out_of_an_orthographic_view_returns_to_perspective() {
+        let mut camera = Camera::default();
+        camera.set_view(ViewKind::Top);
+        assert_eq!(camera.view, ViewKind::Top);
+        let eye = camera.eye();
+        // Straight down by design, and far enough back for the whole scene.
+        assert!((eye.x).abs() < 1e-4 && (eye.z).abs() < 1e-4);
+        assert!(eye.y > 100.0, "the eye sits well above the scene: {eye:?}");
+
+        camera.orbit(20.0, 5.0);
+        assert_eq!(camera.view, ViewKind::Perspective, "orbiting leaves the fixed view");
+        assert!(camera.pitch < std::f32::consts::FRAC_PI_2, "and tips off the pole");
+
+        // Zooming an orthographic view changes the extent, not where the eye
+        // is: the eye stays at the fixed distance while the extent shrinks.
+        camera.set_view(ViewKind::Front);
+        let before = camera.eye();
+        camera.zoom(4.0);
+        let after = camera.eye();
+        assert!((before - after).length() < 1e-4, "the eye does not move: {before:?} {after:?}");
+        let wide = {
+            let mut c = camera;
+            c.distance = 16.0;
+            c
+        };
+        let size = [400.0, 400.0];
+        let (narrow_x, _, _) = project(camera.view_proj(1.0), Vec3::X * 4.0, size).unwrap();
+        let (wide_x, _, _) = project(wide.view_proj(1.0), Vec3::X * 4.0, size).unwrap();
+        assert!(
+            (narrow_x - 200.0).abs() > (wide_x - 200.0).abs(),
+            "zooming in spreads the same point further from the middle"
+        );
+    }
+
 }
 

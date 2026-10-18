@@ -7,7 +7,7 @@ use crate::gpu_viewport::{self, GpuViewport};
 use crate::settings::{self, Settings, Theme, SHORTCUTS};
 use crate::snap::{self, SnapMode};
 use crate::uv_editor::{self, UvEditor};
-use crate::viewport::{self, Camera};
+use crate::viewport::{self, Camera, ViewKind};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
 use glam::{Mat4, Vec2, Vec3, Vec4};
@@ -3067,9 +3067,11 @@ impl OpenForgeApp {
         self.paint_gizmo(&painter);
         self.paint_marquee(&painter);
 
-        // Overlay label.
+        // Overlay label: which projection this viewport shows, and what is in
+        // it.
         let label = format!(
-            "Perspective  |  {} tris  |  {} selected",
+            "{}  |  {} tris  |  {} selected",
+            self.camera.view.label(),
             self.tris.len(),
             self.selection.node_count()
         );
@@ -3080,6 +3082,15 @@ impl OpenForgeApp {
             egui::FontId::monospace(12.0),
             egui::Color32::from_gray(200),
         );
+    }
+
+    /// Switch the viewport to a projection (View ▸ Viewport, or a digit).
+    /// An orthographic view snaps the camera to its own angle; picking and the
+    /// gizmo read the same view matrix either way, and the corner label is
+    /// what tells the user which projection is showing.
+    fn set_view(&mut self, view: viewport::ViewKind) {
+        self.camera.set_view(view);
+        self.dirty = true;
     }
 
     /// Middle-drag on the viewport: orbit, or pan with Shift. The settings'
@@ -3475,6 +3486,24 @@ impl OpenForgeApp {
                     }
                 });
                 ui.menu_button("View", |ui| {
+                    ui.menu_button("Viewport", |ui| {
+                        for view in ViewKind::ALL {
+                            let label =
+                                format!("{} ({:?})", view.label(), view.hotkey());
+                            if ui
+                                .selectable_label(self.camera.view == view, label)
+                                .on_hover_text(if view.is_ortho() {
+                                    "Axis-aligned orthographic view"
+                                } else {
+                                    "The free orbit camera"
+                                })
+                                .clicked()
+                            {
+                                self.set_view(view);
+                                ui.close_menu();
+                            }
+                        }
+                    });
                     if ui.button("Frame All (F)").clicked() {
                         self.frame_all();
                         ui.close_menu();
@@ -3583,6 +3612,16 @@ impl OpenForgeApp {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F)) {
             self.frame_all();
+        }
+        // Viewport projections: 0 is the perspective camera, 1-6 the six
+        // axis-aligned views. Held back while a text field has the keyboard,
+        // so typing a number into a panel does not change the view under it.
+        if !ctx.wants_keyboard_input() {
+            for view in ViewKind::ALL {
+                if ctx.input(|i| i.key_pressed(view.hotkey())) {
+                    self.set_view(view);
+                }
+            }
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Z)) {
             self.wireframe = self.wireframe.next();
@@ -4258,6 +4297,12 @@ impl OpenForgeApp {
             rows.push((
                 format!("{:?}", tool.hotkey()),
                 format!("{} tool", tool.registry_name()),
+            ));
+        }
+        for view in ViewKind::ALL {
+            rows.push((
+                format!("{:?}", view.hotkey()),
+                format!("{} viewport", view.label()),
             ));
         }
         rows
@@ -4999,7 +5044,8 @@ impl OpenForgeApp {
         self.paint_marquee(&painter);
 
         let label = format!(
-            "Perspective  |  wgpu  |  {} tris  |  {} draws  |  {} selected",
+            "{}  |  wgpu  |  {} tris  |  {} draws  |  {} selected",
+            self.camera.view.label(),
             stats.indices / 3,
             stats.draws,
             self.selection.node_count()
@@ -7811,6 +7857,83 @@ mod tests {
 
 
     #[test]
+    fn a_digit_key_switches_the_viewport_projection() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        assert_eq!(app.camera.view, ViewKind::Perspective, "and it starts free");
+
+        step_with_keys(&ctx, &mut app, key_frame(1.0, ViewKind::Front.hotkey()));
+        assert_eq!(app.camera.view, ViewKind::Front);
+
+        // The corner label says which projection is showing, and the frame is
+        // laid out along the view: the X arm is level with the middle and the
+        // Z arm — which points at the camera — collapses to a point.
+        let shapes = paint_once(&ctx, &mut app, frame(2.0, egui::pos2(500.0, 350.0), None));
+        let labels = painted_labels(&shapes);
+        assert!(
+            labels.iter().any(|label| label.starts_with("Front  |")),
+            "the viewport names its projection: {labels:?}"
+        );
+        let origin = laid_out_pivot(&app);
+        let x = arm_tip(&app, gizmo::Axis::X);
+        let z = arm_tip(&app, gizmo::Axis::Z);
+        assert!((x.y - origin.y).abs() < 1.0, "the X arm runs level: {x:?} vs {origin:?}");
+        assert!(x.x > origin.x + 20.0, "and to the right");
+        assert!(
+            (z - origin).length() < 1.0,
+            "the Z arm points at the camera, so it projects to a point: {z:?}"
+        );
+
+        // Back to the free camera with 0, and the orbit resumes from there.
+        step_with_keys(&ctx, &mut app, key_frame(3.0, ViewKind::Perspective.hotkey()));
+        assert_eq!(app.camera.view, ViewKind::Perspective);
+        app.drag_camera(egui::vec2(15.0, 0.0), false);
+        assert_eq!(app.camera.view, ViewKind::Perspective, "still free after an orbit");
+
+        // Orbiting out of a fixed view does the same thing.
+        app.set_view(ViewKind::Top);
+        app.drag_camera(egui::vec2(0.0, 15.0), false);
+        assert_eq!(app.camera.view, ViewKind::Perspective, "orbiting leaves the fixed view");
+    }
+
+    #[test]
+    fn an_orthographic_view_picks_and_zooms_without_perspective() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        app.set_view(ViewKind::Front);
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        // The click answers with the sphere it is drawn over: the picking ray
+        // is parallel to the view, so what is drawn is what is picked, exactly
+        // as in perspective.
+        let centre = laid_out_pivot(&app);
+        let ray = app.camera.ray_from_ndc(0.0, 0.0, 1.6);
+        assert!(
+            (ray.direction - app.camera.forward()).length() < 1e-3,
+            "the ray runs along the view: {:?}",
+            ray.direction
+        );
+
+        app.selection.clear();
+        app.tool = ActiveTool::Select;
+        // Press and release inside egui's click window, or the gesture reads as
+        // a long press.
+        step(&ctx, &mut app, frame(1.0, centre, Some(true)));
+        step(&ctx, &mut app, frame(1.05, centre, Some(false)));
+        assert!(
+            app.selection.is_node_selected(id),
+            "the sphere under the cursor is selected"
+        );
+
+        // Zooming moves the eye nowhere; it narrows what the eye can see.
+        let before = app.camera.eye();
+        app.scroll_camera(30.0);
+        assert!((app.camera.eye() - before).length() < 1e-3, "the eye stays put in an axis view");
+        assert!(app.camera.distance < 8.0, "zooming in got closer: {}", app.camera.distance);
+    }
+
+    #[test]
     fn the_move_gizmo_paints_one_stroke_per_axis() {
         let ctx = egui::Context::default();
         let (mut app, _id) = app_ready_to_move();
@@ -10449,7 +10572,10 @@ mod tests {
     fn the_shortcut_rows_come_from_the_table_and_the_tool_hotkeys() {
         let app = OpenForgeApp::with_gpu(None);
         let rows = app.shortcut_rows();
-        assert_eq!(rows.len(), SHORTCUTS.len() + ActiveTool::all().len());
+        assert_eq!(
+            rows.len(),
+            SHORTCUTS.len() + ActiveTool::all().len() + ViewKind::ALL.len()
+        );
         for (keys, action) in SHORTCUTS {
             let row = rows.iter().find(|(row_keys, _)| row_keys == keys).expect("a table row");
             assert_eq!(&row.1, action);
@@ -10465,6 +10591,17 @@ mod tests {
         let tool_keys: Vec<String> =
             ActiveTool::all().iter().map(|tool| format!("{:?}", tool.hotkey())).collect();
         assert_eq!(tool_keys, vec!["Q", "W", "E", "R"], "the hotkeys the frame reads");
+        // And they are the keys the frame reads for the projections, which no
+        // tool hotkey uses.
+        for view in ViewKind::ALL {
+            let key = format!("{:?}", view.hotkey());
+            let action = format!("{} viewport", view.label());
+            assert!(
+                rows.iter().any(|(row_keys, row_action)| *row_keys == key && *row_action == action),
+                "{key} / {action} is missing"
+            );
+            assert!(!tool_keys.contains(&key), "{key} is free for the viewport");
+        }
     }
 
     #[test]

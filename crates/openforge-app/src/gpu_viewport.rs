@@ -280,12 +280,17 @@ pub fn orbit_camera(camera: &Camera) -> OrbitCamera {
         fov_y: camera.fov_y,
         near: camera.near,
         far: camera.far,
+        // An axis-aligned view is orthographic with its own idea of up, so the
+        // GPU image and the CPU picking rays agree about where things are.
+        ortho: camera.view.is_ortho(),
+        up: camera.view.up(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::viewport::ViewKind;
     use glam::Vec3;
     use openforge_core::NodeId;
 
@@ -323,6 +328,24 @@ mod tests {
         assert_eq!(gpu.eye(), camera.eye());
         assert_eq!(gpu.view_matrix(), camera.view_matrix());
         assert_eq!(gpu.view_proj(16.0 / 9.0), camera.view_proj(16.0 / 9.0));
+
+        // And for an axis-aligned view too, where the projection is parallel
+        // and the up vector is the view's own.
+        for view in [
+            ViewKind::Front,
+            ViewKind::Back,
+            ViewKind::Left,
+            ViewKind::Right,
+            ViewKind::Top,
+            ViewKind::Bottom,
+        ] {
+            let mut camera = camera;
+            camera.set_view(view);
+            let gpu = orbit_camera(&camera);
+            assert_eq!(gpu.eye(), camera.eye(), "{view:?}");
+            assert_eq!(gpu.view_matrix(), camera.view_matrix(), "{view:?}");
+            assert_eq!(gpu.view_proj(16.0 / 9.0), camera.view_proj(16.0 / 9.0), "{view:?}");
+        }
     }
 
     #[test]
