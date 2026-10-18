@@ -10,6 +10,7 @@ use std::path::Path;
 use thiserror::Error;
 
 pub mod dae;
+pub mod fbx;
 pub mod gltf;
 pub mod obj;
 pub mod off;
@@ -59,6 +60,7 @@ pub fn format_from_extension(ext: &str) -> Option<Format> {
         "ply" => Some(Format::Ply),
         "stl" => Some(Format::Stl),
         "dae" => Some(Format::Collada),
+        "fbx" => Some(Format::Fbx),
         "off" => Some(Format::Off),
         _ => None,
     }
@@ -73,6 +75,7 @@ pub enum Format {
     Stl,
     Collada,
     Off,
+    Fbx,
 }
 
 impl Format {
@@ -84,6 +87,7 @@ impl Format {
             Format::Stl => "stl",
             Format::Collada => "dae",
             Format::Off => "off",
+            Format::Fbx => "fbx",
         }
     }
 
@@ -95,6 +99,7 @@ impl Format {
             Format::Stl => "STL",
             Format::Collada => "COLLADA",
             Format::Off => "OFF",
+            Format::Fbx => "FBX (ASCII)",
         }
     }
 }
@@ -113,6 +118,7 @@ pub fn import_path(path: &Path) -> IoResult<LoadedScene> {
         Some(Format::Stl) => stl::import(path),
         Some(Format::Collada) => dae::import(path),
         Some(Format::Off) => off::import(path),
+        Some(Format::Fbx) => fbx::import(path),
         None => Err(IoError::Unsupported("unrecognized file extension")),
     }
 }
@@ -131,6 +137,7 @@ pub fn export_path(path: &Path, data: &MeshData) -> IoResult<()> {
         Some(Format::Stl) => stl::export(path, data),
         Some(Format::Collada) => dae::export(path, data),
         Some(Format::Off) => off::export(path, data),
+        Some(Format::Fbx) => fbx::export(path, data),
         None => Err(IoError::Unsupported("unrecognized file extension")),
     }
 }
