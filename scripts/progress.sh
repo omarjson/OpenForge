@@ -51,7 +51,7 @@ UV math (project, unwrap, pack, edits)|87|Engine
 GPU viewport (depth, shading, grid, gizmo)|88|UI
 Viewport editing UX (gizmos, wireframe, outlines, picking)|96|UI
 UV editor UI|70|UI
-Panels & dialogs (outliner, properties, toolbars, Preferences)|66|UI
+Panels & dialogs (outliner, properties, toolbars, Preferences)|68|UI
 Import/export UX|74|UI
 Plugin / service host|64|UI
 Game tooling (LOD, dummies/TXD, vehicles)|40|UI

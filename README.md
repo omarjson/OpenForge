@@ -232,7 +232,9 @@ A sample GitHub Actions matrix is shown below.
   **Pack** groups by coincident positions instead).
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
 - **Edit → Preferences…** edits the theme, the ground grid (on/off, step,
-  reach) and the camera's orbit/pan/zoom speeds; **Help → Keyboard
+  reach) and the camera's orbit/pan/zoom speeds — closing the window files
+  the choices away in the platform's config directory (`settings.json`), and
+  the next start reads them back; **Help → Keyboard
   Shortcuts…** lists every global key and the four tool hotkeys, and **Help →
   About OpenForge** names the version and the licence.
 - **Ctrl+Z** undoes, **Ctrl+Shift+Z** redoes, **Ctrl+D** duplicates the selection,
@@ -298,8 +300,9 @@ mostly application surface. Natural next steps:
   of the diffuse map that samples today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
-- Settings that persist across runs (in the app and in the project file), an
-  asset browser, and the deeper panel/dialog surface.
+- The app's settings persist across runs now (the platform's config
+  directory); what remains here is window-layout memory, an asset browser and
+  the deeper panel/dialog surface.
 - More standard formats (FBX-ascii, USDZ, glTF extensions) and a fuller
   COLLADA (node transforms, effects, animation) behind the same `openforge-io` traits.
 - Dynamic plugin loading (`cdylib` filters) behind the host seam, which already

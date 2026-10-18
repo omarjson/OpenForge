@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 13 crates (633 `#[test]` fns; 636 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 13 crates (640 `#[test]` fns; 643 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -58,7 +58,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-rig` | 25 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights` (with the weight *editing* maths: `assign`, `blend`, `smooth`), `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
 | `openforge-project` | 14 | The project file: one versioned JSON document holding the scene (nodes listed parents-first, every reference a position in that list — ids never reach the file), the material library (textures as base64 RGBA8), the animation clips and — since version 2 — the skinned rig (skeleton with both poses, weights, bind positions, driven node; version-1 files still load, without a rig). It has its own document structs and a bridge to the engine types, rebuilds the rig through the rig crate's own API (parents-first, validated weights), and every refusal says what it found: not JSON, not ours, too new, or malformed. |
-| `openforge-app` | 204 (bin) | eframe/egui GUI. `app.rs` (~9300 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the shortcut table) + its project block (File ▸ Open/Save/Save As over `openforge-project`; `current_file` is the remembered document path, which the status bar shows; the live rig rides the save and comes back through undo's rig snapshot). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
+| `openforge-app` | 211 (bin) | eframe/egui GUI. `app.rs` (~9300 lines) + `gizmo.rs` (screen-space transform gizmo) + `snap.rs` (snapping settings + pure snap maths) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the shortcut table — and the settings file: a small JSON document in the platform's config directory, loaded only by the real constructor and written when the Preferences window closes) + its project block (File ▸ Open/Save/Save As over `openforge-project`; `current_file` is the remembered document path, which the status bar shows; the live rig rides the save and comes back through undo's rig snapshot). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), and the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest). |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -356,6 +356,15 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
   validation and renormalization — never by construction around it; an empty
   weight row is a legal state (an unweighted vertex) and is left untouched,
   because `set_weights` refuses empty input.
+- **The preferences file is the app's, never the project's.** Machine choices
+  — theme, grid, camera speeds — live in `settings.json` under the platform's
+  config directory, and `settings::platform_settings_path` is a **pure
+  function of a `getenv` lookup**, so every convention is tested from any
+  host. A partial or newer file is read through defaults (`serde(default)`)
+  rather than refused piecemeal; only a document that does not parse is
+  refused whole. Two rules keep test runs honest: only the real constructor
+  sets the path and loads the file, and the test constructor leaves it
+  `None` — so no test ever touches a real user's preferences.
 - **`wgpu` is pinned once**, in `[workspace.dependencies]`, and must stay in
   lockstep with the wgpu eframe re-exports — otherwise the device/texture types
   crossing between eframe and `openforge-render` stop being the same types.
@@ -387,12 +396,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **441 tests pass**, CI green on all 3
-platforms. Eleven work-streams are done — the **wgpu viewport** (#1), the
-**interactive UV editor** (#2), the **transform gizmo** (#3), the **edge
-overlay** (#4), the **sub-object transforms** (#5), **materials** (#6), the
-**plugin host** (#7), the **GPU edge overlay + MSAA** (#8), **per-face
-materials** (#9), **snapping** (#10) and **textures end to end** (#11) — plus a
+workspace builds with **0 warnings**, **643 tests pass** (640 `#[test]`
+functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
+Thirty-three work-streams are done — the engine layer from the **wgpu
+viewport** (#1) through **textures end to end** (#11), then the application
+surface from **sub-object picking that matches the drawn frame** (#12)
+through the **preferences file** (#33), each narrated further down — plus a
 progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
@@ -1402,9 +1411,42 @@ progress report:
   pose a bone, re-skin, save, wreck, open — finding the posed skeleton, the
   weights and the skinned mesh back.
 
+- **Preferences persist** (work-stream #33). The Preferences window's choices
+  were the last state the app kept only in the running process; now closing
+  the window files them away and the next start reads them back:
+  - **The file is a small JSON document** in the platform's config directory
+    (`settings.json`), written pretty with a closing newline — it is the
+    user's to read and to hand-edit. `serde(default)` gives it forward
+    compatibility: keys an older build does not know are ignored and fields
+    the file omits keep their defaults, so a partial file is a legal file;
+    one that does not parse is refused whole, and the app keeps what it had
+    rather than half-believing it. The theme is stored by name,
+    `"dark"`/`"light"`, and reads under either spelling.
+  - **The path is the platform convention, pure and testable**: `%APPDATA%\
+    OpenForge` (falling back to `%LOCALAPPDATA%`), macOS's `Library/
+    Application Support/OpenForge`, and `$XDG_CONFIG_HOME/openforge` falling
+    back to `~/.config/openforge` — a function of a `getenv`-style lookup
+    that `host_platform()` picks for the build (with `cfg!`, so every build
+    compiles all three conventions and none warns about the variants the
+    others use). When the environment names no config directory the choices
+    stay for the session, and the status bar says so when the window closes.
+  - **The wiring keeps tests away from the real file**: only the real
+    constructor sets the path and loads before the first frame; the test
+    constructor leaves it `None`. Closing the Preferences window — the Close
+    button or the X, both one `close_preferences()` now — writes the file
+    and names it in the status bar.
+- **7 new tests**: the JSON round trip (and that the writer's own output
+  parses back), a partial document keeping the other defaults, unknown keys
+  from a newer build ignored, malformed documents refused, file load/save
+  with the directory chain made and a corrupt file refused rather than
+  guessed, one branch per platform convention driven by a fake `getenv`,
+  and in the app the save → fresh-app read-back trip (including a session
+  with no path, which stays in memory and says so) plus the
+  close-the-window-writes-it rule — an open window writes nothing.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **636 pass, 0 failures**
+build too); `cargo test --workspace` → **643 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The #30 windows are
 measured headless too: the theme is asserted on a bare egui context, the
 grid's lines are counted through a real view-projection with the grid on and
@@ -1412,9 +1454,13 @@ off, and the three windows are painted inside a `ctx.run` — so their layout
 is exercised (how they *look* is in the by-eye list below). The project
 round trips are measured through real files too — a save writes a file the
 tests load back as a document, the app's statuses and remembered path are
-asserted, every refusal by its message, and the rig round trip builds a real
+asserted, every refusal by its message, the rig round trip builds a real
 chain in the app, poses and re-skins it, saves, wrecks the session and opens
-it back — and the portable cross-check job now
+it back, and the preferences file's trip is driven through a real path the
+same way — written when the window closes, read whole by a fresh app, the
+defaults kept when it is corrupt, and a session with no config directory
+keeping its choices in memory with a word in the status bar — and the
+portable cross-check job now
 type-checks `openforge-project` alongside `core` and `io` on all three
 targets. The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
@@ -1539,8 +1585,9 @@ change the posed deformation, and Edit ▸ Undo should put the weights back) and
 the **Preferences / Shortcuts / About windows** by eye (Light should restyle
 the whole window at once, a grid step of 2 should space the ground lines twice
 as wide, Orbit × should visibly slow or speed the middle-drag, Keyboard
-Shortcuts should list every key the app answers to, and About should show the
-version), and the two project dialogs by eye (the filter should read
+Shortcuts should list every key the app answers to, About should show the
+version, and closing Preferences should leave a `settings.json` in the
+platform's config directory that the very next start comes back with), and the two project dialogs by eye (the filter should read
 *OpenForge project* and the default file name should end `.ofproj`) —
 the agent has no
 display access, so a human should look at all of those once. (An earlier session did
@@ -1553,7 +1600,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **74.6%**, shown as 74%). The engine
+16 curated areas is **74.8%**, shown as 74%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1579,7 +1626,9 @@ selection, undoable) as of #28, COLLADA and OFF (import/export through
 the same registry, six formats) as of #29, and the Preferences/shortcuts/About
 shell (theme, ground grid, camera speeds, the key table) as of #30, and the
 project format (the whole document — scene, materials and clips, and the rig
-since #32 — in one versioned file) as of #31.
+since #32 — in one versioned file) as of #31, and the preferences file (the
+window's choices surviving a restart, in the platform's config directory) as
+of #33.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1619,21 +1668,24 @@ Prioritized next steps:
    the remaining pieces. Per-face material assignment — the reason slots exist
    per face — landed in #9.
 7. **Finish the panel/dialog surface.** Preferences, Keyboard Shortcuts and
-   About landed in #30; settings that persist across runs, an asset browser,
-   and the deeper ZModeler-style dialogs have no home yet.
+   About landed in #30 and the window's choices now persist across runs
+   (#33); an asset browser, window-layout memory and the deeper
+   ZModeler-style dialogs have no home yet.
 8. **Deepen the project format.** The scene, the materials, the clips and
-   (since version 2) the rig are in the file; the app preferences are the
-   next piece, and the conveniences around it — a recent-projects list, a
-   dirty marker in the title — come with them.
+   (since version 2) the rig are in the file; preferences are settled as
+   machine choices (#33) rather than document state, so what is left here is
+   the conveniences around the file — a recent-projects list, a dirty marker
+   in the title — and, further out, per-project overrides of the app
+   preferences if a real need shows up.
 
 **Honest gap to parity:** format-specific game tooling (vehicles, TXD
 dictionaries, per-game export paths — the generic half, LOD tags, dummies,
 their triangle budget and the LOD generator, landed in #21/#25), the
-panel/dialog surface beyond the new shell (settings do not persist across
-runs — they are not in the project file either — there is no asset browser,
-and ZModeler's deeper dialogs have no home yet), the project format's own
-remaining half (the preferences are not in the project file yet),
-animation *authoring* beyond the key row (per-key
+panel/dialog surface beyond the new shell (the preferences persist now, as
+machine choices rather than document state; there is no asset browser, no
+window-layout memory, and ZModeler's deeper dialogs have no home yet), the
+project file's own conveniences (a recent-projects list, a dirty marker in
+the title), animation *authoring* beyond the key row (per-key
 easing edits, a curve view, clip-level tools), and exact format breadth
 (six formats, none proprietary; COLLADA is the geometry subset, without
 node transforms, effects or animation) remain the largest deltas and are many
