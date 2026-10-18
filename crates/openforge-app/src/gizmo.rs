@@ -33,6 +33,107 @@ pub const PLANE_HALF: f32 = 0.13;
 /// so a constant screen size is what keeps it usable at any distance).
 pub const CENTRE_PIXELS: f32 = 5.0;
 
+/// Which way a gizmo's handles point.
+///
+/// The handles are always labelled X, Y and Z, and always coloured red, green
+/// and blue; what changes is what those three axes *are*. A modeller moves a
+/// turned object along its own axes as often as along the world's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Axes {
+    /// The world's own axes, whatever the camera and the object do.
+    #[default]
+    World,
+    /// The selected object's axes, taken from its rotation: what a modeller
+    /// reaches for to move something along the way it is already turned.
+    Local,
+    /// The screen's axes — right, up and the view direction — so the handles
+    /// sit the same way however the view and the object are set.
+    Screen,
+}
+
+impl Axes {
+    /// Every mode, in menu order.
+    pub const ALL: [Axes; 3] = [Axes::World, Axes::Local, Axes::Screen];
+
+    /// What the toolbar and the menu call it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Axes::World => "World",
+            Axes::Local => "Local",
+            Axes::Screen => "Screen",
+        }
+    }
+}
+
+/// Three orthonormal world-space unit vectors: what a gizmo's X, Y and Z
+/// handles point along.
+///
+/// A drag's [`Measure`] is written in this basis' own components, so a handle
+/// that moves "one axis" moves one *of these* axes, and the world-space
+/// transform is built from it at the very end.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct Basis {
+    pub x: Vec3,
+    pub y: Vec3,
+    pub z: Vec3,
+}
+
+impl Default for Basis {
+    fn default() -> Self {
+        Self::WORLD
+    }
+}
+
+impl Basis {
+    /// The world's own axes.
+    pub const WORLD: Basis = Basis { x: Vec3::X, y: Vec3::Y, z: Vec3::Z };
+
+    /// The direction handle `axis` points along.
+    pub fn axis(self, axis: Axis) -> Vec3 {
+        match axis {
+            Axis::X => self.x,
+            Axis::Y => self.y,
+            Axis::Z => self.z,
+        }
+    }
+
+    /// A world-space direction as this basis' components (a projection: exact,
+    /// because the three vectors are orthonormal).
+    pub fn components(self, world: Vec3) -> Vec3 {
+        Vec3::new(world.dot(self.x), world.dot(self.y), world.dot(self.z))
+    }
+
+    /// This basis' components back as a world-space direction.
+    pub fn to_world(self, components: Vec3) -> Vec3 {
+        self.x * components.x + self.y * components.y + self.z * components.z
+    }
+
+    /// A transform's own axes, so a local gizmo lines up with the object it is
+    /// on. A scaled object's axes are normalized: the gizmo points the way the
+    /// object does, not as far.
+    pub fn of_matrix(matrix: Mat4) -> Basis {
+        Basis {
+            x: matrix.x_axis.truncate().normalize_or_zero(),
+            y: matrix.y_axis.truncate().normalize_or_zero(),
+            z: matrix.z_axis.truncate().normalize_or_zero(),
+        }
+    }
+
+    /// The screen's axes: right, up, and the view direction pointing out of
+    /// the screen towards the viewer, which is the order a right-handed view
+    /// basis uses.
+    pub fn of_camera(camera: &Camera) -> Basis {
+        let view = camera.view_matrix();
+        // The columns of the view rotation are the camera's axes in world
+        // space; the third is the direction *out* of the screen.
+        Basis {
+            x: Vec3::new(view.x_axis.x, view.y_axis.x, view.z_axis.x).normalize_or_zero(),
+            y: Vec3::new(view.x_axis.y, view.y_axis.y, view.z_axis.y).normalize_or_zero(),
+            z: Vec3::new(view.x_axis.z, view.y_axis.z, view.z_axis.z).normalize_or_zero(),
+        }
+    }
+}
+
 /// One of the three world axes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Axis {
@@ -43,14 +144,6 @@ pub enum Axis {
 
 impl Axis {
     pub const ALL: [Axis; 3] = [Axis::X, Axis::Y, Axis::Z];
-
-    pub fn dir(self) -> Vec3 {
-        match self {
-            Axis::X => Vec3::X,
-            Axis::Y => Vec3::Y,
-            Axis::Z => Vec3::Z,
-        }
-    }
 
     pub fn label(self) -> &'static str {
         match self {
@@ -166,13 +259,33 @@ impl Handle {
     }
 }
 
-/// Two unit vectors spanning the plane perpendicular to `axis`, in a fixed
-/// right-handed order so that angles are stable frame to frame.
-pub fn ring_basis(axis: Axis) -> (Vec3, Vec3) {
-    match axis {
-        Axis::X => (Vec3::Y, Vec3::Z),
-        Axis::Y => (Vec3::Z, Vec3::X),
-        Axis::Z => (Vec3::X, Vec3::Y),
+/// Two orthonormal unit vectors spanning the plane perpendicular to `axis`,
+/// in a fixed right-handed order (`u × v` points along `axis`) so that angles
+/// are stable from frame to frame.
+///
+/// The companions of a world axis are the same two the gizmo has always used;
+/// any other direction takes the world pair it is closest to and projects the
+/// axis out of it.
+pub fn ring_basis(axis: Vec3) -> (Vec3, Vec3) {
+    let n = axis.normalize_or_zero();
+    let (a, b) = {
+        let (ax, ay, az) = (n.x.abs(), n.y.abs(), n.z.abs());
+        if ax >= ay && ax >= az {
+            (Vec3::Y, Vec3::Z)
+        } else if ay >= az {
+            (Vec3::Z, Vec3::X)
+        } else {
+            (Vec3::X, Vec3::Y)
+        }
+    };
+    let u = (a - n * a.dot(n)).normalize_or_zero();
+    let v = (b - n * b.dot(n) - u * b.dot(u)).normalize_or_zero();
+    // A negative direction (or a turned one) can come out the wrong way round;
+    // the pair has to stay right-handed about the axis it spans.
+    if u.cross(v).dot(n) < 0.0 {
+        (u, -v)
+    } else {
+        (u, v)
     }
 }
 
@@ -184,10 +297,13 @@ pub fn pixel_size_to_world(distance: f32, fov_y: f32, height: f32, pixels: f32) 
     2.0 * distance.max(1e-3) * (fov_y * 0.5).tan() * (pixels / height)
 }
 
-/// The gizmo's world-space frame: where it sits and how big its handles are.
+/// The gizmo's world-space frame: where it sits, which way it points, and how
+/// big its handles are.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Frame {
     pub origin: Vec3,
+    /// Which way the three handles point.
+    pub basis: Basis,
     /// Length of one axis arm, in world units.
     pub arm: f32,
     /// Radius of the rotation rings, in world units.
@@ -197,22 +313,34 @@ pub struct Frame {
 impl Frame {
     /// A frame centred on `origin` whose handles are `pixels` tall on screen.
     ///
-    /// The size is derived from the distance between the eye and `origin`, not
-    /// from the camera's orbit radius, so a selection that has been moved away
-    /// from the camera's target keeps the same handle size on screen.
-    pub fn for_camera(camera: &Camera, viewport_height: f32, pixels: f32, origin: Vec3) -> Self {
-        let distance = (origin - camera.eye()).length();
+    /// The size is derived from the depth the projection gives `origin` — the
+    /// distance from the eye in perspective, and the view's own depth in an
+    /// orthographic view — so a selection that has been moved away from the
+    /// camera's target keeps the same handle size on screen.
+    pub fn for_camera(
+        camera: &Camera,
+        viewport_height: f32,
+        pixels: f32,
+        origin: Vec3,
+        basis: Basis,
+    ) -> Self {
+        let distance = camera.eye_depth(origin);
         let size = pixel_size_to_world(distance, camera.fov_y, viewport_height, pixels).max(1e-3);
-        Self { origin, arm: size, radius: size }
+        Self { origin, basis, arm: size, radius: size }
+    }
+
+    /// The world direction handle `axis` points along.
+    pub fn dir(&self, axis: Axis) -> Vec3 {
+        self.basis.axis(axis)
     }
 
     pub fn tip(&self, axis: Axis) -> Vec3 {
-        self.origin + axis.dir() * self.arm
+        self.origin + self.dir(axis) * self.arm
     }
 
     /// The rotation ring around `axis`, closed and sampled at `segments` points.
     pub fn ring(&self, axis: Axis, segments: usize) -> Vec<Vec3> {
-        let (u, v) = ring_basis(axis);
+        let (u, v) = ring_basis(self.dir(axis));
         let n = segments.max(3);
         (0..n)
             .map(|i| {
@@ -228,7 +356,7 @@ impl Frame {
     /// Corners run counter-clockwise as seen from the plane's normal side.
     pub fn plane_quad(&self, plane: Plane) -> [Vec3; 4] {
         let (u, v) = plane.axes();
-        let (du, dv) = (u.dir(), v.dir());
+        let (du, dv) = (self.dir(u), self.dir(v));
         let centre = self.origin + (du + dv) * (self.arm * PLANE_CENTRE);
         let half = self.arm * PLANE_HALF;
         [
@@ -448,8 +576,8 @@ pub fn ray_plane(ray: Ray, origin: Vec3, normal: Vec3) -> Option<Vec3> {
     Some(ray.at(t))
 }
 
-/// Signed angle of `p` around `axis`, measured in the axis' ring basis.
-pub fn plane_angle(origin: Vec3, axis: Axis, p: Vec3) -> f32 {
+/// Signed angle of `p` around the direction `axis`, measured in its ring basis.
+pub fn plane_angle(origin: Vec3, axis: Vec3, p: Vec3) -> f32 {
     let (u, v) = ring_basis(axis);
     let r = p - origin;
     r.dot(v).atan2(r.dot(u))
@@ -470,17 +598,18 @@ pub fn angle_delta(from: f32, to: f32) -> f32 {
 
 /// How far a drag has travelled, in the unit its mode consumes.
 ///
-/// A translation carries its world-space vector and a scale its per-axis
-/// factors, so a handle that works in one axis and a handle that works in a
-/// plane are the same shape to everything downstream: `1` in the factor of an
-/// axis a scale handle does not touch, `0` in the component a move does not.
+/// A translation carries its vector and a scale its per-axis factors, both
+/// written in the *gizmo's own* components (see [`Basis`]), so a handle that
+/// works in one axis and a handle that works in a plane are the same shape to
+/// everything downstream: `1` in the factor of an axis a scale handle does not
+/// touch, `0` in the component a move does not.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Measure {
-    /// Move: the world-space translation.
+    /// Move: the translation, in the gizmo's components.
     Translate(Vec3),
-    /// Scale: a multiplier per world axis, relative to the drag start.
+    /// Scale: a multiplier per gizmo axis, relative to the drag start.
     Scale(Vec3),
-    /// Rotate: radians around the axis.
+    /// Rotate: radians around the gizmo axis.
     Rotate(Axis, f32),
 }
 
@@ -499,20 +628,62 @@ fn factors(axes: &[Axis], f: f32) -> Vec3 {
     out
 }
 
-/// Apply a drag measure to one node's drag-start transform.
-pub fn apply_measure(start: &Transform, measure: Measure) -> Transform {
+/// The component of `v` that `axis` names.
+pub(crate) fn component(v: Vec3, axis: Axis) -> f32 {
+    match axis {
+        Axis::X => v.x,
+        Axis::Y => v.y,
+        Axis::Z => v.z,
+    }
+}
+
+/// `out` with `value` written into the component `axis` names, leaving the
+/// other two exactly as they were.
+pub(crate) fn set_component(out: Vec3, axis: Axis, value: f32) -> Vec3 {
+    match axis {
+        Axis::X => Vec3::new(value, out.y, out.z),
+        Axis::Y => Vec3::new(out.x, value, out.z),
+        Axis::Z => Vec3::new(out.x, out.y, value),
+    }
+}
+
+/// Apply a drag measure to one node's drag-start transform, about `origin` —
+/// the gizmo's own centre, which is the selection's or a pivot the user placed.
+///
+/// `basis` is the gizmo's: the measure's components are its axes, so a local
+/// gizmo moves the node along the way it is turned. Translation and rotation
+/// are exact in every basis; a scale is exact along the world axes and along a
+/// node's own axes (which is what a local gizmo asks for), and is applied to
+/// the node's own scale axes elsewhere — a node transform cannot carry the
+/// shear that scaling a turned object along a screen axis would need. Vertex
+/// targets do not go through here: they take [`measure_matrix`], which is
+/// exact in any basis.
+///
+/// A rotation or a scale moves the node's *position* about `origin` as well as
+/// its own transform, which is what makes a placed pivot mean something: with
+/// the pivot somewhere else, a turn swings the selection round it instead of
+/// spinning it in place.
+pub fn apply_measure(start: &Transform, basis: Basis, origin: Vec3, measure: Measure) -> Transform {
     let mut out = *start;
     match measure {
-        Measure::Translate(d) => out.translation = start.translation + d,
+        Measure::Translate(d) => out.translation = start.translation + basis.to_world(d),
         Measure::Scale(f) => {
-            out.scale = start.scale * Vec3::new(
+            let s = Vec3::new(
                 f.x.clamp(0.01, 1000.0),
                 f.y.clamp(0.01, 1000.0),
                 f.z.clamp(0.01, 1000.0),
-            )
+            );
+            out.scale = start.scale * s;
+            // The node's own position swings with the same stretch, exactly:
+            // the map is a linear one however the basis is turned.
+            let b = glam::Mat3::from_cols(basis.x, basis.y, basis.z);
+            let linear = b * glam::Mat3::from_diagonal(s) * b.transpose();
+            out.translation = origin + linear * (start.translation - origin);
         }
         Measure::Rotate(axis, a) => {
-            out.rotation = Quat::from_axis_angle(axis.dir(), a) * start.rotation
+            let spin = Quat::from_axis_angle(basis.axis(axis), a);
+            out.rotation = spin * start.rotation;
+            out.translation = origin + spin * (start.translation - origin);
         }
     }
     out
@@ -525,6 +696,9 @@ pub struct Anchor {
     pub mode: TransformMode,
     pub handle: Handle,
     pub origin: Vec3,
+    /// Which way the handles point, fixed for the whole gesture: a gizmo whose
+    /// basis moved with the object it is dragging would chase itself.
+    pub basis: Basis,
     /// The plane a non-axis drag is resolved in: the plane's own normal for a
     /// plane handle, the camera's view direction for the centre handle.
     plane_normal: Vec3,
@@ -544,33 +718,37 @@ impl Anchor {
         mode: TransformMode,
         handle: Handle,
         origin: Vec3,
+        basis: Basis,
         ray: Ray,
         view: Vec3,
     ) -> Option<Self> {
+        let dir = |axis: Axis| basis.axis(axis);
         let plane_normal = match handle {
-            Handle::Axis(axis) => axis.dir(),
-            Handle::Plane(plane) => plane.normal().dir(),
+            Handle::Axis(axis) => dir(axis),
+            Handle::Plane(plane) => dir(plane.normal()),
             Handle::Centre => view.normalize_or_zero(),
         };
         match (mode, handle) {
             (TransformMode::Rotate, Handle::Axis(axis)) => {
-                let p = ray_plane(ray, origin, axis.dir())?;
+                let p = ray_plane(ray, origin, dir(axis))?;
                 Some(Self {
                     mode,
                     handle,
                     origin,
+                    basis,
                     plane_normal,
                     start_point: origin,
-                    start_angle: plane_angle(origin, axis, p),
+                    start_angle: plane_angle(origin, dir(axis), p),
                 })
             }
             (TransformMode::Rotate, _) => None,
             (_, Handle::Axis(axis)) => {
-                let p = closest_point_on_line(ray, origin, axis.dir())?;
+                let p = closest_point_on_line(ray, origin, dir(axis))?;
                 Some(Self {
                     mode,
                     handle,
                     origin,
+                    basis,
                     plane_normal,
                     start_point: p,
                     start_angle: 0.0,
@@ -582,6 +760,7 @@ impl Anchor {
                     mode,
                     handle,
                     origin,
+                    basis,
                     plane_normal,
                     start_point: p,
                     start_angle: 0.0,
@@ -591,30 +770,48 @@ impl Anchor {
     }
 
     pub fn measure(&self, ray: Ray) -> Option<Measure> {
+        let dir = |axis: Axis| self.basis.axis(axis);
         match (self.mode, self.handle) {
             (TransformMode::Rotate, Handle::Axis(axis)) => {
-                let p = ray_plane(ray, self.origin, axis.dir())?;
-                let angle = angle_delta(self.start_angle, plane_angle(self.origin, axis, p));
+                let p = ray_plane(ray, self.origin, dir(axis))?;
+                let angle = angle_delta(
+                    self.start_angle,
+                    plane_angle(self.origin, dir(axis), p),
+                );
                 Some(Measure::Rotate(axis, angle))
             }
             (TransformMode::Move, Handle::Axis(axis)) => {
-                let dir = axis.dir();
-                let p = closest_point_on_line(ray, self.origin, dir)?;
-                Some(Measure::Translate(dir * (p - self.start_point).dot(dir)))
+                let d = dir(axis);
+                let p = closest_point_on_line(ray, self.origin, d)?;
+                // The measure is written in the gizmo's components, so only the
+                // axis that moved carries a value and the other two are exactly
+                // zero however the basis is turned.
+                let travel = (p - self.start_point).dot(d);
+                Some(Measure::Translate(set_component(Vec3::ZERO, axis, travel)))
             }
             (TransformMode::Move, _) => {
                 // A plane or centre handle: the cursor's own point in the
                 // drag's plane, relative to where the grab began. Both points
-                // lie in that plane, so their difference lies in no axis the
-                // handle must not move.
+                // lie in that plane, so a plane's delta has no share of its own
+                // normal, which is exactly what its measure leaves at zero.
                 let p = ray_plane(ray, self.origin, self.plane_normal)?;
-                Some(Measure::Translate(p - self.start_point))
+                let world = p - self.start_point;
+                let d = match self.handle {
+                    Handle::Plane(plane) => {
+                        let (u, v) = plane.axes();
+                        let mut c = set_component(Vec3::ZERO, u, world.dot(dir(u)));
+                        c = set_component(c, v, world.dot(dir(v)));
+                        c
+                    }
+                    _ => self.basis.components(world),
+                };
+                Some(Measure::Translate(d))
             }
             (TransformMode::Scale, Handle::Axis(axis)) => {
-                let dir = axis.dir();
-                let p = closest_point_on_line(ray, self.origin, dir)?;
-                let start = (self.start_point - self.origin).dot(dir);
-                let now = (p - self.origin).dot(dir);
+                let d = dir(axis);
+                let p = closest_point_on_line(ray, self.origin, d)?;
+                let start = (self.start_point - self.origin).dot(d);
+                let now = (p - self.origin).dot(d);
                 // Grabbing the arm away from the centre gives a true ratio;
                 // near the centre that ratio explodes, so fall back to an
                 // additive factor there.
@@ -645,12 +842,29 @@ impl Anchor {
 }
 
 /// The world-space transform a measure describes, about `pivot`.
-pub fn measure_matrix(measure: Measure, pivot: Vec3) -> Mat4 {
+///
+/// Every mode is exact here, whatever the basis: a scale along the gizmo's
+/// axes maps each of them to `factor * axis`, which is a full linear map and
+/// not a diagonal one — that is why vertex targets take this route.
+pub fn measure_matrix(measure: Measure, basis: Basis, pivot: Vec3) -> Mat4 {
     let about_pivot = |m: Mat4| Mat4::from_translation(pivot) * m * Mat4::from_translation(-pivot);
     match measure {
-        Measure::Translate(d) => Mat4::from_translation(d),
-        Measure::Scale(f) => about_pivot(Mat4::from_scale(f)),
-        Measure::Rotate(axis, a) => about_pivot(Mat4::from_axis_angle(axis.dir(), a)),
+        Measure::Translate(d) => Mat4::from_translation(basis.to_world(d)),
+        Measure::Scale(f) => {
+            let s = Vec3::new(
+                f.x.clamp(0.01, 1000.0),
+                f.y.clamp(0.01, 1000.0),
+                f.z.clamp(0.01, 1000.0),
+            );
+            // Each of the gizmo's axes is stretched by its own factor: the map
+            // is `B · S · B⁻¹`, which for the world basis is the plain diagonal
+            // scale and for a turned one is the same stretch about that axis.
+            let b = glam::Mat3::from_cols(basis.x, basis.y, basis.z);
+            about_pivot(Mat4::from_mat3(b * glam::Mat3::from_diagonal(s) * b.transpose()))
+        }
+        Measure::Rotate(axis, a) => {
+            about_pivot(Mat4::from_axis_angle(basis.axis(axis), a))
+        }
     }
 }
 
@@ -768,8 +982,9 @@ impl Gizmo {
     ) -> bool {
         let Some(drag) = self.drag.as_ref() else { return false };
         let Some(measure) = drag.anchor.measure(ray) else { return false };
-        let measure = crate::snap::snap_measure(
+        let measure = crate::snap::snap_measure_in(
             snap,
+            drag.anchor.basis,
             &drag.handle.axes(),
             drag.anchor.origin,
             measure,
@@ -779,13 +994,14 @@ impl Gizmo {
             Targets::Nodes(nodes) => {
                 for (id, start) in nodes {
                     let Ok(node) = scene.get_mut(*id) else { continue };
-                    node.transform = apply_measure(start, measure);
+                    node.transform =
+                        apply_measure(start, drag.anchor.basis, drag.anchor.origin, measure);
                 }
             }
             Targets::Vertices(targets) => {
                 // The measure is world-space; the vertices are mesh-local, so
                 // the transform is carried through each node's world matrix.
-                let world_space = measure_matrix(measure, drag.anchor.origin);
+                let world_space = measure_matrix(measure, drag.anchor.basis, drag.anchor.origin);
                 for target in targets {
                     let Ok(world) = scene.world_matrix(target.node) else { continue };
                     if world.determinant().abs() < 1e-12 {
@@ -858,12 +1074,12 @@ mod tests {
     #[test]
     fn handle_size_follows_the_gizmo_distance_not_the_orbit_radius() {
         let cam = camera();
-        let at_target = Frame::for_camera(&cam, 500.0, 90.0, cam.target);
+        let at_target = Frame::for_camera(&cam, 500.0, 90.0, cam.target, Basis::WORLD);
         // Halfway from the eye to the target: half the world size, which is the
         // same number of pixels on screen.
         let eye = cam.eye();
         let half_way = eye + (cam.target - eye) * 0.5;
-        let nearer = Frame::for_camera(&cam, 500.0, 90.0, half_way);
+        let nearer = Frame::for_camera(&cam, 500.0, 90.0, half_way, Basis::WORLD);
         assert!(
             (nearer.arm - at_target.arm * 0.5).abs() < 1e-3,
             "{} vs {}",
@@ -874,13 +1090,13 @@ mod tests {
 
     #[test]
     fn ring_points_lie_in_the_axis_plane() {
-        let frame = Frame { origin: Vec3::new(1.0, 2.0, 3.0), arm: 2.0, radius: 2.0 };
+        let frame = Frame { origin: Vec3::new(1.0, 2.0, 3.0), arm: 2.0, radius: 2.0, basis: Basis::WORLD };
         for axis in Axis::ALL {
             let ring = frame.ring(axis, 16);
             assert_eq!(ring.len(), 16);
             for p in ring {
                 let offset = p - frame.origin;
-                assert!(offset.dot(axis.dir()).abs() < 1e-4, "{axis:?} ring is flat");
+                assert!(offset.dot(Basis::WORLD.axis(axis)).abs() < 1e-4, "{axis:?} ring is flat");
                 assert!((offset.length() - frame.radius).abs() < 1e-4, "{axis:?} ring radius");
             }
         }
@@ -888,13 +1104,13 @@ mod tests {
 
     #[test]
     fn tips_sit_along_their_axis() {
-        let frame = Frame { origin: Vec3::ZERO, arm: 2.0, radius: 2.0 };
+        let frame = Frame { origin: Vec3::ZERO, arm: 2.0, radius: 2.0, basis: Basis::WORLD };
         assert_eq!(frame.tip(Axis::Y), Vec3::new(0.0, 2.0, 0.0));
     }
 
     #[test]
     fn hit_axis_finds_the_arm_under_the_cursor() {
-        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0 };
+        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0, basis: Basis::WORLD };
         let layout = layout_for(&frame);
         let tip = layout
             .arms
@@ -913,7 +1129,7 @@ mod tests {
 
     #[test]
     fn hit_axis_reports_the_nearest_arm() {
-        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0 };
+        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0, basis: Basis::WORLD };
         let layout = layout_for(&frame);
         // A cursor a couple of pixels off the Y arm picks Y, not a neighbour,
         // as long as no other arm is closer.
@@ -924,7 +1140,7 @@ mod tests {
 
     #[test]
     fn hit_ring_finds_a_ring_edge() {
-        let frame = Frame { origin: Vec3::ZERO, arm: 1.5, radius: 1.5 };
+        let frame = Frame { origin: Vec3::ZERO, arm: 1.5, radius: 1.5, basis: Basis::WORLD };
         let layout = layout_for(&frame);
         let (axis, pts) = layout
             .rings
@@ -961,24 +1177,24 @@ mod tests {
 
     #[test]
     fn a_plane_quad_sits_between_its_two_axes_and_off_the_third() {
-        let frame = Frame { origin: Vec3::new(1.0, 0.0, -2.0), arm: 2.0, radius: 2.0 };
+        let frame = Frame { origin: Vec3::new(1.0, 0.0, -2.0), arm: 2.0, radius: 2.0, basis: Basis::WORLD };
         for plane in Plane::ALL {
             let (u, v) = plane.axes();
             let quad = frame.plane_quad(plane);
             let centre: Vec3 = quad.iter().sum::<Vec3>() / 4.0;
             let offset = centre - frame.origin;
             // Halfway out along both axes of the plane, and nowhere else.
-            let expected = (u.dir() + v.dir()) * (frame.arm * PLANE_CENTRE);
+            let expected = (Basis::WORLD.axis(u) + Basis::WORLD.axis(v)) * (frame.arm * PLANE_CENTRE);
             assert!((offset - expected).length() < 1e-5, "{plane:?}: {offset:?}");
             assert!(
-                offset.dot(plane.normal().dir()).abs() < 1e-5,
+                offset.dot(Basis::WORLD.axis(plane.normal())).abs() < 1e-5,
                 "{plane:?} stays out of its own normal"
             );
 
             // Every corner lies in the plane, and the sides are square.
             for corner in quad {
                 let off = corner - frame.origin;
-                assert!(off.dot(plane.normal().dir()).abs() < 1e-5);
+                assert!(off.dot(Basis::WORLD.axis(plane.normal())).abs() < 1e-5);
             }
             let side = (quad[1] - quad[0]).length();
             assert!((side - frame.arm * PLANE_HALF * 2.0).abs() < 1e-5, "{plane:?} side {side}");
@@ -989,7 +1205,7 @@ mod tests {
 
     #[test]
     fn the_cursor_picks_the_handle_it_appears_to_be_over() {
-        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0 };
+        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0, basis: Basis::WORLD };
         let layout = layout_for(&frame);
         let tol = HIT_TOLERANCE;
 
@@ -1016,7 +1232,7 @@ mod tests {
 
     #[test]
     fn a_rotate_gizmo_offers_only_its_rings() {
-        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0 };
+        let frame = Frame { origin: Vec3::ZERO, arm: 1.0, radius: 1.0, basis: Basis::WORLD };
         let layout = layout_for(&frame);
         // Rotate has no plane square and no centre handle: the origin is free,
         // even though it is the middle of every ring.
@@ -1086,12 +1302,12 @@ mod tests {
 
     #[test]
     fn plane_angle_follows_the_ring_basis() {
-        let frame = Frame { origin: Vec3::new(2.0, -1.0, 0.5), arm: 1.0, radius: 1.0 };
-        let (u, v) = ring_basis(Axis::Z);
+        let frame = Frame { origin: Vec3::new(2.0, -1.0, 0.5), arm: 1.0, radius: 1.0, basis: Basis::WORLD };
+        let (u, v) = ring_basis(Basis::WORLD.axis(Axis::Z));
         let on_u = frame.origin + u;
         let on_v = frame.origin + v;
-        assert!(plane_angle(frame.origin, Axis::Z, on_u).abs() < 1e-5);
-        assert!((plane_angle(frame.origin, Axis::Z, on_v) - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+        assert!(plane_angle(frame.origin, Basis::WORLD.axis(Axis::Z), on_u).abs() < 1e-5);
+        assert!((plane_angle(frame.origin, Basis::WORLD.axis(Axis::Z), on_v) - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
     }
 
     #[test]
@@ -1105,7 +1321,7 @@ mod tests {
 
     #[test]
     fn measure_translates_along_the_axis() {
-        let anchor = Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, Ray {
+        let anchor = Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, Basis::WORLD, Ray {
             origin: Vec3::new(2.0, 5.0, 0.0),
             direction: -Vec3::Y,
         }, VIEW)
@@ -1117,14 +1333,14 @@ mod tests {
         assert_eq!(m, Measure::Translate(Vec3::X * 2.0));
 
         let start = Transform::from_translation(Vec3::new(1.0, 1.0, 1.0));
-        let moved = apply_measure(&start, m);
+        let moved = apply_measure(&start, Basis::WORLD, Vec3::ZERO, m);
         assert!((moved.translation - Vec3::new(3.0, 1.0, 1.0)).length() < 1e-5);
     }
 
     #[test]
     fn measure_scales_relative_to_the_grab_point() {
         let origin = Vec3::ZERO;
-        let anchor = Anchor::new(TransformMode::Scale, Handle::Axis(Axis::Y), origin, Ray {
+        let anchor = Anchor::new(TransformMode::Scale, Handle::Axis(Axis::Y), origin, Basis::WORLD, Ray {
             origin: Vec3::new(6.0, 1.0, 0.0),
             direction: -Vec3::X,
         }, VIEW)
@@ -1136,7 +1352,7 @@ mod tests {
         assert_eq!(m, Measure::Scale(Vec3::new(1.0, 2.0, 1.0)));
 
         let start = Transform::identity();
-        let scaled = apply_measure(&start, m);
+        let scaled = apply_measure(&start, Basis::WORLD, Vec3::ZERO, m);
         assert!(
             (scaled.scale - Vec3::new(1.0, 2.0, 1.0)).length() < 1e-5,
             "only the grabbed axis scales: {:?}",
@@ -1144,7 +1360,7 @@ mod tests {
         );
 
         // Shrinking towards the centre is clamped, never inverted.
-        let tiny = apply_measure(&start, Measure::Scale(Vec3::new(1.0, -3.0, 1.0)));
+        let tiny = apply_measure(&start, Basis::WORLD, Vec3::ZERO, Measure::Scale(Vec3::new(1.0, -3.0, 1.0)));
         assert!(tiny.scale.y > 0.0);
     }
 
@@ -1155,7 +1371,7 @@ mod tests {
         let anchor = Anchor::new(
             TransformMode::Rotate,
             Handle::Axis(Axis::Z),
-            Vec3::ZERO,
+            Vec3::ZERO, Basis::WORLD,
             ray_at(1.0, 0.0),
             VIEW,
         )
@@ -1170,7 +1386,7 @@ mod tests {
         }
 
         let start = Transform::identity();
-        let spun = apply_measure(&start, m);
+        let spun = apply_measure(&start, Basis::WORLD, Vec3::ZERO, m);
         let rotated = spun.rotation * Vec3::X;
         assert!((rotated - Vec3::Y).length() < 1e-4, "X rotated into Y, got {rotated:?}");
     }
@@ -1183,7 +1399,7 @@ mod tests {
         let anchor = Anchor::new(
             TransformMode::Move,
             Handle::Plane(Plane::XY),
-            Vec3::ZERO,
+            Vec3::ZERO, Basis::WORLD,
             ray_at(1.0, 1.0),
             VIEW,
         )
@@ -1191,7 +1407,7 @@ mod tests {
         let m = anchor.measure(ray_at(3.0, -1.0)).unwrap();
         assert_eq!(m, Measure::Translate(Vec3::new(2.0, -2.0, 0.0)));
 
-        let moved = apply_measure(&Transform::from_translation(Vec3::new(0.0, 0.0, 7.0)), m);
+        let moved = apply_measure(&Transform::from_translation(Vec3::new(0.0, 0.0, 7.0)), Basis::WORLD, Vec3::ZERO, m);
         assert!((moved.translation - Vec3::new(2.0, -2.0, 7.0)).length() < 1e-5);
     }
 
@@ -1200,7 +1416,7 @@ mod tests {
         let anchor = Anchor::new(
             TransformMode::Scale,
             Handle::Plane(Plane::ZX),
-            Vec3::ZERO,
+            Vec3::ZERO, Basis::WORLD,
             Ray { origin: Vec3::new(1.0, 6.0, 0.0), direction: -Vec3::Y },
             VIEW,
         )
@@ -1211,7 +1427,7 @@ mod tests {
             .unwrap();
         assert_eq!(m, Measure::Scale(Vec3::new(3.0, 1.0, 3.0)));
 
-        let scaled = apply_measure(&Transform::identity(), m);
+        let scaled = apply_measure(&Transform::identity(), Basis::WORLD, Vec3::ZERO, m);
         assert!((scaled.scale - Vec3::new(3.0, 1.0, 3.0)).length() < 1e-5);
     }
 
@@ -1223,7 +1439,7 @@ mod tests {
         let move_anchor = Anchor::new(
             TransformMode::Move,
             Handle::Centre,
-            Vec3::ZERO,
+            Vec3::ZERO, Basis::WORLD,
             ray_at(1.0, 0.0),
             VIEW,
         )
@@ -1235,7 +1451,7 @@ mod tests {
         let scale_anchor = Anchor::new(
             TransformMode::Scale,
             Handle::Centre,
-            Vec3::ZERO,
+            Vec3::ZERO, Basis::WORLD,
             ray_at(2.0, 0.0),
             VIEW,
         )
@@ -1247,7 +1463,7 @@ mod tests {
         assert!(Anchor::new(
             TransformMode::Rotate,
             Handle::Centre,
-            Vec3::ZERO,
+            Vec3::ZERO, Basis::WORLD,
             ray_at(1.0, 0.0),
             VIEW
         )
@@ -1268,7 +1484,7 @@ mod tests {
         let mut gizmo = Gizmo::default();
         let ray = Ray { origin: Vec3::new(0.0, 0.0, 5.0), direction: -Vec3::Z };
         let anchor =
-            Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, ray, VIEW).unwrap();
+            Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, Basis::WORLD, ray, VIEW).unwrap();
         let start = scene.get(id).unwrap().transform;
         gizmo.begin(Drag {
             mode: TransformMode::Move,
@@ -1293,17 +1509,17 @@ mod tests {
         let pivot = Vec3::new(1.0, 0.0, 0.0);
         let p = Vec3::new(2.0, 0.0, 0.0);
 
-        let moved = measure_matrix(Measure::Translate(Vec3::X * 3.0), pivot).transform_point3(p);
+        let moved = measure_matrix(Measure::Translate(Vec3::X * 3.0), Basis::WORLD, pivot).transform_point3(p);
         assert!((moved - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5, "got {moved:?}");
 
         // Scaling about the pivot: x = 1 + (2 - 1) * 2.
         let scaled =
-            measure_matrix(Measure::Scale(Vec3::new(2.0, 1.0, 1.0)), pivot).transform_point3(p);
+            measure_matrix(Measure::Scale(Vec3::new(2.0, 1.0, 1.0)), Basis::WORLD, pivot).transform_point3(p);
         assert!((scaled - Vec3::new(3.0, 0.0, 0.0)).length() < 1e-5, "got {scaled:?}");
 
         // A quarter turn about Z around the pivot sends +X to +Y.
         let spun = measure_matrix(
-            Measure::Rotate(Axis::Z, std::f32::consts::FRAC_PI_2),
+            Measure::Rotate(Axis::Z, std::f32::consts::FRAC_PI_2), Basis::WORLD,
             pivot,
         )
         .transform_point3(p);
@@ -1326,7 +1542,7 @@ mod tests {
     fn vertex_drag(node: NodeId, positions: Vec<(u32, Vec3)>) -> (Gizmo, Vec3) {
         let ray = Ray { origin: Vec3::new(0.0, 5.0, 0.0), direction: -Vec3::Y };
         let anchor =
-            Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, ray, VIEW).unwrap();
+            Anchor::new(TransformMode::Move, Handle::Axis(Axis::X), Vec3::ZERO, Basis::WORLD, ray, VIEW).unwrap();
         let mut gizmo = Gizmo::default();
         gizmo.begin(Drag {
             mode: TransformMode::Move,
@@ -1406,7 +1622,7 @@ mod tests {
         let anchor = Anchor::new(
             TransformMode::Scale,
             Handle::Axis(Axis::Y),
-            Vec3::ZERO,
+            Vec3::ZERO, Basis::WORLD,
             Ray { origin: Vec3::new(5.0, 1.0, 0.0), direction: -Vec3::X },
             VIEW,
         )
@@ -1437,7 +1653,7 @@ mod tests {
     #[test]
     fn a_lone_axis_grab_does_not_move_the_other_axes() {
         let start = Transform::from_translation(Vec3::new(4.0, 4.0, 4.0));
-        let moved = apply_measure(&start, Measure::Translate(Vec3::new(0.0, 0.0, -2.0)));
+        let moved = apply_measure(&start, Basis::WORLD, Vec3::ZERO, Measure::Translate(Vec3::new(0.0, 0.0, -2.0)));
         assert!((moved.translation - Vec3::new(4.0, 4.0, 2.0)).length() < 1e-5);
     }
 
@@ -1461,4 +1677,242 @@ mod tests {
         assert!(moving_nodes.is_empty());
         assert_eq!(moving_vertices, vec![(id, 0), (id, 2)]);
     }
+    #[test]
+    fn the_axes_modes_name_themselves_and_the_world_basis_is_the_default() {
+        let names: Vec<&str> = Axes::ALL.iter().map(|a| a.label()).collect();
+        assert_eq!(names, vec!["World", "Local", "Screen"]);
+        assert_eq!(Axes::default(), Axes::World);
+        assert_eq!(Basis::default(), Basis::WORLD);
+        for (axis, dir) in [(Axis::X, Vec3::X), (Axis::Y, Vec3::Y), (Axis::Z, Vec3::Z)] {
+            assert_eq!(Basis::WORLD.axis(axis), dir);
+        }
+        // Components and back is the identity for an orthonormal basis, and it
+        // is exact on the world's own axes.
+        let v = Vec3::new(1.0, -2.0, 3.0);
+        assert_eq!(Basis::WORLD.components(v), v);
+        assert_eq!(Basis::WORLD.to_world(Basis::WORLD.components(v)), v);
+    }
+
+    #[test]
+    fn a_local_basis_takes_a_turned_transform_its_own_axes() {
+        // A quarter turn about Y sends X to -Z and Z to +X.
+        let basis = Basis::of_matrix(Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2));
+        assert!((basis.axis(Axis::X) - -Vec3::Z).length() < 1e-5, "{:?}", basis.x);
+        assert!((basis.axis(Axis::Y) - Vec3::Y).length() < 1e-5, "{:?}", basis.y);
+        assert!((basis.axis(Axis::Z) - Vec3::X).length() < 1e-5, "{:?}", basis.z);
+        // A scaled node's axes stay unit: the gizmo points the way the object
+        // does, not as far.
+        let basis = Basis::of_matrix(Mat4::from_scale(Vec3::new(5.0, 0.5, 2.0)));
+        for axis in Axis::ALL {
+            assert!((basis.axis(axis).length() - 1.0).abs() < 1e-5, "{axis:?}");
+        }
+        assert!((basis.axis(Axis::X) - Vec3::X).length() < 1e-5);
+        // An untransformed node is the world.
+        assert_eq!(Basis::of_matrix(Mat4::IDENTITY), Basis::WORLD);
+    }
+
+    #[test]
+    fn a_screen_basis_is_right_up_and_out_of_the_screen() {
+        // Looking down -Z: right is +X, up is +Y, and the third axis points out
+        // of the screen, back at the viewer.
+        let camera = Camera { yaw: std::f32::consts::FRAC_PI_2, pitch: 0.0, ..Camera::default() };
+        let basis = Basis::of_camera(&camera);
+        assert!((basis.axis(Axis::X) - Vec3::X).length() < 1e-5, "{:?}", basis.x);
+        assert!((basis.axis(Axis::Y) - Vec3::Y).length() < 1e-5, "{:?}", basis.y);
+        assert!((basis.axis(Axis::Z) - Vec3::Z).length() < 1e-5, "{:?}", basis.z);
+        assert!(basis.z.dot(camera.forward()) < -0.99, "out of the screen");
+
+        // Whatever the orbit, the three stay orthonormal and right-handed, and
+        // the third is still the way out of the screen.
+        let camera = Camera { yaw: 0.7, pitch: -0.4, ..Camera::default() };
+        let basis = Basis::of_camera(&camera);
+        for (a, b) in [
+            (basis.x, basis.y),
+            (basis.y, basis.z),
+            (basis.z, basis.x),
+        ] {
+            assert!(a.dot(b).abs() < 1e-5, "square to each other");
+            assert!((a.length() - 1.0).abs() < 1e-5, "unit");
+        }
+        assert!((basis.x.cross(basis.y) - basis.z).length() < 1e-5, "right-handed");
+        assert!(basis.z.dot(camera.forward()) < -0.99);
+    }
+
+    #[test]
+    fn ring_basis_spans_the_plane_around_any_direction() {
+        // The world axes keep the companions they have always had, in the same
+        // order, so the angle a ring reports has not moved.
+        for (dir, expected) in [
+            (Vec3::X, (Vec3::Y, Vec3::Z)),
+            (Vec3::Y, (Vec3::Z, Vec3::X)),
+            (Vec3::Z, (Vec3::X, Vec3::Y)),
+        ] {
+            let (u, v) = ring_basis(dir);
+            assert!((u - expected.0).length() < 1e-5 && (v - expected.1).length() < 1e-5);
+        }
+        // Any other direction: the two companions stay unit, square to the axis
+        // and to each other, and right-handed about it.
+        for dir in [Vec3::new(1.0, 2.0, 3.0), Vec3::new(-1.0, 0.3, 0.0), -Vec3::Y] {
+            let n = dir.normalize();
+            let (u, v) = ring_basis(dir);
+            assert!(u.dot(n).abs() < 1e-5 && v.dot(n).abs() < 1e-5, "square to the axis");
+            assert!(u.dot(v).abs() < 1e-5, "square to each other");
+            assert!((u.length() - 1.0).abs() < 1e-5 && (v.length() - 1.0).abs() < 1e-5);
+            assert!((u.cross(v) - n).length() < 1e-4, "right-handed about {n:?}");
+        }
+    }
+
+    #[test]
+    fn a_move_along_a_turned_axis_follows_it_and_leaves_the_rest_exactly_zero() {
+        // A basis whose X handle points along world +Z: a rigid quarter turn
+        // about Y the other way.
+        let basis = Basis::of_matrix(Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2));
+        assert!((basis.axis(Axis::X) - Vec3::Z).length() < 1e-5);
+        // A ray that slides along world Z, so it meets the turned X handle,
+        // which is the world Z axis.
+        let ray = |z: f32| Ray { origin: Vec3::new(2.0, 0.0, z), direction: -Vec3::X };
+        let anchor = Anchor::new(
+            TransformMode::Move,
+            Handle::Axis(Axis::X),
+            Vec3::ZERO,
+            basis,
+            ray(5.0),
+            VIEW,
+        )
+        .expect("the ray meets the axis");
+        let m = anchor.measure(ray(8.0)).expect("a measure each frame");
+        assert_eq!(
+            m,
+            Measure::Translate(Vec3::new(3.0, 0.0, 0.0)),
+            "three along the gizmo's own X, and nothing else at all"
+        );
+
+        // The node follows that turned axis — world +Z, not the world axis its
+        // handle is named after.
+        let start = Transform::from_translation(Vec3::new(1.0, 1.0, 1.0));
+        let moved = apply_measure(&start, basis, Vec3::ZERO, m);
+        assert!(
+            (moved.translation - Vec3::new(1.0, 1.0, 4.0)).length() < 1e-5,
+            "got {:?}",
+            moved.translation
+        );
+    }
+
+    #[test]
+    fn a_plane_handle_in_a_turned_frame_stays_in_its_own_plane() {
+        let basis = Basis::of_matrix(Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2));
+        // The XY square spans the gizmo's X (world Z) and Y (world Y), and its
+        // normal is the gizmo's Z (world -X): its plane is x = 0.
+        let ray_to = |p: Vec3| Ray {
+            origin: p + Vec3::X * 10.0,
+            direction: -Vec3::X,
+        };
+        let anchor = Anchor::new(
+            TransformMode::Move,
+            Handle::Plane(Plane::XY),
+            Vec3::ZERO,
+            basis,
+            ray_to(Vec3::new(0.0, 1.0, 4.0)),
+            VIEW,
+        )
+        .expect("the ray meets the plane");
+        let m = anchor
+            .measure(ray_to(Vec3::new(0.0, 2.0, 5.0)))
+            .expect("a measure each frame");
+        let Measure::Translate(d) = m else { panic!("a move") };
+        assert_eq!(d.z, 0.0, "the normal's own component is left exactly zero");
+        assert!((d.x - 1.0).abs() < 1e-4, "one along the turned X: {d:?}");
+        assert!((d.y - 1.0).abs() < 1e-4, "one along Y: {d:?}");
+        // And the world translation lies in the plane: nothing along its normal.
+        let world = basis.to_world(d);
+        assert!(world.dot(basis.axis(Axis::Z)).abs() < 1e-4, "{world:?}");
+        assert!((world - Vec3::new(0.0, 1.0, 1.0)).length() < 1e-3, "{world:?}");
+    }
+
+    #[test]
+    fn a_scale_in_a_turned_basis_stretches_along_its_own_axes() {
+        let basis = Basis::of_matrix(Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2));
+        // Vertex targets take the whole matrix, so this is exact however the
+        // basis is turned: a point one along the gizmo's X (world Z) doubles
+        // along that axis...
+        let m = measure_matrix(Measure::Scale(Vec3::new(2.0, 1.0, 1.0)), basis, Vec3::ZERO);
+        let stretched = m.transform_point3(Vec3::Z);
+        assert!((stretched - Vec3::new(0.0, 0.0, 2.0)).length() < 1e-5, "got {stretched:?}");
+        // ...and one along a gizmo axis that does not scale stays put.
+        let same = m.transform_point3(Vec3::X);
+        assert!((same - Vec3::X).length() < 1e-5, "got {same:?}");
+        // About a pivot, so a scale does not drag the geometry to the origin.
+        let about = measure_matrix(
+            Measure::Scale(Vec3::new(2.0, 1.0, 1.0)),
+            basis,
+            Vec3::new(0.0, 0.0, 1.0),
+        );
+        let p = about.transform_point3(Vec3::new(0.0, 0.0, 2.0));
+        assert!((p - Vec3::new(0.0, 0.0, 3.0)).length() < 1e-5, "got {p:?}");
+    }
+
+    #[test]
+    fn a_rotation_in_a_turned_basis_turns_about_the_turned_axis() {
+        let basis = Basis::of_matrix(Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2));
+        // The gizmo's Z handle is world -X here, so a quarter turn about it is
+        // a quarter turn about world -X.
+        let turned = apply_measure(
+            &Transform::identity(),
+            basis, Vec3::ZERO,
+            Measure::Rotate(Axis::Z, std::f32::consts::FRAC_PI_2),
+        );
+        let (axis, angle) = turned.rotation.to_axis_angle();
+        assert!((axis - -Vec3::X).length() < 1e-4, "got {axis:?}");
+        assert!((angle - std::f32::consts::FRAC_PI_2).abs() < 1e-4, "got {angle}");
+
+        // Vertices take the same turn, from the same axis, about the pivot.
+        let m = measure_matrix(
+            Measure::Rotate(Axis::Z, std::f32::consts::FRAC_PI_2),
+            basis,
+            Vec3::new(0.0, 1.0, 0.0),
+        );
+        // A point one above the pivot swings a quarter turn about world -X,
+        // which is towards -Z.
+        let p = m.transform_point3(Vec3::new(0.0, 2.0, 0.0));
+        assert!((p - Vec3::new(0.0, 1.0, -1.0)).length() < 1e-4, "got {p:?}");
+        // And the pivot itself is the one point that does not move.
+        let still = m.transform_point3(Vec3::new(0.0, 1.0, 0.0));
+        assert!((still - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-5);
+    }
+
+    #[test]
+    fn a_view_sizes_the_handles_by_the_depth_its_projection_uses() {
+        let origin = Vec3::ZERO;
+        let size = [800.0, 800.0];
+        // How many pixels an arm of this length comes out as on screen.
+        let arm_pixels = |camera: &Camera, frame: &Frame| {
+            let vp = camera.view_proj(size[0] / size[1]);
+            let (ax, ay, _) = viewport::project(vp, frame.origin, size).expect("the origin projects");
+            let tip = frame.origin + frame.dir(Axis::X) * frame.arm;
+            let (bx, by, _) = viewport::project(vp, tip, size).expect("the tip projects");
+            ((bx - ax).powi(2) + (by - ay).powi(2)).sqrt()
+        };
+
+        // Looking straight down -Z, the arm is across the screen, so the pixel
+        // length is the arm's own size on screen.
+        let mut camera = Camera { target: origin, yaw: std::f32::consts::FRAC_PI_2, pitch: 0.0, ..Camera::default() };
+        let frame = Frame::for_camera(&camera, size[1], HANDLE_PIXELS, origin, Basis::WORLD);
+        assert!(
+            (arm_pixels(&camera, &frame) - HANDLE_PIXELS).abs() < 1.0,
+            "in perspective the arm is {} pixels",
+            arm_pixels(&camera, &frame)
+        );
+
+        // The same from an orthographic front view: its eye stands a fixed way
+        // back, so sizing by the eye distance would draw a handle thousands of
+        // pixels long. The projection's own depth is what counts.
+        camera.set_view(viewport::ViewKind::Front);
+        let frame = Frame::for_camera(&camera, size[1], HANDLE_PIXELS, origin, Basis::WORLD);
+        assert!(
+            (arm_pixels(&camera, &frame) - HANDLE_PIXELS).abs() < 1.0,
+            "and in an axis view too: {} pixels",
+            arm_pixels(&camera, &frame)
+        );
+    }
+
 }

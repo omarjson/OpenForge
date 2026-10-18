@@ -8,7 +8,7 @@
 //! travelled, so a drag comes to rest on a grid value wherever it started;
 //! `Vertex` mode lands the grabbed point on the vertex under the cursor.
 
-use crate::gizmo::{Axis, Measure};
+use crate::gizmo::{component, set_component, Axis, Basis, Measure};
 use glam::Vec3;
 
 /// The default grid step, in world units.
@@ -105,16 +105,11 @@ pub fn snap_to_step(value: f32, step: f32) -> f32 {
     (value / step).round() * step
 }
 
-/// Snap `measure` for a drag whose grabbed point is `grab`.
+/// Snap `measure` for a drag whose grabbed point is `grab`, in the world's own
+/// axes.
 ///
-/// `axes` are the world axes the dragged handle can move along — one for an
-/// axis arm, two for a plane square, none for the centre handle, whose plane
-/// faces the camera and so lines up with no world axis. Cutting the measure
-/// down to those axes is what keeps a snapped drag from nudging a component the
-/// handle was never allowed to touch.
-///
-/// `vertex` is the world position of the vertex under the cursor, when the app
-/// found one within its radius; that is what [`SnapMode::Vertex`] lands on.
+/// This is [`snap_measure_in`] with [`Basis::WORLD`], for callers whose drags
+/// work in world axes — see there for what `axes` and `vertex` mean.
 pub fn snap_measure(
     snap: Snap,
     axes: &[Axis],
@@ -122,25 +117,48 @@ pub fn snap_measure(
     measure: Measure,
     vertex: Option<Vec3>,
 ) -> Measure {
+    snap_measure_in(snap, Basis::WORLD, axes, grab, measure, vertex)
+}
+
+/// Snap `measure` for a drag whose grabbed point is `grab`, in `basis`.
+///
+/// `axes` are the gizmo axes the dragged handle can move along — one for an
+/// axis arm, two for a plane square, none for the centre handle, whose plane
+/// faces the camera and so lines up with no axis of a turned basis either.
+/// Cutting the measure down to those axes is what keeps a snapped drag from
+/// nudging a component the handle was never allowed to touch.
+///
+/// `vertex` is the world position of the vertex under the cursor, when the app
+/// found one within its radius; that is what [`SnapMode::Vertex`] lands on.
+pub fn snap_measure_in(
+    snap: Snap,
+    basis: Basis,
+    axes: &[Axis],
+    grab: Vec3,
+    measure: Measure,
+    vertex: Option<Vec3>,
+) -> Measure {
     match (snap.mode, measure) {
         (SnapMode::Off, m) => m,
-        // With no world axis to snap to (the centre handle) the point comes
-        // back exactly as it went in, so the drag stays free.
+        // With no axis to snap to (the centre handle) the point comes back
+        // exactly as it went in, so the drag stays free.
         (SnapMode::Grid, Measure::Translate(d)) => {
-            Measure::Translate(snap_point(grab + d, axes, snap.grid) - grab)
+            // Both ends are taken into the gizmo's components, snapped there,
+            // and brought back, so the grid step means a step along the handle.
+            let here = basis.components(grab);
+            let there = snap_point(here + d, axes, snap.grid);
+            Measure::Translate(there - here)
         }
         (SnapMode::Vertex, Measure::Translate(d)) if !axes.is_empty() => match vertex {
             Some(v) => {
                 // The grabbed point lands on the vertex, but only along the
                 // axes this handle moves: the rest of the vertex is dropped.
-                let mut delta = v - grab;
-                for axis in Axis::ALL {
-                    if !axes.contains(&axis) {
-                        let dir = axis.dir();
-                        delta -= dir * delta.dot(dir);
-                    }
+                let delta = basis.components(v - grab);
+                let mut out = Vec3::ZERO;
+                for &axis in axes {
+                    out = set_component(out, axis, component(delta, axis));
                 }
-                Measure::Translate(delta)
+                Measure::Translate(out)
             }
             None => Measure::Translate(d),
         },
@@ -154,9 +172,8 @@ pub fn snap_measure(
             let step = snap.factor.max(1e-3);
             let mut out = f;
             for &axis in axes {
-                let dir = axis.dir();
-                let v = f.dot(dir);
-                out += dir * (snap_to_step(v, step).max(step) - v);
+                let v = component(f, axis);
+                out = set_component(out, axis, snap_to_step(v, step).max(step));
             }
             Measure::Scale(out)
         }
@@ -165,14 +182,16 @@ pub fn snap_measure(
     }
 }
 
-/// `p` with the components on `axes` snapped to the nearest multiple of
-/// `step`, and every other component left exactly as it was.
+/// `p` with the components on `axes` snapped to the nearest multiple of `step`,
+/// and every other component left exactly as it was.
+///
+/// `p` is already written in a gizmo's own components — the caller takes the
+/// two ends of the drag into that basis and brings the answer back — so an
+/// axis' component is simply that component.
 fn snap_point(p: Vec3, axes: &[Axis], step: f32) -> Vec3 {
     let mut out = p;
     for &axis in axes {
-        let dir = axis.dir();
-        let v = out.dot(dir);
-        out += dir * (snap_to_step(v, step) - v);
+        out = set_component(out, axis, snap_to_step(component(out, axis), step));
     }
     out
 }
@@ -467,4 +486,58 @@ mod tests {
         assert_eq!(SnapMode::Vertex.next(), SnapMode::Off);
         assert_eq!(SnapMode::Grid.label(), "Grid");
     }
+    #[test]
+    fn grid_snapping_steps_along_the_gizmo_axis_it_is_given() {
+        let snap = Snap { mode: SnapMode::Grid, grid: 0.25, ..Snap::default() };
+        // A rigid quarter turn about Y: the gizmo's X handle is world +Z.
+        let basis = glam::Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2);
+        let basis = Basis::of_matrix(basis);
+        assert!((basis.axis(Axis::X) - Vec3::Z).length() < 1e-5);
+
+        let grab = Vec3::new(0.37, 2.0, 0.0);
+        let drag = Measure::Translate(Vec3::new(0.9, 0.0, 0.0));
+        let Measure::Translate(d) =
+            snap_measure_in(snap, basis, &[Axis::X], grab, drag, None)
+        else {
+            panic!("still a translation")
+        };
+        // The grid counts along the gizmo's own axis, so a step lands one whole
+        // step from wherever the drag started on that axis — and the world
+        // answer for the same grab is a different distance entirely.
+        assert!((d.x - 1.0).abs() < 1e-5, "a whole step along the turned X: {d:?}");
+        assert_eq!(d.y, 0.0);
+        assert_eq!(d.z, 0.0, "the other two components are left exactly alone");
+        assert!((basis.to_world(d) - Vec3::new(0.0, 0.0, 1.0)).length() < 1e-5, "a step along Z");
+
+        let Measure::Translate(world) = snap_measure(snap, &[Axis::X], grab, drag, None) else {
+            panic!("still a translation")
+        };
+        assert!((world.x - 0.88).abs() < 1e-5, "the world grid steps differently: {world:?}");
+    }
+
+    #[test]
+    fn vertex_snapping_projects_onto_the_turned_axes() {
+        let snap = Snap { mode: SnapMode::Vertex, ..Snap::default() };
+        let basis = Basis::of_matrix(glam::Mat4::from_rotation_y(-std::f32::consts::FRAC_PI_2));
+        let grab = Vec3::new(-1.0, 0.5, 0.0);
+        let vertex = Vec3::new(2.3, 9.0, 4.0);
+        let Measure::Translate(d) = snap_measure_in(
+            snap,
+            basis,
+            &[Axis::X],
+            grab,
+            Measure::Translate(Vec3::new(0.0, 0.0, 0.2)),
+            Some(vertex),
+        ) else {
+            panic!("still a translation")
+        };
+        // The run to the vertex, kept only along the gizmo's X — which is world
+        // Z here, so it is that share of the delta and not the world X one.
+        let expected = (vertex - grab).dot(basis.axis(Axis::X));
+        assert!((d.x - expected).abs() < 1e-5, "{d:?} vs {expected}");
+        assert_eq!(d.y, 0.0);
+        assert_eq!(d.z, 0.0);
+        assert!((basis.to_world(d) - Vec3::Z * expected).length() < 1e-5);
+    }
+
 }

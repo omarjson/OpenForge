@@ -12,7 +12,7 @@ use eframe::egui;
 use eframe::egui_wgpu::RenderState;
 use glam::{Mat4, Vec2, Vec3, Vec4};
 use openforge_animation::{Clip, ClipLibrary, Interp, Player, TransformTrack};
-use openforge_core::math::Transform;
+use openforge_core::math::{Ray, Transform};
 use openforge_core::mesh::{self, Mesh};
 use openforge_core::node::NodeKind;
 use openforge_core::scene::Scene;
@@ -354,6 +354,16 @@ pub struct OpenForgeApp {
     rig_smooth_passes: u32,
     /// Live transform-gizmo state (hover, drag, this frame's handle layout).
     gizmo: gizmo::Gizmo,
+    /// Which way the gizmo's handles point: the world's axes, the selected
+    /// node's own, or the screen's.
+    axes: gizmo::Axes,
+    /// A pivot the user placed: while it is set the gizmo sits there and
+    /// rotations and scales turn about it, whatever the selection does. `None`
+    /// means the gizmo follows the selection's own centre.
+    pivot: Option<Vec3>,
+    /// The ray the cursor last cast into the viewport, which is what "place the
+    /// pivot at the cursor" works from.
+    cursor_ray: Option<Ray>,
     /// What a transform drag snaps to.
     snap: snap::Snap,
     /// Where a live snapped drag is landing, as an absolute screen position:
@@ -463,6 +473,9 @@ impl OpenForgeApp {
             show_outliner: true,
             show_properties: true,
             select_through: false,
+            axes: gizmo::Axes::World,
+            pivot: None,
+            cursor_ray: None,
             deform_axis: 1,
             deform_amount: 0.5,
             rig_skeleton: None,
@@ -2664,6 +2677,14 @@ impl OpenForgeApp {
         let response = ui.interact(rect, ui.id().with("viewport"), egui::Sense::click_and_drag());
         let aspect = rect.width() / rect.height().max(1.0);
 
+        // Where the cursor points in the scene this frame, which is what the
+        // pivot command works from (a ray, so it knows the depth the ground
+        // plane gives it).
+        self.cursor_ray = ui
+            .input(|i| i.pointer.hover_pos())
+            .filter(|p| rect.contains(*p))
+            .map(|p| Self::pick_ray(&self.camera, p, rect, aspect));
+
         // Camera controls: middle mouse orbits, shift+middle pans, scroll zooms.
         let middle = response.dragged_by(egui::PointerButton::Middle);
         if middle {
@@ -2690,21 +2711,26 @@ impl OpenForgeApp {
             ActiveTool::Rotate => Some(TransformMode::Rotate),
         };
         let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
-        let bounds = self.scene.world_bounds(&ids);
         // A sub-object selection is transformed about its own centroid, a node
         // selection about its bounds. While a drag is live the frame stays where
         // that drag began — otherwise the handles would chase the geometry they
         // are moving, and each frame's hit-test would be against a new origin.
-        let origin = self.gizmo.drag.as_ref().map(|drag| drag.anchor.origin).or_else(|| {
-            viewport::element_centroid(&mut self.scene, &self.selection)
-                .or_else(|| (!bounds.is_empty()).then(|| bounds.center()))
-        });
+        // A pivot the user placed wins over all of that.
+        let origin = self
+            .pivot
+            .or_else(|| self.gizmo.drag.as_ref().map(|drag| drag.anchor.origin))
+            .or_else(|| self.selection_centre());
+        // Which way the handles point. The basis is read every frame by the
+        // hit-test and the paint; a live drag keeps its own, taken when it
+        // began, so a local gizmo cannot chase the object it is turning.
+        let basis = self.gizmo_basis();
         let frame = match (gizmo_mode, origin) {
             (Some(_), Some(origin)) => Some(gizmo::Frame::for_camera(
                 &self.camera,
                 rect.height(),
                 gizmo::HANDLE_PIXELS,
                 origin,
+                basis,
             )),
             _ => None,
         };
@@ -2781,7 +2807,9 @@ impl OpenForgeApp {
                 if let Some(handle) = handle {
                     let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
                     let view = self.camera.forward();
-                    if let Some(anchor) = gizmo::Anchor::new(mode, handle, frame.origin, ray, view) {
+                    if let Some(anchor) =
+                        gizmo::Anchor::new(mode, handle, frame.origin, frame.basis, ray, view)
+                    {
                         let targets = self.gizmo_targets(&ids);
                         self.gizmo.begin(gizmo::Drag { mode, handle, anchor, targets });
                         if self.edit_before.is_none() {
@@ -3064,7 +3092,7 @@ impl OpenForgeApp {
         self.paint_selected_edges(&painter, rect);
         // The transform gizmo sits above the geometry so its handles stay
         // grabbable even when they overlap the mesh.
-        self.paint_gizmo(&painter);
+        self.paint_gizmo(&painter, rect);
         self.paint_marquee(&painter);
 
         // Overlay label: which projection this viewport shows, and what is in
@@ -3090,6 +3118,103 @@ impl OpenForgeApp {
     /// what tells the user which projection is showing.
     fn set_view(&mut self, view: viewport::ViewKind) {
         self.camera.set_view(view);
+        self.dirty = true;
+    }
+
+    /// The gizmo's origin when no pivot is placed: a sub-object selection's
+    /// centroid, or the bounds' centre for whole nodes. `None` when nothing is
+    /// selected.
+    fn selection_centre(&mut self) -> Option<Vec3> {
+        let ids: Vec<NodeId> = self.selection.selected_nodes().collect();
+        let bounds = self.scene.world_bounds(&ids);
+        viewport::element_centroid(&mut self.scene, &self.selection)
+            .or_else(|| (!bounds.is_empty()).then(|| bounds.center()))
+    }
+
+    /// The node a local gizmo takes its axes from: the first selected node, or
+    /// the node whose sub-objects are being edited.
+    fn local_axis_node(&self) -> Option<NodeId> {
+        self.selection
+            .selected_nodes()
+            .next()
+            .or_else(|| self.selection.selected_element_node())
+    }
+
+    /// Which way the gizmo's handles point this frame, from the axes mode.
+    ///
+    /// A local gizmo takes the selected node's own axes; with nothing selected
+    /// (or a node that will not resolve) it falls back to the world's.
+    fn gizmo_basis(&mut self) -> gizmo::Basis {
+        match self.axes {
+            gizmo::Axes::World => gizmo::Basis::WORLD,
+            gizmo::Axes::Local => self
+                .local_axis_node()
+                .and_then(|id| self.scene.world_matrix(id).ok())
+                .map(gizmo::Basis::of_matrix)
+                .unwrap_or(gizmo::Basis::WORLD),
+            gizmo::Axes::Screen => gizmo::Basis::of_camera(&self.camera),
+        }
+    }
+
+    /// Switch the gizmo's axes (View ▸ Axes Mode, or the toolbar). A live drag
+    /// keeps the basis it began with, so the mode cannot change under it.
+    fn set_axes(&mut self, axes: gizmo::Axes) {
+        if self.axes == axes || self.gizmo.is_dragging() {
+            return;
+        }
+        self.axes = axes;
+        self.status = format!("Gizmo axes: {}.", axes.label());
+        self.dirty = true;
+    }
+
+    /// Set the transform pivot, which the gizmo then sits on: drags turn and
+    /// scale about it whatever the selection does.
+    ///
+    /// Ignored while a drag is live, like a change of axes: the gesture keeps
+    /// the pivot it began with.
+    fn set_pivot(&mut self, pivot: Vec3, what: &str) {
+        if self.gizmo.is_dragging() {
+            return;
+        }
+        self.pivot = Some(pivot);
+        self.status = format!(
+            "Pivot placed {} at ({:.3}, {:.3}, {:.3}).",
+            what, pivot.x, pivot.y, pivot.z
+        );
+        self.dirty = true;
+    }
+
+    /// Put the pivot where the cursor last pointed, on the ground plane.
+    fn place_pivot_at_cursor(&mut self) {
+        let Some(ray) = self.cursor_ray else {
+            self.status = "Place pivot: point the cursor at the viewport first.".into();
+            return;
+        };
+        match gizmo::ray_plane(ray, Vec3::ZERO, Vec3::Y) {
+            Some(p) => self.set_pivot(p, "at the cursor"),
+            None => {
+                self.status = "Place pivot: the view runs along the ground plane here.".into();
+            }
+        }
+    }
+
+    /// Put the pivot on the selection's own centre, which freezes it where the
+    /// selection is now — so a later drag turns about that point rather than
+    /// following the geometry.
+    fn place_pivot_at_selection(&mut self) {
+        match self.selection_centre() {
+            Some(p) => self.set_pivot(p, "at the selection"),
+            None => self.status = "Place pivot: nothing is selected.".into(),
+        }
+    }
+
+    /// Drop the pivot: the gizmo follows the selection again.
+    fn clear_pivot(&mut self) {
+        if self.pivot.is_none() || self.gizmo.is_dragging() {
+            return;
+        }
+        self.pivot = None;
+        self.status = "Pivot cleared — the gizmo follows the selection.".into();
         self.dirty = true;
     }
 
@@ -3504,6 +3629,45 @@ impl OpenForgeApp {
                             }
                         }
                     });
+                    ui.menu_button("Axes Mode", |ui| {
+                        for axes in gizmo::Axes::ALL {
+                            if ui.selectable_label(self.axes == axes, axes.label()).clicked() {
+                                self.set_axes(axes);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    ui.menu_button("Pivot", |ui| {
+                        if ui
+                            .button("Place at Cursor")
+                            .on_hover_text("Put the pivot where the cursor meets the ground plane")
+                            .clicked()
+                        {
+                            self.place_pivot_at_cursor();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .button("Place at Selection")
+                            .on_hover_text("Freeze the pivot on the selection's centre")
+                            .clicked()
+                        {
+                            self.place_pivot_at_selection();
+                            ui.close_menu();
+                        }
+                        if ui.button("Place at Origin").clicked() {
+                            self.set_pivot(Vec3::ZERO, "at the origin");
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(self.pivot.is_some(), egui::Button::new("Clear Pivot"))
+                            .on_hover_text("Let the gizmo follow the selection again")
+                            .clicked()
+                        {
+                            self.clear_pivot();
+                            ui.close_menu();
+                        }
+                    });
                     if ui.button("Frame All (F)").clicked() {
                         self.frame_all();
                         ui.close_menu();
@@ -3807,6 +3971,26 @@ impl OpenForgeApp {
                             .prefix("× "),
                     )
                     .on_hover_text("Scale factor step");
+                }
+                ui.separator();
+                ui.label("Axes:");
+                for axes in gizmo::Axes::ALL {
+                    let hover = match axes {
+                        gizmo::Axes::World => "Handles along the world's own axes",
+                        gizmo::Axes::Local => {
+                            "Handles along the selected object's axes, so a turned object moves the way it faces"
+                        }
+                        gizmo::Axes::Screen => {
+                            "Handles along the screen's axes — right, up and the view direction"
+                        }
+                    };
+                    if ui
+                        .selectable_label(self.axes == axes, axes.label())
+                        .on_hover_text(hover)
+                        .clicked()
+                    {
+                        self.set_axes(axes);
+                    }
                 }
             });
             // Second row: selection tools, at every level.
@@ -5040,7 +5224,7 @@ impl OpenForgeApp {
 
         self.paint_vertex_dots(&painter, rect);
         self.paint_selected_edges(&painter, rect);
-        self.paint_gizmo(&painter);
+        self.paint_gizmo(&painter, rect);
         self.paint_marquee(&painter);
 
         let label = format!(
@@ -5202,7 +5386,27 @@ impl OpenForgeApp {
     /// Shared by both viewport backends: the handle layout was computed in
     /// screen space by the input pass, so what is drawn here is exactly what
     /// can be grabbed.
-    fn paint_gizmo(&self, painter: &egui::Painter) {
+    fn paint_gizmo(&self, painter: &egui::Painter, rect: egui::Rect) {
+        // The pivot, when the user placed one: a mark where the gizmo sits and
+        // what a rotation or a scale turns about.
+        if let Some(pivot) = self.pivot {
+            let size = [rect.width(), rect.height()];
+            let aspect = size[0] / size[1].max(1.0);
+            let vp = self.camera.view_proj(aspect);
+            if let Some((x, y, _)) = viewport::project(vp, pivot, size) {
+                let p = rect.min + egui::vec2(x, y);
+                let color = egui::Color32::from_rgb(190, 120, 255);
+                painter.circle_stroke(p, 6.0, egui::Stroke::new(1.4_f32, color));
+                painter.line_segment(
+                    [p - egui::vec2(10.0, 0.0), p + egui::vec2(10.0, 0.0)],
+                    egui::Stroke::new(1.0_f32, color),
+                );
+                painter.line_segment(
+                    [p - egui::vec2(0.0, 10.0), p + egui::vec2(0.0, 10.0)],
+                    egui::Stroke::new(1.0_f32, color),
+                );
+            }
+        }
         // A live snapped drag shows exactly where it is landing, above the
         // handles that are being dragged.
         if let Some(p) = self.snap_marker {
@@ -10911,4 +11115,234 @@ mod tests {
         assert!(clean.pending_guard.is_none(), "and asks nothing");
         let _ = std::fs::remove_file(&project);
     }
+    #[test]
+    fn a_local_gizmo_points_the_way_its_object_does() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        // A quarter turn about Y: the node's own X runs along world Z, which a
+        // front view looks straight down.
+        app.scene.get_mut(id).unwrap().transform.rotation =
+            glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        app.set_view(ViewKind::Front);
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        // The world's arms: X across the screen, Z at the eye and collapsed.
+        let origin = laid_out_pivot(&app);
+        let world_x = arm_tip(&app, gizmo::Axis::X);
+        let world_z = arm_tip(&app, gizmo::Axis::Z);
+        assert!(world_x.x > origin.x + 20.0, "the world X arm runs right: {world_x:?}");
+        assert!((world_x.y - origin.y).abs() < 2.0, "and level with the origin");
+        assert!(
+            (world_z - origin).length() < 2.0,
+            "the world Z arm looks at the eye and collapses: {world_z:?}"
+        );
+
+        // Local axes: the node's own X takes the world Z arm's place, because
+        // that is the way the node is turned.
+        app.set_axes(gizmo::Axes::Local);
+        step(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None));
+        let origin = laid_out_pivot(&app);
+        let local_x = arm_tip(&app, gizmo::Axis::X);
+        let local_y = arm_tip(&app, gizmo::Axis::Y);
+        let local_z = arm_tip(&app, gizmo::Axis::Z);
+        assert!(
+            (local_x - origin).length() < 2.0,
+            "the local X arm points at the eye now: {local_x:?}"
+        );
+        assert!(local_z.x > origin.x + 20.0, "the local Z arm runs right: {local_z:?}");
+        assert!((local_z.y - origin.y).abs() < 2.0, "and level: {local_z:?}");
+        assert!(local_y.y < origin.y - 20.0, "the local Y arm still runs up: {local_y:?}");
+    }
+
+    #[test]
+    fn a_screen_gizmo_lays_its_arms_across_the_screen() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        // From this camera the world's arms are neither level nor upright.
+        let world_origin = laid_out_pivot(&app);
+        let world_x = arm_tip(&app, gizmo::Axis::X);
+        assert!(
+            (world_x.y - world_origin.y).abs() > 5.0,
+            "the world X arm is tilted by the view: {world_x:?}"
+        );
+
+        app.set_axes(gizmo::Axes::Screen);
+        step(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None));
+        let origin = laid_out_pivot(&app);
+        let x = arm_tip(&app, gizmo::Axis::X);
+        let y = arm_tip(&app, gizmo::Axis::Y);
+        let z = arm_tip(&app, gizmo::Axis::Z);
+        // Right, up, and straight at the eye, whatever the camera is doing —
+        // which is the whole point of a screen gizmo.
+        assert!(x.x > origin.x + 20.0, "X runs along the screen's right: {x:?}");
+        assert!((x.y - origin.y).abs() < 2.0, "and level: {x:?}");
+        assert!(y.y < origin.y - 20.0, "Y runs up the screen: {y:?}");
+        assert!((y.x - origin.x).abs() < 2.0, "and upright: {y:?}");
+        assert!((z - origin).length() < 2.0, "Z points at the eye and collapses: {z:?}");
+        assert!(
+            (x - world_x).length() > 5.0,
+            "which is not where the world's X arm was: {x:?} vs {world_x:?}"
+        );
+    }
+
+    #[test]
+    fn an_axes_mode_cannot_change_under_a_live_drag() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        step(&ctx, &mut app, frame(1.0, tip, Some(true)));
+        assert!(app.gizmo.is_dragging());
+        assert_eq!(app.gizmo.drag.as_ref().unwrap().anchor.basis, gizmo::Basis::WORLD);
+
+        // Asking for another mode mid-gesture is ignored: the handles are where
+        // the drag says they are, and moving them would snap the selection.
+        app.set_axes(gizmo::Axes::Screen);
+        assert_eq!(app.axes, gizmo::Axes::World, "the mode held still");
+
+        step(&ctx, &mut app, frame(2.0, tip, Some(false)));
+        app.set_axes(gizmo::Axes::Screen);
+        assert_eq!(app.axes, gizmo::Axes::Screen, "and changes once the drag is over");
+    }
+
+    #[test]
+    fn a_local_drag_moves_the_node_along_its_own_axis() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        app.scene.get_mut(id).unwrap().transform.rotation =
+            glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        app.set_axes(gizmo::Axes::Local);
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+
+        let tip = arm_tip(&app, gizmo::Axis::X);
+        let before = app.scene.get(id).unwrap().transform.translation;
+        step(&ctx, &mut app, frame(1.0, tip, Some(true)));
+        assert_eq!(app.gizmo.active, on_axis(gizmo::Axis::X), "the arm is grabbed");
+
+        let dragged = tip + egui::vec2(0.0, -140.0);
+        step(&ctx, &mut app, frame(2.0, dragged, None));
+        step(&ctx, &mut app, frame(3.0, dragged, Some(false)));
+        assert!(!app.gizmo.is_dragging());
+
+        // The node follows its own X — world Z, the way the object faces — and
+        // not a thousandth of the drag crosses the other two world axes.
+        let after = app.scene.get(id).unwrap().transform.translation;
+        let d = after - before;
+        assert!(d.length() > 0.05, "the drag moved the node: {d:?}");
+        assert!(d.z.abs() > 20.0 * d.x.abs(), "{d:?}");
+        assert!(d.z.abs() > 20.0 * d.y.abs(), "{d:?}");
+        assert!(d.x.abs() < 1e-3 && d.y.abs() < 1e-3, "nothing across: {d:?}");
+        // The node keeps the quarter turn it had: a move does not spin it.
+        let want = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        assert!(
+            app.scene.get(id).unwrap().transform.rotation.dot(want).abs() > 1.0 - 1e-6,
+            "the node keeps the quarter turn it had: {:?}",
+            app.scene.get(id).unwrap().transform.rotation
+        );
+    }
+
+    #[test]
+    fn a_placed_pivot_takes_the_gizmo_and_turns_the_selection_about_it() {
+        let ctx = egui::Context::default();
+        let (mut app, id) = app_ready_to_move();
+        app.set_view(ViewKind::Front);
+        // Park the node two units to the right and let the app paint.
+        app.scene.get_mut(id).unwrap().transform.translation = Vec3::new(2.0, 0.0, 0.0);
+        let without = stroked(&paint_once(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None))).0;
+
+        // With no pivot the gizmo follows the selection, out to the right.
+        let followed = laid_out_pivot(&app);
+        assert!(followed.x > 520.0, "the gizmo sits on the selection: {followed:?}");
+
+        // Placed at the origin the gizmo stays there, and is drawn there.
+        app.set_pivot(Vec3::ZERO, "at the origin");
+        let with = stroked(&paint_once(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None))).0;
+        assert_eq!(with, without + 2, "the pivot is two strokes where it was put");
+        let placed = laid_out_pivot(&app);
+        assert!((placed.x - 500.0).abs() < 2.0, "the gizmo sits at the origin: {placed:?}");
+        assert!((placed.y - 350.0).abs() < 2.0, "and on the target's line: {placed:?}");
+
+        // A turn about the pivot swings the node round it, instead of spinning
+        // it where it stands.
+        app.tool = ActiveTool::Rotate;
+        step(&ctx, &mut app, frame(2.0, egui::pos2(500.0, 350.0), None));
+        let ring: Vec<egui::Pos2> = app
+            .gizmo
+            .layout
+            .as_ref()
+            .expect("rings are laid out")
+            .rings
+            .iter()
+            .find(|(a, pts)| *a == gizmo::Axis::Z && pts.len() > 4)
+            .map(|(_, pts)| pts.clone())
+            .expect("the Z ring faces a front view");
+        let before = app.scene.get(id).unwrap().transform;
+        step(&ctx, &mut app, frame(3.0, ring[2], Some(true)));
+        assert_eq!(app.gizmo.active, on_axis(gizmo::Axis::Z), "the ring is grabbed");
+        let quarter = ring[ring.len() / 4];
+        step(&ctx, &mut app, frame(4.0, quarter, None));
+        step(&ctx, &mut app, frame(5.0, quarter, Some(false)));
+
+        let after = app.scene.get(id).unwrap().transform;
+        assert!(
+            before.rotation.angle_between(after.rotation) > 0.05,
+            "the node turned: {:?} -> {:?}",
+            before.rotation,
+            after.rotation
+        );
+        let swung = (after.translation - before.translation).length();
+        assert!(swung > 0.5, "the node swung round the pivot rather than in place: {swung}");
+        assert!(
+            (after.translation.length() - 2.0).abs() < 0.3,
+            "and is still two from it: {:?}",
+            after.translation
+        );
+        // One undo entry puts the whole thing back, position and all.
+        app.undo_edit();
+        let restored = app.scene.get(id).unwrap().transform;
+        assert!((restored.translation - before.translation).length() < 1e-6);
+        assert!(restored.rotation.dot(before.rotation).abs() > 1.0 - 1e-6);
+
+        app.clear_pivot();
+        assert!(app.pivot.is_none(), "clearing the pivot lets the gizmo follow again");
+    }
+
+    #[test]
+    fn placing_the_pivot_at_the_cursor_lands_it_on_the_ground_plane() {
+        let ctx = egui::Context::default();
+        let (mut app, _id) = app_ready_to_move();
+        // A top view looks straight down the ground plane's normal, so the
+        // cursor's ray meets it, and the middle of the screen is the target.
+        app.set_view(ViewKind::Top);
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        app.place_pivot_at_cursor();
+        let middle = app.pivot.expect("the ray met the ground plane");
+        assert!(middle.length() < 0.05, "the middle of the screen is the target: {middle:?}");
+
+        // Off to one side it lands off the target, still in the plane of the
+        // grid, and further out the further the cursor goes.
+        step(&ctx, &mut app, frame(1.0, egui::pos2(600.0, 350.0), None));
+        app.place_pivot_at_cursor();
+        let right = app.pivot.unwrap();
+        assert!(right.x > 0.05, "off to one side: {right:?}");
+        assert!(right.y.abs() < 0.05, "and still on the ground plane: {right:?}");
+        assert!(right.z.abs() < 0.05, "{right:?}");
+
+        // A front view looks *along* the ground plane, which its rays never
+        // meet: the command says so and leaves the pivot alone.
+        app.set_view(ViewKind::Front);
+        step(&ctx, &mut app, frame(2.0, egui::pos2(500.0, 350.0), None));
+        app.place_pivot_at_cursor();
+        assert_eq!(app.pivot, Some(right), "the pivot is where it was");
+        assert!(
+            app.status.contains("ground plane"),
+            "and the status says why: {}",
+            app.status
+        );
+        app.clear_pivot();
+        assert!(app.pivot.is_none(), "the gizmo follows the selection again");
+    }
+
 }

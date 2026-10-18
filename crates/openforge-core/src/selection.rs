@@ -49,6 +49,16 @@ impl Selection {
         self.nodes.iter().copied()
     }
 
+    /// The node whose sub-object selection is non-empty, in id order — what a
+    /// local gizmo takes its axes from while elements are being edited.
+    pub fn selected_element_node(&self) -> Option<NodeId> {
+        self.elements
+            .iter()
+            .filter(|(_, idx)| !idx.is_empty())
+            .map(|(id, _)| *id)
+            .min()
+    }
+
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
@@ -184,4 +194,27 @@ mod tests {
         assert!(s.is_node_selected(id), "the node is still the one being edited");
         assert_eq!(s.node_count(), 1);
     }
+    #[test]
+    fn selected_element_node_names_the_node_the_elements_belong_to() {
+        let mut s = Selection::new();
+        assert_eq!(s.selected_element_node(), None, "nothing selected, nothing to name");
+
+        // Several nodes carrying elements: the answer is stable, not whatever
+        // order a hash map happened to walk in.
+        s.select_elements(NodeId(9), [0u32, 1]);
+        s.select_elements(NodeId(3), [4u32]);
+        assert_eq!(s.selected_element_node(), Some(NodeId(3)));
+        assert_eq!(s.selected_nodes().next(), Some(NodeId(3)));
+
+        // Named nodes win over elements, which is what a local gizmo wants: the
+        // object being moved, not the one being edited underneath it.
+        s.select_node(NodeId(1));
+        assert_eq!(s.selected_nodes().next(), Some(NodeId(1)));
+        assert_eq!(s.selected_element_node(), Some(NodeId(3)));
+
+        // Elements dropped: nothing left to take axes from.
+        s.clear_elements();
+        assert_eq!(s.selected_element_node(), None);
+    }
+
 }

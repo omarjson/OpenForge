@@ -180,6 +180,22 @@ impl Camera {
         (self.target - self.eye()).normalize_or_zero()
     }
 
+    /// How far away `p` is *as the projection sees it*, which is the depth
+    /// anything drawn a constant size on screen has to be sized by.
+    ///
+    /// In perspective that is the distance from the eye. An orthographic view's
+    /// eye stands a fixed [`ORTHO_EYE`] back — far enough to put the whole scene
+    /// in front of the near plane — and its extent is set by `distance`
+    /// instead, so that is the depth to size by, or the gizmo would be drawn
+    /// a hundred times its size.
+    pub fn eye_depth(&self, p: Vec3) -> f32 {
+        if self.view.is_ortho() {
+            self.distance
+        } else {
+            (p - self.eye()).length()
+        }
+    }
+
     pub fn view_matrix(&self) -> Mat4 {
         Mat4::look_at_rh(self.eye(), self.target, self.view.up())
     }
