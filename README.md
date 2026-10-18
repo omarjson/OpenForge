@@ -23,7 +23,7 @@ The project is a Cargo workspace of thirteen crates; these are the main layers:
 | `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per fragment — four map layers per vertex (diffuse, normal, specular, emissive) over reserved identity layers, with the material's specular colour and emissive colour on the same vertex — and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew, down to single faces, edges and vertices. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-project` | Project files | One versioned JSON document — the scene, the material library (textures as base64) and the animation clips — with its own document structs and a bridge to the engine types. Ids never reach the file: references are positions in a parents-first node list. |
-| `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. The transform gizmo draws axis arms, one square per coordinate plane and a screen-plane centre handle, and the Properties panel edits a transform as numbers. |
+| `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. The camera is either the free orbit camera or one of the six axis-aligned orthographic views, the transform gizmo draws axis arms, one square per coordinate plane and a screen-plane centre handle, and the Properties panel edits a transform as numbers. |
 
 ### Core concepts
 
@@ -107,6 +107,13 @@ A sample GitHub Actions matrix is shown below.
   and the whole gesture is a single undo step. Handles keep a constant size on
   screen whatever the camera distance. A rotation and a scale can also be typed
   into the Properties panel, per axis, as XYZ Euler degrees and multipliers.
+- **0-6** choose the viewport projection: `0` is the free perspective camera and
+  `1`-`6` are the six axis-aligned **orthographic** views (Front, Back, Left,
+  Right, Top, Bottom), also on **View → Viewport** with the current one ticked.
+  An orthographic view looks along one world axis with the world's own axes
+  right and up on screen, `F` frames the scene in it, the gizmo and picking
+  behave exactly as in perspective, and a middle-drag (or `0`) brings the free
+  camera back. The corner label names whichever projection is showing.
 - **Z** cycles the edge overlay: off, then the selected meshes' edges as a
   selection outline, then every visible mesh's wireframe (**View → Wireframe**
   shows the current mode). Edges of the selected faces are highlighted, and
@@ -296,7 +303,8 @@ This is a deliberately solid *foundation*, not a feature-complete clone of a
 mature commercial modeler. Sub-element editing, deformers, boolean CSG,
 skeletal skinning, materials, **texture mapping end to end**,
 **occlusion-exact sub-object picking — faces, edges and vertices, by click or
-by rectangle —** and a **depth-tested `wgpu` viewport** are in; what remains is
+by rectangle —**, the six **orthographic viewports** and a **depth-tested
+`wgpu` viewport** are in; what remains is
 mostly application surface. Natural next steps:
 
 - Gizmo polish: the plane and centre handles and numeric rotation/scale entry
@@ -311,7 +319,9 @@ mostly application surface. Natural next steps:
   edge already highlighted in the frame and the selection tools (all / none /
   invert, grow / shrink, edge loop / ring, hide / isolate) in place: the four
   material maps and a per-material highlight now reach the fragment stage,
-  leaving shadowing and a configurable shading mode as the honest gaps, then
+  leaving a multi-view layout (several viewports side by side, each with its own
+  projection — the projections themselves landed as the axis views), shadowing
+  and a configurable shading mode as the honest gaps, then
   the materials node graph — mipmapped sampling, a per-map UV channel,
   opacity/blend and bump/environment maps on top of the four that sample today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
