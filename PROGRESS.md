@@ -11,24 +11,24 @@ ENGINE
   Modeling ops (extrude, inset, bevel, mirror, weld, deformers) ████████████████░░░░  80%
   Boolean CSG                                          █████████████░░░░░░░  65%
   Generators & algorithms (primitives, Catmull-Clark, noise, L-systems) ████████████████░░░░  80%
-  Materials & textures                                 ██████████████░░░░░░  72%
+  Materials & textures                                 ███████████████░░░░░  78%
   Animation (tracks, clips, playback, key editing)     ███████████████░░░░░  78%
   Rigging & skinning                                   ███████████████░░░░░  75%
   UV math (project, unwrap, pack, edits)               █████████████████░░░  87%
 
 APPLICATION SURFACE
-  GPU viewport (depth, shading, grid, gizmo)           █████████████████░░░  88%
+  GPU viewport (depth, shading, grid, gizmo)           ██████████████████░░  90%
   Viewport editing UX (gizmos, wireframe, outlines, picking) ███████████████████░  96%
   UV editor UI                                         ██████████████░░░░░░  70%
-  Panels & dialogs (outliner, properties, toolbars, Preferences, recents, unsaved guard) ██████████████░░░░░░  71%
+  Panels & dialogs (outliner, properties, toolbars, Preferences, recents, unsaved guard) ██████████████░░░░░░  72%
   Import/export UX                                     ██████████████░░░░░░  74%
   Plugin / service host                                ████████████░░░░░░░░  64%
   Game tooling (LOD, dummies/TXD, vehicles)            ████████░░░░░░░░░░░░  40%
 
   OVERALL (unweighted mean of 16 areas)                ███████████████░░░░░  75%
 
-Measured from the repo: 13 crates · 654 test fns · 38752 lines of Rust
-Exact mean of the curated area scores: 75.1% (sum 1203 over 16 areas)
+Measured from the repo: 13 crates · 676 test fns · 40177 lines of Rust
+Exact mean of the curated area scores: 75.7% (sum 1212 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

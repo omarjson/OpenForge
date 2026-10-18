@@ -20,7 +20,7 @@ The project is a Cargo workspace of thirteen crates; these are the main layers:
 |-------|------|-------|
 | `openforge-core` | Scene graph, geometry, editing model | GUI- and renderer-agnostic. Nodes, meshes, selection, undo/redo, interactive tools, ray picking. |
 | `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII. Clean-room readers and writers. |
-| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per face, and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew, down to single faces, edges and vertices. |
+| `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per fragment — four map layers per vertex (diffuse, normal, specular, emissive) over reserved identity layers, with the material's specular colour and emissive colour on the same vertex — and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew, down to single faces, edges and vertices. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-project` | Project files | One versioned JSON document — the scene, the material library (textures as base64) and the animation clips — with its own document structs and a bridge to the engine types. Ids never reach the file: references are positions in a parents-first node list. |
 | `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. |
@@ -212,18 +212,22 @@ A sample GitHub Actions matrix is shown below.
   (marked with a gold cross-hair while the drag is live). Hold **Ctrl** to
   invert snapping for as long as it is held, even mid-drag, and the status bar
   shows the value the drag is snapping to.
-- **Textures.** A material can carry a **diffuse map**: the **Materials** panel
-  picks one from the library (with a thumbnail and a **None** entry), **Load
-  Texture…** imports a PNG or JPEG and maps it onto the material being edited,
-  and **Checker** generates a procedural checkerboard. A **Checker Test** preset
-  ships with a 256px checkerboard, so assigning it to a mesh shows texturing
-  without importing anything. Textured faces are shaded as `texel × material
-  colour` in *both* viewports — on the wgpu path through a texture array the
-  scene pass samples per face, in the CPU fallback through an egui mesh that
-  multiplies the texel by the shaded vertex colour — and the **UV editor** paints
-  the map behind the UVs (toggle it in the Materials panel) with `v = 0` at the
-  bottom of the tile. UVs come from the mesh: the sphere primitive carries
-  spherical UVs, and imports bring their own.
+- **Textures.** A material carries up to four maps — **diffuse, normal,
+  specular and emissive** — and the **Materials** panel gives each one its own
+  row: a combo over the library (with a thumbnail of what it holds and a
+  **None** entry), **Load Texture…** imports a PNG or JPEG onto the material
+  being edited, and **Checker** generates a procedural checkerboard. A **Checker
+  Test** preset ships with a 256px checkerboard, so assigning it to a mesh shows
+  texturing without importing anything. Both viewports shade all four: the
+  diffuse texel multiplies the material colour, the normal map tilts the
+  shading through a tangent frame read back from the surface's own positions
+  and UVs (no tangent attribute), the specular map scales the material's own
+  highlight and the emissive map is added. The CPU fallback samples the maps at
+  a triangle's centre — its one per-pixel feature is the diffuse texel the egui
+  mesh interpolates — while the wgpu path samples every map per fragment. The
+  **UV editor** paints the diffuse map behind the UVs (toggle it in the
+  Materials panel) with `v = 0` at the bottom of the tile. UVs come from the
+  mesh: the sphere primitive carries spherical UVs, and imports bring their own.
 - **The UV editor** (bottom panel) picks, rubber-band selects and drags UVs, and
   projects, packs and scales/rotates a selection. **Island** grows the selection
   to every UV of the islands it touches — islands are welded across mesh edges
@@ -300,10 +304,11 @@ mostly application surface. Natural next steps:
   faces, edges and vertices — and rectangles of them — exactly as drawn (the
   select-through switch answers from the projection instead), with a picked
   edge already highlighted in the frame and the selection tools (all / none /
-  invert, grow / shrink, edge loop / ring, hide / isolate) in place: shadowing
-  and a configurable shading mode are the honest gaps left, then the
-  materials node graph — normal/specular maps and mipmapped sampling on top
-  of the diffuse map that samples today.
+  invert, grow / shrink, edge loop / ring, hide / isolate) in place: the four
+  material maps and a per-material highlight now reach the fragment stage,
+  leaving shadowing and a configurable shading mode as the honest gaps, then
+  the materials node graph — mipmapped sampling, a per-map UV channel,
+  opacity/blend and bump/environment maps on top of the four that sample today.
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
 - The app's settings persist across runs now (the platform's config

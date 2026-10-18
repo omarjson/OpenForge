@@ -44,14 +44,14 @@ Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII)|76|Engine
 Modeling ops (extrude, inset, bevel, mirror, weld, deformers)|80|Engine
 Boolean CSG|65|Engine
 Generators & algorithms (primitives, Catmull-Clark, noise, L-systems)|80|Engine
-Materials & textures|72|Engine
+Materials & textures|78|Engine
 Animation (tracks, clips, playback, key editing)|78|Engine
 Rigging & skinning|75|Engine
 UV math (project, unwrap, pack, edits)|87|Engine
-GPU viewport (depth, shading, grid, gizmo)|88|UI
+GPU viewport (depth, shading, grid, gizmo)|90|UI
 Viewport editing UX (gizmos, wireframe, outlines, picking)|96|UI
 UV editor UI|70|UI
-Panels & dialogs (outliner, properties, toolbars, Preferences, recents, unsaved guard)|71|UI
+Panels & dialogs (outliner, properties, toolbars, Preferences, recents, unsaved guard)|72|UI
 Import/export UX|74|UI
 Plugin / service host|64|UI
 Game tooling (LOD, dummies/TXD, vehicles)|40|UI
