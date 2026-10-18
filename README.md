@@ -23,7 +23,7 @@ The project is a Cargo workspace of thirteen crates; these are the main layers:
 | `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per fragment — four map layers per vertex (diffuse, normal, specular, emissive) over reserved identity layers, with the material's specular colour and emissive colour on the same vertex — and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew, down to single faces, edges and vertices. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-project` | Project files | One versioned JSON document — the scene, the material library (textures as base64) and the animation clips — with its own document structs and a bridge to the engine types. Ids never reach the file: references are positions in a parents-first node list. |
-| `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. The camera is either the free orbit camera or one of the six axis-aligned orthographic views, the transform gizmo draws axis arms, one square per coordinate plane and a screen-plane centre handle, and the Properties panel edits a transform as numbers. |
+| `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. The camera is either the free orbit camera or one of the six axis-aligned orthographic views, the transform gizmo draws axis arms, one square per coordinate plane and a screen-plane centre handle in three axis modes (world, the selection's own, the screen's) with a pivot a transform swings about, and the Properties panel edits a transform as numbers. |
 
 ### Core concepts
 
@@ -105,8 +105,20 @@ A sample GitHub Actions matrix is shown below.
   the middle** to work in the plane facing the camera (a uniform scale in Scale
   mode). The grabbed handle highlights and is labelled while the drag is live,
   and the whole gesture is a single undo step. Handles keep a constant size on
-  screen whatever the camera distance. A rotation and a scale can also be typed
-  into the Properties panel, per axis, as XYZ Euler degrees and multipliers.
+  screen whatever the camera distance and in whichever projection is showing. A
+  rotation and a scale can also be typed into the Properties panel, per axis,
+  as XYZ Euler degrees and multipliers.
+- **Axes Mode** (the toolbar's *Axes:* row, or **View → Axes Mode**) turns the
+  handles with the object or with the screen: **World** keeps them on the world
+  axes, **Local** takes the selected object's own axes (a turned object then
+  moves along the way it faces), and **Screen** holds them level and upright
+  however the camera is orbited. **View → Pivot** puts the point a turn or a
+  scale works about — *Place at Cursor* drops it where the cursor meets the
+  ground grid, *Place at Selection* freezes it on the selection, *Place at
+  Origin* uses the world origin, and *Clear Pivot* lets the gizmo follow the
+  selection again — so a ring drag swings the whole selection round that point
+  instead of spinning it in place. Snapping steps along whichever axes the
+  handles are on.
 - **0-6** choose the viewport projection: `0` is the free perspective camera and
   `1`-`6` are the six axis-aligned **orthographic** views (Front, Back, Left,
   Right, Top, Bottom), also on **View → Viewport** with the current one ticked.
@@ -303,16 +315,18 @@ This is a deliberately solid *foundation*, not a feature-complete clone of a
 mature commercial modeler. Sub-element editing, deformers, boolean CSG,
 skeletal skinning, materials, **texture mapping end to end**,
 **occlusion-exact sub-object picking — faces, edges and vertices, by click or
-by rectangle —**, the six **orthographic viewports** and a **depth-tested
+by rectangle —**, the six **orthographic viewports**, the gizmo's **axes modes
+with a placeable pivot** and a **depth-tested
 `wgpu` viewport** are in; what remains is
 mostly application surface. Natural next steps:
 
-- Gizmo polish: the plane and centre handles and numeric rotation/scale entry
-  are in; a local/orientation mode (local axes, a view-aligned axis), soft
-  selection and a single-axis constraint readout are still to come. Snapping is
+- Gizmo polish: the plane and centre handles, numeric rotation/scale entry, the
+  **world / local / screen axes modes and the placeable pivot** are in; soft
+  selection and a numeric readout of the measure a drag is carrying are still to
+  come. Snapping is
   in for the grid and for vertices, confined to the axes the grabbed handle can
-  move; snapping to edges, faces and midpoints, snapping to the screen-plane
-  grid, and snapping during the free-form view-plane drag, are still to come.
+  move and taken in the frame those axes define; snapping to edges, faces and
+  midpoints, and snapping during the free-form view-plane drag, are still to come.
 - A deeper GPU viewport: shading depth on top of the ID pass that now resolves
   faces, edges and vertices — and rectangles of them — exactly as drawn (the
   select-through switch answers from the projection instead), with a picked

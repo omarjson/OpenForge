@@ -49,7 +49,7 @@ Animation (tracks, clips, playback, key editing)|78|Engine
 Rigging & skinning|75|Engine
 UV math (project, unwrap, pack, edits)|87|Engine
 GPU viewport (depth, shading, grid, gizmo)|91|UI
-Viewport editing UX (gizmos, orthographic views, wireframe, outlines, picking)|98|UI
+Viewport editing UX (gizmos, axes modes, pivot, orthographic views, wireframe, outlines, picking)|99|UI
 UV editor UI|70|UI
 Panels & dialogs (outliner, properties, toolbars, Preferences, recents, unsaved guard)|74|UI
 Import/export UX|74|UI
@@ -57,6 +57,17 @@ Plugin / service host|64|UI
 Game tooling (LOD, dummies/TXD, vehicles)|40|UI
 DATA
 )
+
+# The thousands separator, for the line count: bash's printf grouping flag is
+# not reliable on the 3.2 that macOS ships, so group the digits by hand.
+group() {
+    local n=$1 out=""
+    while [ ${#n} -gt 3 ]; do
+        out=",${n: -3}${out}"
+        n=${n:0:${#n}-3}
+    done
+    printf '%s%s' "$n" "$out"
+}
 
 bar() {
     local pct=$1 filled i out=""
@@ -88,7 +99,7 @@ report() {
     printf '  %-52s %s\n' "OVERALL (unweighted mean of $count areas)" "$(bar "$overall")"
     echo
     printf 'Measured from the repo: %s crates · %s test fns · %s lines of Rust\n' \
-        "$crates" "$test_fns" "$rust_loc"
+        "$crates" "$test_fns" "$(group "$rust_loc")"
     # The OVERALL bar can only show whole percent; the exact mean is repeated
     # here with a decimal so that a single area moving is still visible.
     printf 'Exact mean of the curated area scores: %s.%s%% (sum %s over %s areas)\n' \

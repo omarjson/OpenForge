@@ -42,11 +42,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 13 crates (699 `#[test]` fns; 702 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 13 crates (717 `#[test]` fns; 720 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
-| `openforge-core` | 51 | `Mesh`, `Scene`, nodes, selection, undo (a stack generic over its snapshot, so the app restores a scene and its clip library together), tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). `Transform::euler_degrees`/`set_euler_degrees` are the one XYZ-Euler view of a rotation the panels edit through. |
+| `openforge-core` | 52 | `Mesh`, `Scene`, nodes, selection, undo (a stack generic over its snapshot, so the app restores a scene and its clip library together), tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), **`selected_element_node` is the one answer to which node a sub-object selection belongs to** (Local gizmo axes fall back to it when nothing but sub-objects is selected), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). `Transform::euler_degrees`/`set_euler_degrees` are the one XYZ-Euler view of a rotation the panels edit through. |
 | `openforge-io` | 33 | Import/export: OBJ, glTF/GLB, PLY, STL, COLLADA (a hand-written XML subset reader), OFF and FBX ASCII (a hand-written reader for the FBX text schema — node tree, complement-closed n-gons, the normal/UV/material layers — plus a writer for the same subset). |
 | `openforge-ops` | 19 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**, and **grid-cluster decimation** (`decimate_clustered`) for LOD chains. |
 | `openforge-materials` | 49 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays), and the **four map kinds** (`MapKind::Diffuse`/`Normal`/`Specular`/`Emissive` as `Material` fields with `map`/`set_map`). `maps.rs` is the sampler of record — `MapTexels::sample`/`IDENTITY`, `tangent_frame` (a frame from a triangle's positions and UVs alone), `apply_normal_map` — and `shading.rs` holds `shade_surface`, **the one Phong surface the CPU painter and the GPU shader both mirror**. |
@@ -58,7 +58,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-rig` | 25 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights` (with the weight *editing* maths: `assign`, `blend`, `smooth`), `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
 | `openforge-project` | 15 | The project file: one versioned JSON document holding the scene (nodes listed parents-first, every reference a position in that list — ids never reach the file), the material library (textures as base64 RGBA8; each material's four maps as optional fields, so a file written before one existed still loads), the animation clips and — since version 2 — the skinned rig (skeleton with both poses, weights, bind positions, driven node; version-1 files still load, without a rig). It has its own document structs and a bridge to the engine types, rebuilds the rig through the rig crate's own API (parents-first, validated weights), and every refusal says what it found: not JSON, not ours, too new, or malformed. |
-| `openforge-app` | 241 (bin) | eframe/egui GUI. `app.rs` (~10300 lines) + `gizmo.rs` (screen-space transform gizmo: **axis arms, one grab handle per coordinate plane and a centre handle that moves or scales in the plane facing the camera**, with the one `Layout` driving both the hit-test and the paint) + `snap.rs` (snapping settings + pure snap maths, confined per handle to the axes it can move) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback; the `Camera` is either the free orbit camera or one of the six **axis-aligned orthographic views** — `ViewKind` carries the angle pair, the up vector and the label, and picking, the grid and the gizmo all read the same `view_proj`) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the recent-projects list, the shortcut table — and the settings file: a small JSON document in the platform's config directory, loaded only by the real constructor, written when the Preferences window closes and quietly when the recent list changes) + its project block (File ▸ Open/Save/Save As over `openforge-project`; `current_file` is the remembered document path, which the status bar shows; the live rig rides the save and comes back through undo's rig snapshot; the title carries the document's name and a star while `modified` holds unsaved edits, File ▸ Open Recent lists the recent projects and the unsaved-changes guard holds New, a chosen project file and Quit — the window's own X included — until the edits are answered). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest), and the **materials panel** edits the library's textures (import, checker presets) and materials — one row per map kind with its texture combo and a thumbnail of what it holds. View ▸ Viewport lists the seven projections (the current one ticked, 0–6 on the digits, the corner label naming what shows), and the **Properties panel** edits a single node's transform as three rows of numbers — translation, XYZ Euler degrees and per-axis scale — one undo entry per edit named for what moved. |
+| `openforge-app` | 258 (bin) | eframe/egui GUI. `app.rs` (~10700 lines) + `gizmo.rs` (screen-space transform gizmo: **axis arms, one grab handle per coordinate plane and a centre handle that moves or scales in the plane facing the camera**, in **three axis modes — World, the selection's own axes (Local) or the screen's (Screen) — with a placeable pivot the whole selection turns and scales about**, with the one `Layout` driving both the hit-test and the paint) + `snap.rs` (snapping settings + pure snap maths, confined per handle to the axes it can move) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback; the `Camera` is either the free orbit camera or one of the six **axis-aligned orthographic views** — `ViewKind` carries the angle pair, the up vector and the label, and picking, the grid and the gizmo all read the same `view_proj`) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the recent-projects list, the shortcut table — and the settings file: a small JSON document in the platform's config directory, loaded only by the real constructor, written when the Preferences window closes and quietly when the recent list changes) + its project block (File ▸ Open/Save/Save As over `openforge-project`; `current_file` is the remembered document path, which the status bar shows; the live rig rides the save and comes back through undo's rig snapshot; the title carries the document's name and a star while `modified` holds unsaved edits, File ▸ Open Recent lists the recent projects and the unsaved-changes guard holds New, a chosen project file and Quit — the window's own X included — until the edits are answered). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest), and the **materials panel** edits the library's textures (import, checker presets) and materials — one row per map kind with its texture combo and a thumbnail of what it holds. View ▸ Viewport lists the seven projections (the current one ticked, 0–6 on the digits, the corner label naming what shows), and the **Properties panel** edits a single node's transform as three rows of numbers — translation, XYZ Euler degrees and per-axis scale — one undo entry per edit named for what moved. |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -397,13 +397,13 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **702 tests pass** (699 `#[test]`
+workspace builds with **0 warnings**, **720 tests pass** (717 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Thirty-eight work-streams are done — the engine layer from the **wgpu
+Thirty-nine work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
-through **orthographic viewports** (#38), each narrated further down — plus a
-progress report:
+through **gizmo axes modes and a placed pivot** (#39), each narrated further
+down — plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -1728,9 +1728,108 @@ progress report:
   with what is drawn. `gpu_viewport.rs`'s bridge test now walks all six axis
   views.
 
+- **World, local and screen gizmo axes, and a pivot a turn swings about**
+  (work-stream #39). The gizmo was world-aligned — the first honest gap §7
+  named after #37 — while ZModeler's toolbar carries an *Axes Mode* switch and
+  its Pivot menu places the point a transform works about (`Local Axes…`,
+  `Place under cursor`, a reset helper). Both are the same piece of maths: a
+  frame to write the drag in, and an origin to work about.
+  - **`Axes`** (`gizmo.rs`) is `World` / `Local` / `Screen`, with `ALL` and
+    `label`. `Basis` is an orthonormal frame (x, y, z) with `axis`,
+    `components` and `to_world` — so a measure is written in the gizmo's own
+    components and turned into the world once, at the end. `of_matrix` takes a
+    node's axes from its world matrix and **normalizes them**, so a scaled node
+    points the gizmo the way it is turned rather than as far as it is
+    stretched; `of_camera` reads right, up and the way *out* of the screen (at
+    the viewer, `-forward`) out of the view matrix, so Screen mode is
+    right-handed and behaves for any camera. `Axis::dir()` is gone:
+    `Frame::dir(axis)` answers from the frame's basis, and `ring_basis` now
+    takes a direction rather than an axis — the world axes keep the companions
+    and handedness they always had, in the same order, so no ring's angles
+    moved (a negative direction needed the right-handed flip, which a test
+    caught).
+  - **A drag's measure is written in the frame's components.** A move along a
+    turned axis leaves the other two at exactly `0.0`, a plane handle's normal
+    component stays exactly `0.0`, and the node follows the *turned* direction,
+    not the world axis its handle is named after.
+  - **A pivot the whole selection turns about.** `apply_measure` takes the
+    gizmo origin, so a rotation or a scale moves the node's *position* round it
+    (the composition `M_p · T·R·S`) as well as its own transform: with the
+    pivot somewhere else a turn swings the selection round that point instead
+    of spinning it in place, and one undo entry (the drag's snapshot) puts
+    position and rotation back together. With no pivot the origin is the
+    selection's own centre, as it always was — but it is *used* now: a node
+    whose origin sits away from the selection's centre has its position swung
+    round that centre, where before only its own transform changed. Every
+    pre-#39 test kept its numbers because their nodes are at the origin with
+    the gizmo on top of them.
+  - **One bug fixed, one approximation named.** `measure_matrix`'s scale is now
+    `B · S · B⁻¹` — a stretch along the frame's own axes, exact for vertex
+    targets in any basis; the diagonal-only version was right for the world
+    basis alone. Translation and rotation are exact in every basis, and node
+    *scale* is exact in World and Local (a local gizmo asks for the node's own
+    scale axes); in Screen mode it is applied to the node's own scale axes and
+    is an approximation, because a node transform cannot carry the shear that
+    stretching a turned node along a screen axis would need. Vertex targets do
+    not go through it at all — they take the matrix, so they are exact
+    everywhere.
+  - **Snapping follows the frame.** `snap_measure_in(snap, basis, axes, grab,
+    measure, vertex)` takes both ends of the drag into the gizmo's components
+    and snaps there, so a grid step is a step *along the handle*: on a turned
+    axis the same world drag lands somewhere else, which the tests pin from
+    both sides. `snap_measure` stays as the world wrapper, so every pre-#39
+    snap test is untouched.
+  - **The app surface.** The app carries `axes`, `pivot` and the cursor's ray;
+    `gizmo_basis()` resolves a mode (Local takes the **lowest-id** selected
+    node — `Selection::nodes` is a `BTreeSet`, so this is deterministic — and
+    falls back to the node a sub-object selection belongs to through the new
+    `Selection::selected_element_node`, then to the world). The top toolbar
+    grew an *Axes:* row; View ▸ Axes Mode and View ▸ Pivot (Place at Cursor /
+    Place at Selection / Place at Origin / Clear Pivot) are beside it, and
+    **every one of them is ignored while a drag is live** — a basis or a pivot
+    that changed under a gesture would move the handles away from the anchor
+    that gesture is measured from. Place at Cursor intersects the cursor's own
+    picking ray with the ground plane and says so when a view looks along that
+    plane instead of at it.
+    `paint_gizmo` draws the placed pivot as a small crosshair.
+  - **The orthographic gizmo was sized against the wrong depth.** #38 gave the
+    camera axis views whose eye stands a fixed `ORTHO_EYE` (500 units) back,
+    and `Frame::for_camera` sized its handles from the eye-to-origin distance —
+    so every axis view drew a gizmo thousands of pixels long, and nothing
+    caught it because #38's tests only checked the arms' *directions*.
+    `Camera::eye_depth` now names the depth the projection itself uses (the eye
+    distance in perspective, `distance` — the zoom — in an orthographic view),
+    and the handles are `pixels` tall in both.
+- **18 new tests.** `gizmo.rs` gained the mode names and the world default
+  (components and back being the identity), `of_matrix` for a quarter turn
+  (X to -Z, Z to X) and under a scale, `of_camera` right/up/out-of-the-screen
+  and turned-but-still-orthonormal-and-right-handed, `ring_basis` on the three
+  world axes and on turned and negative ones, a move along a turned axis (the
+  other two components exactly zero, and the node moving along the turned
+  direction), a plane handle in a turned frame (its normal component exactly
+  zero, its world motion in its own plane), a scale in a turned basis (along
+  that axis, about a pivot), a rotation about a turned axis (and the pivot as
+  the one point that does not move), and **the arm's size in pixels in both
+  projections** — which is the regression test for the ortho bug above.
+  `snap.rs` gained the grid stepping along a turned axis (one whole step from
+  wherever the drag began on *that* axis, and a different distance from the
+  world's answer for the same grab) and a vertex target projected onto the
+  turned axes. `openforge-core` gained `selected_element_node` (id order, named
+  nodes not consulted, nothing once the elements are cleared). The app gained
+  six end-to-end: Local axes in an orthographic front view (the node's own X
+  takes the world Z arm's place and the world X arm is where it was), Screen
+  axes exactly horizontal, vertical and collapsed on the eye ray whatever the
+  camera, an axes change refused mid-drag and honoured after it, a Local drag
+  landing only on the node's own axis with its rotation untouched, a placed
+  pivot (the gizmo leaves the selection for it, two more strokes are painted
+  there, a ring drag swings the node round it at a constant distance, and undo
+  puts it back), and Place at Cursor (the middle of a top view is the target,
+  a point off to the side is off-target and still on the ground plane, and a
+  front view refuses with a status that says why).
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **702 pass, 0 failures**
+build too); `cargo test --workspace` → **720 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The #30 windows are
 measured headless too: the theme is asserted on a bare egui context, the
 grid's lines are counted through a real view-projection with the grid on and
@@ -1749,7 +1848,10 @@ type-checks `openforge-project` alongside `core` and `io` on all three
 targets. The gizmo, the wiring
 behind the UV canvas, the side panels, the snapping gestures, the plugin
 seam, the axis viewports (their angles, their parallel rays, and their whole
-paint stack driven by a digit key) and now texture sampling on both paths are
+paint stack driven by a digit key), the gizmo's three axis modes and a placed
+pivot (whose arm is measured in *pixels* in both projections — which is where
+the orthographic gizmo's 500-unit-stand-off sizing bug surfaced) and now
+texture sampling on both paths are
 all covered *without* a display: the `app.rs` test module runs the real
 `handle_central_viewport` / `handle_side_panels` against a plain
 `egui::Context` with synthetic pointer events and asserts on both the gesture
@@ -1828,7 +1930,14 @@ layout, the GPU edge overlay by eye (its depth-tested look
 and the MSAA smoothing), the **axis viewports** by eye (press 1-6: the picture
 should go parallel and the corner label should name the view, 0 or a
 middle-drag should bring the free camera back, and the gizmo and picking should
-keep working there), the **swatch of the material editor's four map rows
+keep working there — **and the handles should stay the same size on screen in
+an axis view as in perspective**, which was broken until #39), the
+**gizmo's axes modes and its pivot** by eye (View ▸ Axes Mode: Local should
+turn the handles with a rotated object and Screen should hold them level
+however the camera is orbited; View ▸ Pivot ▸ Place at Cursor should drop the
+crosshair where the cursor meets the ground grid, and a ring drag should then
+swing the selection round that point rather than spin it in place), the
+**swatch of the material editor's four map rows
 by eye** (put a checker on each kind in turn and confirm the two viewports
 still agree), the **per-face material shading on the GPU
 path** (assign one face a different material and confirm the two paths agree
@@ -1900,7 +2009,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **76.0%**, shown as 76%). The engine
+16 curated areas is **76.1%**, shown as 76%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -1940,7 +2049,10 @@ coordinate plane, one at the middle that works in the screen plane, with
 snapping confined to the axes a handle can move and rotation/scale rows in the
 Properties panel) as of #37, and the axis-aligned viewports (the six
 orthographic views as one camera's projections, on a digit or from the
-Viewport menu, mirrored on the GPU path) as of #38.
+Viewport menu, mirrored on the GPU path) as of #38, and the gizmo's world /
+local / screen axes with a pivot a transform swings about (the Axes Mode
+toolbar row and the Pivot menu, snapping confined to the frame's own axes)
+as of #39.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -1957,13 +2069,17 @@ Prioritized next steps:
 2. **Extend the gizmo further** (`gizmo.rs`, all additive). Axis arms, rings,
    one square per coordinate plane and the screen-plane centre handle are in
    (#37), with rotation and scale typed in the Properties panel beside
-   translation. Snapping landed in #10 but is deliberately partial:
+   translation, and the **world / local / screen axes modes with a placeable
+   pivot** landed in #39 — so the handles can point the way an object is turned
+   or the way the screen sits, and a turn or a scale works about a point the
+   user puts. Snapping landed in #10 but is deliberately partial:
    only the gizmo's handles snap (the free-form view-plane drag does not) and
    only the grid and *vertices* are targets — ZModeler also snaps to edges,
-   faces, midpoints and the grid of the *screen plane*, and its snapping works
-   during free drags too. The gizmo is world-aligned: a local/orientation mode
-   (local axes, a view-aligned axis, a single-axis constraint readout) and soft
-   selection are the other honest gaps. (Sub-object pivots are done: a
+   faces and midpoints, and its snapping works
+   during free drags too (the *screen-plane* grid now steps along the screen's
+   own axes when the Screen mode is on, #39). Soft selection and a numeric
+   readout of a drag's own measure while the pointer moves are the other honest
+   gaps. (Sub-object pivots are done: a
    vertex/face-level drag moves only its own geometry, via `gizmo::Targets` +
    `viewport::element_centroid`.)
 3. **Deepen the UV editor.** The texture background (#11), island selection
