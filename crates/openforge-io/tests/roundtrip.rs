@@ -113,6 +113,11 @@ fn round_trip_off() {
 }
 
 #[test]
+fn round_trip_fbx() {
+    round_trip("fbx")
+}
+
+#[test]
 fn unknown_extension_errors() {
     let dir = temp_dir();
     let path = dir.join("mesh.xyz");
