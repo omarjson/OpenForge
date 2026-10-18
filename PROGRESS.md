@@ -18,17 +18,17 @@ ENGINE
 
 APPLICATION SURFACE
   GPU viewport (depth, shading, grid, gizmo)           ██████████████████░░  90%
-  Viewport editing UX (gizmos, wireframe, outlines, picking) ███████████████████░  96%
+  Viewport editing UX (gizmos, wireframe, outlines, picking) ███████████████████░  97%
   UV editor UI                                         ██████████████░░░░░░  70%
-  Panels & dialogs (outliner, properties, toolbars, Preferences, recents, unsaved guard) ██████████████░░░░░░  72%
+  Panels & dialogs (outliner, properties, toolbars, Preferences, recents, unsaved guard) ██████████████░░░░░░  74%
   Import/export UX                                     ██████████████░░░░░░  74%
   Plugin / service host                                ████████████░░░░░░░░  64%
   Game tooling (LOD, dummies/TXD, vehicles)            ████████░░░░░░░░░░░░  40%
 
   OVERALL (unweighted mean of 16 areas)                ███████████████░░░░░  75%
 
-Measured from the repo: 13 crates · 676 test fns · 40177 lines of Rust
-Exact mean of the curated area scores: 75.7% (sum 1212 over 16 areas)
+Measured from the repo: 13 crates · 691 test fns · 41207 lines of Rust
+Exact mean of the curated area scores: 75.9% (sum 1215 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

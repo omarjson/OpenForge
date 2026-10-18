@@ -23,7 +23,7 @@ The project is a Cargo workspace of thirteen crates; these are the main layers:
 | `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per fragment — four map layers per vertex (diffuse, normal, specular, emissive) over reserved identity layers, with the material's specular colour and emissive colour on the same vertex — and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew, down to single faces, edges and vertices. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-project` | Project files | One versioned JSON document — the scene, the material library (textures as base64) and the animation clips — with its own document structs and a bridge to the engine types. Ids never reach the file: references are positions in a parents-first node list. |
-| `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. |
+| `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. The transform gizmo draws axis arms, one square per coordinate plane and a screen-plane centre handle, and the Properties panel edits a transform as numbers. |
 
 ### Core concepts
 
@@ -100,10 +100,13 @@ A sample GitHub Actions matrix is shown below.
   the view plane (with a transform tool).
 - **Q / W / E / R** switch Select / Move / Scale / Rotate. With a transform tool
   active a **transform gizmo** sits on the selection: drag an axis arm to move or
-  scale along that axis, or an axis ring to rotate around it. The grabbed handle
-  highlights and is labelled while the drag is live, and the whole gesture is a
-  single undo step. Handles keep a constant size on screen whatever the camera
-  distance.
+  scale along that axis, a ring to rotate around it, the **square in one of the
+  coordinate planes** to move or scale in two axes at once, or the **square at
+  the middle** to work in the plane facing the camera (a uniform scale in Scale
+  mode). The grabbed handle highlights and is labelled while the drag is live,
+  and the whole gesture is a single undo step. Handles keep a constant size on
+  screen whatever the camera distance. A rotation and a scale can also be typed
+  into the Properties panel, per axis, as XYZ Euler degrees and multipliers.
 - **Z** cycles the edge overlay: off, then the selected meshes' edges as a
   selection outline, then every visible mesh's wireframe (**View → Wireframe**
   shows the current mode). Edges of the selected faces are highlighted, and
@@ -296,10 +299,12 @@ skeletal skinning, materials, **texture mapping end to end**,
 by rectangle —** and a **depth-tested `wgpu` viewport** are in; what remains is
 mostly application surface. Natural next steps:
 
-- Gizmo polish: plane and centre handles, and numeric entry for rotation and
-  scale (translation already has fields). Snapping is in for the grid and for
-  vertices; snapping to edges, faces and midpoints, and snapping during the
-  free-form view-plane drag, are still to come.
+- Gizmo polish: the plane and centre handles and numeric rotation/scale entry
+  are in; a local/orientation mode (local axes, a view-aligned axis), soft
+  selection and a single-axis constraint readout are still to come. Snapping is
+  in for the grid and for vertices, confined to the axes the grabbed handle can
+  move; snapping to edges, faces and midpoints, snapping to the screen-plane
+  grid, and snapping during the free-form view-plane drag, are still to come.
 - A deeper GPU viewport: shading depth on top of the ID pass that now resolves
   faces, edges and vertices — and rectangles of them — exactly as drawn (the
   select-through switch answers from the projection instead), with a picked
