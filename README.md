@@ -263,6 +263,12 @@ A sample GitHub Actions matrix is shown below.
   starts a fresh undo history; a file that is not JSON, not an OpenForge
   project, or from a newer build is refused with a sentence saying which one
   it was.
+- **The window says what the document is**: the title carries the file's name
+  and a star while there are unsaved edits, **File → Open Recent** lists the
+  last eight projects (with the full path in the tooltip and a clear-the-list
+  item), and New, Open and Quit — the window's own close button included —
+  stop at one **unsaved changes** modal (Discard / Cancel) instead of
+  throwing work away silently.
 - The **Plugins** section of the Properties panel lists the loaded plugins and
   the services, tools and formats they contributed.
 - **Create** menu adds primitives (box, sphere, cylinder, cone, plane).
@@ -301,8 +307,10 @@ mostly application surface. Natural next steps:
 - A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
   3D face selection (island selection and per-island packing are in).
 - The app's settings persist across runs now (the platform's config
-  directory); what remains here is window-layout memory, an asset browser and
-  the deeper panel/dialog surface.
+  directory), and the project's own conveniences — the recent-projects list,
+  the title's star and the unsaved-changes guard — are in; what remains here
+  is window-layout memory, an asset browser and the deeper panel/dialog
+  surface.
 - More standard formats (USDZ, binary FBX, glTF extensions) and a fuller
   COLLADA and FBX (node transforms, effects, animation, the FBX `Materials`
   section) behind the same `openforge-io` traits.
