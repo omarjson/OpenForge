@@ -274,6 +274,12 @@ A sample GitHub Actions matrix is shown below.
   viewport light up in the canvas, a pick in the canvas selects those faces in
   the viewport, and the **Material** combo assigns a material to them.
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
+- **Edit → Find and Replace…** finds an object by name (a case-insensitive
+  substring) and walks the matches: **Find next** and **Find previous** select
+  them in turn, **Replace current** renames the one the search landed on
+  (keeping the rest of the name — *Wheel_Left* with *wheel* replaced by *Rim*
+  is *Rim_Left*) and **Replace all** does it for every match. Both renames are
+  one undo step.
 - **Edit → Preferences…** edits the theme, the ground grid (on/off, step,
   reach) and the camera's orbit/pan/zoom speeds — closing the window files
   the choices away in the platform's config directory (`settings.json`), and
