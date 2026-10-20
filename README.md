@@ -205,6 +205,12 @@ A sample GitHub Actions matrix is shown below.
 - **Rig (the toolbar's Rig row)**: **Create Rig** builds a bone chain along Y
   and auto-weights the active mesh; the **Bone** combo picks one by name and
   the **Angle** slider poses it live (**Reset**/**Clear** step back to rest).
+  The **Weights** row binds the selected vertices to the active bone
+  (**Assign**), moves a share of their influence onto it (**Blend**) and
+  averages it over the mesh's edges (**Smooth**) — and **Paint** turns the
+  cursor into a brush: a drag over the rigged mesh paints the active bone's
+  weight onto the vertices under it, with a radius and a falloff, and
+  **Subtract** takes it away instead. The whole stroke is one undo step.
   With a rig up, the **Weights** row edits the skin over the vertex
   selection: **Assign** binds to the active bone at full weight, **Blend**
   moves a share of every vertex's influence onto it, and **Smooth** averages
@@ -366,6 +372,9 @@ mostly application surface. Natural next steps:
   with the 3D face selection are in (with a per-face material assignable from
   the canvas); what is left is a real unwrap, packing that respects a chosen
   scale, and baking a texture into the layout.
+- A deeper rig: the bone chain, the pose, the weights (assign, blend, smooth
+  and a brush) are in; what is left is a bone hierarchy drawn in the viewport,
+  constraints and IK, and the weights on the GPU path.
 - The app's settings persist across runs now (the platform's config
   directory) — including the **workspace**: which panels were open (View ▸
   Outliner, Properties, UV Editor, Timeline) and how big the window was — and

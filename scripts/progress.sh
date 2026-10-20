@@ -46,7 +46,7 @@ Boolean CSG|76|Engine
 Generators & algorithms (primitives, Catmull-Clark, noise, L-systems)|80|Engine
 Materials & textures|78|Engine
 Animation (tracks, clips, playback, key editing)|78|Engine
-Rigging & skinning|75|Engine
+Rigging & skinning|79|Engine
 UV math (project, unwrap, pack, edits)|87|Engine
 GPU viewport (depth, shading, grid, gizmo, multi-view)|93|UI
 Viewport editing UX (gizmos, axes modes, pivot, orthographic views, multi-view, wireframe, outlines, picking)|100|UI

@@ -13,7 +13,7 @@ ENGINE
   Generators & algorithms (primitives, Catmull-Clark, noise, L-systems) ████████████████░░░░  80%
   Materials & textures                                 ███████████████░░░░░  78%
   Animation (tracks, clips, playback, key editing)     ███████████████░░░░░  78%
-  Rigging & skinning                                   ███████████████░░░░░  75%
+  Rigging & skinning                                   ███████████████░░░░░  79%
   UV math (project, unwrap, pack, edits)               █████████████████░░░  87%
 
 APPLICATION SURFACE
@@ -27,8 +27,8 @@ APPLICATION SURFACE
 
   OVERALL (unweighted mean of 16 areas)                ███████████████░░░░░  77%
 
-Measured from the repo: 13 crates · 745 test fns · 44,746 lines of Rust
-Exact mean of the curated area scores: 77.5% (sum 1240 over 16 areas)
+Measured from the repo: 13 crates · 750 test fns · 45,127 lines of Rust
+Exact mean of the curated area scores: 77.7% (sum 1244 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 
