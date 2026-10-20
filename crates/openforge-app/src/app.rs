@@ -4,7 +4,7 @@
 use crate::file_options::{self, FileOptions, UpAxis};
 use crate::gizmo;
 use crate::gpu_viewport::{self, GpuViewport};
-use crate::settings::{self, Settings, Theme, SHORTCUTS};
+use crate::settings::{self, Settings, Theme, WorkspacePanels, SHORTCUTS};
 use crate::snap::{self, SnapMode};
 use crate::uv_editor::{self, UvEditor};
 use crate::viewport::{self, Camera, ViewKind};
@@ -414,6 +414,9 @@ pub struct OpenForgeApp {
     /// The theme the egui context currently carries, so a changed one is
     /// applied once rather than re-styling every frame.
     applied_theme: Option<Theme>,
+    /// The window's size in points, as the last frame saw it — what the
+    /// workspace record keeps so the next start comes back the same size.
+    window_size: [f32; 2],
     /// Whether the Preferences, Keyboard Shortcuts or About window is open.
     preferences_open: bool,
     shortcuts_open: bool,
@@ -472,6 +475,7 @@ impl OpenForgeApp {
             dirty: true,
             show_outliner: true,
             show_properties: true,
+            window_size: [1280.0, 800.0],
             select_through: false,
             axes: gizmo::Axes::World,
             pivot: None,
@@ -3333,11 +3337,40 @@ impl OpenForgeApp {
             self.applied_theme = Some(self.settings.theme);
         }
     }
+
+    /// Put the workspace's panels where the settings file says they are.
+    fn apply_workspace_panels(&mut self) {
+        let panels = self.settings.panels;
+        self.show_outliner = panels.outliner;
+        self.show_properties = panels.properties;
+        self.uv.open = panels.uv_editor;
+        self.anim_open = panels.timeline;
+    }
+
+    /// The workspace as it is now: which panels are open, and how big the
+    /// window is.
+    ///
+    /// This is what the settings file keeps, so the next start comes back with
+    /// the workspace the user left.
+    fn workspace_snapshot(&self) -> WorkspacePanels {
+        WorkspacePanels {
+            outliner: self.show_outliner,
+            properties: self.show_properties,
+            uv_editor: self.uv.open,
+            timeline: self.anim_open,
+        }
+    }
 }
 
 impl eframe::App for OpenForgeApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.draw(ctx, frame.wgpu_render_state());
+    }
+
+    /// eframe asks the app to save when the window closes, which is when the
+    /// workspace's own size is worth writing down.
+    fn save(&mut self, _storage: &mut dyn eframe::Storage) {
+        self.remember_workspace();
     }
 }
 
@@ -3347,6 +3380,13 @@ impl OpenForgeApp {
     /// read from `eframe::Frame`, so a headless test drives the same frame
     /// the window does.
     fn draw(&mut self, ctx: &egui::Context, render_state: Option<&RenderState>) {
+        // The window's size, for the workspace record.
+        self.window_size = ctx.input(|i| {
+            i.viewport()
+                .inner_rect
+                .map(|r| [r.width(), r.height()])
+                .unwrap_or(self.window_size)
+        });
         // Preferences first: the theme has to be on the context before
         // anything styles itself this frame.
         self.apply_settings(ctx);
@@ -3559,6 +3599,31 @@ impl OpenForgeApp {
                         .clicked()
                     {
                         self.anim_open = !self.anim_open;
+                        self.remember_workspace();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button(format!(
+                            "Outliner: {}",
+                            if self.show_outliner { "shown" } else { "hidden" }
+                        ))
+                        .on_hover_text("Show the scene tree on the left")
+                        .clicked()
+                    {
+                        self.show_outliner = !self.show_outliner;
+                        self.remember_workspace();
+                        ui.close_menu();
+                    }
+                    if ui
+                        .button(format!(
+                            "Properties: {}",
+                            if self.show_properties { "shown" } else { "hidden" }
+                        ))
+                        .on_hover_text("Show the properties, materials and plugins on the right")
+                        .clicked()
+                    {
+                        self.show_properties = !self.show_properties;
+                        self.remember_workspace();
                         ui.close_menu();
                     }
                 });
@@ -3722,6 +3787,7 @@ impl OpenForgeApp {
                     }
                     if ui.button("UV Editor").clicked() {
                         self.uv.open = !self.uv.open;
+                        self.remember_workspace();
                         ui.close_menu();
                     }
                     if ui
@@ -3967,6 +4033,7 @@ impl OpenForgeApp {
                     .clicked()
                 {
                     self.uv.open = !self.uv.open;
+                    self.remember_workspace();
                 }
                 ui.separator();
                 ui.label("Snap:");
@@ -4413,8 +4480,29 @@ impl OpenForgeApp {
             return false;
         };
         self.settings = settings;
+        // The workspace the file describes is the one the window comes back
+        // with: the panels it had open, and the size it was.
+        self.apply_workspace_panels();
         self.status = format!("Loaded preferences from {}.", path.display());
         true
+    }
+
+    /// Note the workspace as it is now — the panels that are open and the
+    /// window's size — and write the preferences file, quietly.
+    ///
+    /// Called when the window closes and whenever a panel is toggled, so the
+    /// next start comes back to the workspace the user left.
+    fn remember_workspace(&mut self) {
+        self.settings.panels = self.workspace_snapshot();
+        if self.settings.window_size != self.window_size {
+            self.settings.window_size = self.window_size;
+        }
+        let Some(path) = self.settings_path.clone() else {
+            return; // no config directory: the choices stay in this session
+        };
+        if let Err(error) = self.settings.save(&path) {
+            log::warn!("could not save the workspace at {}: {error}", path.display());
+        }
     }
 
     /// Write the preferences file. `false` — with the reason in the status —
@@ -11591,6 +11679,38 @@ mod tests {
         app.uv.select_only([uvs[0]]);
         app.uv_sync_from_selection(id);
         assert_eq!(app.uv.indices(), vec![uvs[0]], "the canvas keeps its own picks");
+    }
+
+    #[test]
+    fn the_workspace_comes_back_the_way_it_was_left() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        // The workspace as the user left it: the UV editor open, the outliner
+        // hidden, and a window of a particular size.
+        app.uv.open = true;
+        app.show_outliner = false;
+        app.window_size = [1024.0, 768.0];
+        app.remember_workspace();
+        assert!(app.settings.panels.uv_editor, "the UV editor is recorded");
+        assert!(!app.settings.panels.outliner, "and the outliner's absence");
+        assert_eq!(app.settings.window_size, [1024.0, 768.0]);
+
+        // A frame notices the window's own size.
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        assert!(app.window_size[0] > 0.0 && app.window_size[1] > 0.0);
+
+        // And a fresh app with that file comes back to the same workspace.
+        let dir = std::env::temp_dir().join(format!("openforge-workspace-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        app.settings.save(&path).expect("the settings write");
+        let mut fresh = OpenForgeApp::with_gpu(None);
+        fresh.settings_path = Some(path);
+        assert!(fresh.load_settings(), "the file reads back");
+        assert!(fresh.uv.open, "the UV editor is where it was left");
+        assert!(!fresh.show_outliner, "and the outliner is still hidden");
+        assert_eq!(fresh.settings.window_size, [1024.0, 768.0]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 }

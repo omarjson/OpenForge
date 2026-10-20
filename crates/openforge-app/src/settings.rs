@@ -71,6 +71,41 @@ pub struct Settings {
     /// state like the rest of the file — the File menu's Open Recent reads
     /// it — so it follows the user rather than the document.
     pub recent_files: Vec<String>,
+    /// The window's size in points, so the next start comes back with the
+    /// frame the user left it at.
+    pub window_size: [f32; 2],
+    /// Which panels the workspace shows.
+    pub panels: WorkspacePanels,
+}
+
+/// Which panels the workspace shows.
+///
+/// The reference application files a `Workspace@WxH` record per window size —
+/// the docked panels' rectangles and the toolbars — and this is the part of
+/// that the app can keep honestly: which of its own panels are open, and how
+/// big the window was.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorkspacePanels {
+    /// The scene outliner on the left.
+    pub outliner: bool,
+    /// The properties, materials and plugins panels on the right.
+    pub properties: bool,
+    /// The UV editor along the bottom.
+    pub uv_editor: bool,
+    /// The animation timeline along the bottom.
+    pub timeline: bool,
+}
+
+impl Default for WorkspacePanels {
+    fn default() -> Self {
+        Self {
+            outliner: true,
+            properties: true,
+            uv_editor: false,
+            timeline: false,
+        }
+    }
 }
 
 impl Default for Settings {
@@ -84,6 +119,8 @@ impl Default for Settings {
             pan_speed: 1.0,
             zoom_speed: 1.0,
             recent_files: Vec::new(),
+            window_size: [1280.0, 800.0],
+            panels: WorkspacePanels::default(),
         }
     }
 }
@@ -483,12 +520,27 @@ mod tests {
             pan_speed: 0.5,
             zoom_speed: 2.0,
             recent_files: vec!["/work/thing.ofproj".to_string()],
+            window_size: [1600.0, 900.0],
+            panels: WorkspacePanels {
+                outliner: false,
+                properties: true,
+                uv_editor: true,
+                timeline: true,
+            },
         };
         let json = settings.to_json();
         assert!(json.ends_with('\n'), "the file ends its last line");
         assert!(json.contains("\"light\""), "the theme is stored by name: {json}");
         assert!(json.contains("\"grid_step\": 2.5"), "{json}");
         assert!(json.contains("\"recent_files\""), "the recent list rides the file: {json}");
+        assert!(
+            json.contains("\"window_size\""),
+            "and so does the window's size: {json}"
+        );
+        assert!(
+            json.contains("\"panels\""),
+            "and the workspace's panels: {json}"
+        );
         let back = Settings::from_json(&json).expect("the writer's own output parses");
         assert_eq!(back, settings);
         assert_eq!(
