@@ -264,7 +264,10 @@ A sample GitHub Actions matrix is shown below.
   to every UV of the islands it touches — islands are welded across mesh edges
   whose UVs match on both endpoints — and **Pack Islands** puts each island in
   its own cell of the `grid × grid` atlas with its aspect preserved (the other
-  **Pack** groups by coincident positions instead).
+  **Pack** groups by coincident positions instead). At the **Face** level the
+  canvas and the viewport share one selection: the faces selected in the
+  viewport light up in the canvas, a pick in the canvas selects those faces in
+  the viewport, and the **Material** combo assigns a material to them.
 - **Middle-drag** orbits the camera; **Shift + middle-drag** pans; **scroll** zooms.
 - **Edit → Preferences…** edits the theme, the ground grid (on/off, step,
   reach) and the camera's orbit/pan/zoom speeds — closing the window files
@@ -348,8 +351,10 @@ mostly application surface. Natural next steps:
   and a configurable shading mode as the honest gaps, then
   the materials node graph — mipmapped sampling, a per-map UV channel,
   opacity/blend and bump/environment maps on top of the four that sample today.
-- A deeper UV editor: island weld/split/mirror, snapping, and live sync with the
-  3D face selection (island selection and per-island packing are in).
+- A deeper UV editor: island weld/split/mirror, snapping, and the live sync
+  with the 3D face selection are in (with a per-face material assignable from
+  the canvas); what is left is a real unwrap, packing that respects a chosen
+  scale, and baking a texture into the layout.
 - The app's settings persist across runs now (the platform's config
   directory), and the project's own conveniences — the recent-projects list,
   the title's star and the unsaved-changes guard — are in; what remains here
