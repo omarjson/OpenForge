@@ -9,7 +9,7 @@ ENGINE
   Data model (nodes, mesh, selection, undo, tools)     █████████████████░░░  87%
   Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII) ███████████████░░░░░  76%
   Modeling ops (extrude, inset, bevel, mirror, weld, deformers) ████████████████░░░░  80%
-  Boolean CSG                                          ██████████████░░░░░░  72%
+  Boolean CSG                                          ███████████████░░░░░  76%
   Generators & algorithms (primitives, Catmull-Clark, noise, L-systems) ████████████████░░░░  80%
   Materials & textures                                 ███████████████░░░░░  78%
   Animation (tracks, clips, playback, key editing)     ███████████████░░░░░  78%
@@ -27,8 +27,8 @@ APPLICATION SURFACE
 
   OVERALL (unweighted mean of 16 areas)                ███████████████░░░░░  76%
 
-Measured from the repo: 13 crates · 729 test fns · 43,381 lines of Rust
-Exact mean of the curated area scores: 76.5% (sum 1225 over 16 areas)
+Measured from the repo: 13 crates · 733 test fns · 43,683 lines of Rust
+Exact mean of the curated area scores: 76.8% (sum 1229 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

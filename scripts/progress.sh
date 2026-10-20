@@ -42,7 +42,7 @@ AREAS=$(cat <<'DATA'
 Data model (nodes, mesh, selection, undo, tools)|87|Engine
 Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII)|76|Engine
 Modeling ops (extrude, inset, bevel, mirror, weld, deformers)|80|Engine
-Boolean CSG|72|Engine
+Boolean CSG|76|Engine
 Generators & algorithms (primitives, Catmull-Clark, noise, L-systems)|80|Engine
 Materials & textures|78|Engine
 Animation (tracks, clips, playback, key editing)|78|Engine

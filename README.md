@@ -21,7 +21,7 @@ The project is a Cargo workspace of thirteen crates; these are the main layers:
 | `openforge-core` | Scene graph, geometry, editing model | GUI- and renderer-agnostic. Nodes, meshes, selection, undo/redo, interactive tools, ray picking. |
 | `openforge-io` | Import/export | OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII. Clean-room readers and writers. |
 | `openforge-render` | GPU viewport backend | Camera/uniform/vertex plumbing plus a `wgpu` renderer behind the `gpu` feature: offscreen color + depth target (multi-sampled when the adapter supports it), the scene, grid, edge-overlay and axis-gizmo passes, a material texture array the scene pass samples per fragment — four map layers per vertex (diffuse, normal, specular, emissive) over reserved identity layers, with the material's specular colour and emissive colour on the same vertex — and an ID pass that resolves a click — or a whole rectangle — against exactly what the frame drew, down to single faces, edges and vertices. |
-| `openforge-boolean` | Solid modelling | BSP CSG — union, subtract, intersect — run in **normalized double precision**, so the tolerances are relative to the model and the same geometry gives the same answer whether the scene is in millimetres or in kilometres. The result is a closed solid: shared vertices are welded by tolerance, slivers are kept rather than dropped, and the status bar says whether the result came out closed. |
+| `openforge-boolean` | Solid modelling | BSP CSG — union, subtract, intersect — run in **normalized double precision**, so the tolerances are relative to the model and the same geometry gives the same answer whether the scene is in millimetres or in kilometres. The result is a closed solid: shared vertices are welded by tolerance, slivers are kept rather than dropped, and the status bar says whether the result came out closed. The **texture and the per-face materials come through the cut**, so cutting a textured object keeps its texture. |
 | `openforge-plugin` | Plugin host | Services, tools and format filters registered by name. The engine's own tools and formats are ordinary plugins here, so a replacement tool or a new format is a registration rather than an app change. |
 | `openforge-project` | Project files | One versioned JSON document — the scene, the material library (textures as base64) and the animation clips — with its own document structs and a bridge to the engine types. Ids never reach the file: references are positions in a parents-first node list. |
 | `openforge-app` | Desktop application | `eframe`/`egui` UI over `winit`/`wgpu`. Viewport, UV editor, outliner, properties, toolbar, hotkeys. The camera is either the free orbit camera or one of the six axis-aligned orthographic views, the transform gizmo draws axis arms, one square per coordinate plane and a screen-plane centre handle in three axis modes (world, the selection's own, the screen's) with a pivot a transform swings about, and the Properties panel edits a transform as numbers. |
@@ -195,7 +195,8 @@ A sample GitHub Actions matrix is shown below.
   the union of two overlapping spheres has no hole in it. The engine works in
   normalized double precision, so the same geometry gives the same answer
   whatever the scene's units are, and the status bar says whether the result
-  came out closed.
+  came out closed. The cut **keeps the texture** — the UVs are interpolated
+  across it — and the two meshes' materials come through as well.
 - **Rig (the toolbar's Rig row)**: **Create Rig** builds a bone chain along Y
   and auto-weights the active mesh; the **Bone** combo picks one by name and
   the **Angle** slider poses it live (**Reset**/**Clear** step back to rest).
