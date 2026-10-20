@@ -338,6 +338,16 @@ pub struct OpenForgeApp {
     deform_axis: usize,
     /// Deformer amount: taper factor, or twist/bend angle in radians.
     deform_amount: f32,
+    /// Whether the weight brush is on: a drag over the rigged mesh paints the
+    /// active bone's weight onto the vertices under the cursor.
+    rig_brush: bool,
+    /// The brush's radius, in world units.
+    rig_brush_radius: f32,
+    /// Whether the brush takes weight away instead of adding it.
+    rig_brush_subtract: bool,
+    /// The state before the current brush stroke, so the whole stroke is one
+    /// undo step.
+    brush_before: Option<AppSnapshot>,
     /// Rig state for the active skinned mesh.
     rig_skeleton: Option<Skeleton>,
     rig_weights: Option<SkinWeights>,
@@ -504,6 +514,10 @@ impl OpenForgeApp {
             rig_weights: None,
             rig_bind: Vec::new(),
             rig_node: None,
+            rig_brush: false,
+            rig_brush_radius: 0.5,
+            rig_brush_subtract: false,
+            brush_before: None,
             rig_bone: 0,
             rig_angle: 0.0,
             rig_bones: 4,
@@ -1242,6 +1256,8 @@ impl OpenForgeApp {
             self.status = format!("{name} already binds the selected vertices.");
             return;
         }
+        // The mesh shows the new weights straight away.
+        self.rig_apply_pose();
         self.status = format!("Bound {changed} vertex(es) to {name}.");
     }
 
@@ -1268,6 +1284,8 @@ impl OpenForgeApp {
             self.status = format!("Nothing to blend — {name} already holds that share.");
             return;
         }
+        // The mesh shows the new weights straight away.
+        self.rig_apply_pose();
         self.status = format!("Blended {share:.2} onto {name} ({changed} vertex(es)).");
     }
 
@@ -1305,11 +1323,91 @@ impl OpenForgeApp {
             self.status = "Nothing to smooth — the neighbours agree already.".into();
             return;
         }
+        // The mesh shows the new weights straight away.
+        self.rig_apply_pose();
         self.status = format!(
             "Smoothed weights over {} vertex(es) ({passes} pass{}).",
             vertices.len(),
             if passes == 1 { "" } else { "es" }
         );
+    }
+
+    /// Paint the weight brush at the cursor: the rigged mesh's vertices within
+    /// the brush's radius take the stroke, with the falloff folded into the
+    /// amount.
+    ///
+    /// The brush sits on the vertex under the cursor, so it works at any
+    /// selection level. `true` when the stroke reached the mesh.
+    fn rig_brush_stroke(&mut self, pos: egui::Pos2, rect: egui::Rect, aspect: f32) -> bool {
+        let Some(node) = self.rig_node else { return false };
+        let Some(mesh) = self.scene.get(node).ok().and_then(|n| n.mesh()).cloned() else {
+            return false;
+        };
+        let Ok(world) = self.scene.world_matrix(node) else {
+            return false;
+        };
+        // The vertex under the cursor is where the brush sits.
+        let ray = Self::pick_ray(self.camera(), pos, rect, aspect);
+        let eye = self.camera().eye();
+        let tol = (self.camera().distance * 0.02).max(0.01);
+        let Some(hit) = viewport::pick_vertex(&mut self.scene, ray, eye, tol) else {
+            return false;
+        };
+        let Some(point) = mesh.positions.get(hit.vertex as usize).copied() else {
+            return false;
+        };
+        let centre = world.transform_point3(point);
+        let amounts = self.rig_brush_amounts(centre, &mesh, world);
+        if amounts.is_empty() {
+            return false;
+        }
+        if self.rig_paint_weights(&amounts) == 0 {
+            return false;
+        }
+        // The mesh shows the new weights straight away.
+        self.rig_apply_pose();
+        self.dirty = true;
+        true
+    }
+
+    /// The vertices the brush covers: those of `mesh` within the brush's
+    /// radius of `centre`, with the falloff folded into the amount.
+    fn rig_brush_amounts(
+        &self,
+        centre: Vec3,
+        mesh: &Mesh,
+        world: glam::Mat4,
+    ) -> Vec<(u32, f32)> {
+        let radius = self.rig_brush_radius.max(1e-3);
+        let strength = if self.rig_brush_subtract {
+            -self.rig_weight
+        } else {
+            self.rig_weight
+        };
+        let mut amounts: Vec<(u32, f32)> = Vec::new();
+        for (i, p) in mesh.positions.iter().enumerate() {
+            let w = world.transform_point3(*p);
+            let distance = (w - centre).length();
+            if distance > radius {
+                continue;
+            }
+            // The stroke fades out with the distance from the cursor.
+            let falloff = 1.0 - distance / radius;
+            amounts.push((i as u32, falloff * strength));
+        }
+        amounts
+    }
+
+    /// Move a brush stroke onto the active bone, and re-skin the mesh.
+    ///
+    /// Returns how many vertices moved.
+    fn rig_paint_weights(&mut self, amounts: &[(u32, f32)]) -> usize {
+        let bone = self.rig_bone;
+        let mut changed = 0;
+        if let Some(weights) = self.rig_weights.as_mut() {
+            changed = weights.brush(amounts, bone);
+        }
+        changed
     }
 
     fn undo_edit(&mut self) {
@@ -2901,6 +2999,39 @@ impl OpenForgeApp {
                         }
                         consumed = true;
                         self.dirty = true;
+                    }
+                }
+            }
+        }
+
+        // The weight brush: while it is on, a drag over the rigged mesh
+        // paints the active bone's weight onto the vertices under the cursor.
+        // It owns the pointer, so the tools do not compete with it.
+        if self.rig_brush && self.rig_skeleton.is_some() {
+            let down = ui.input(|i| i.pointer.primary_down());
+            if pressed {
+                if let Some(pos) = press_pos {
+                    // The state before the stroke, so the whole stroke is one
+                    // undo step.
+                    self.brush_before = Some(self.snapshot());
+                    if self.rig_brush_stroke(pos, rect, aspect) {
+                        consumed = true;
+                    }
+                }
+            } else if down {
+                if let Some(pos) = cursor {
+                    if self.rig_brush_stroke(pos, rect, aspect) {
+                        consumed = true;
+                    }
+                }
+            }
+            if released {
+                if let Some(before) = self.brush_before.take() {
+                    let after = self.snapshot();
+                    if !after.same(&before) {
+                        self.undo.push("Paint Weights", before, after);
+                        self.dirty = true;
+                        self.modified = true;
                     }
                 }
             }
@@ -4499,6 +4630,20 @@ impl OpenForgeApp {
                         .clicked()
                     {
                         self.rig_smooth_weights();
+                    }
+                    ui.separator();
+                    ui.checkbox(&mut self.rig_brush, "Paint")
+                        .on_hover_text("Drag over the mesh to paint the active bone's weight");
+                    if self.rig_brush {
+                        ui.add(
+                            egui::DragValue::new(&mut self.rig_brush_radius)
+                                .range(0.01..=10.0)
+                                .speed(0.01)
+                                .fixed_decimals(2),
+                        )
+                        .on_hover_text("The brush's radius, in world units");
+                        ui.checkbox(&mut self.rig_brush_subtract, "Subtract")
+                            .on_hover_text("Take the weight away instead of adding it");
                     }
                 });
             }
@@ -12166,6 +12311,78 @@ mod tests {
         );
         app.replace_all();
         assert!(app.status.contains("Nothing"), "and nothing to replace");
+    }
+
+    #[test]
+    fn the_weight_brush_paints_the_bone_under_the_cursor() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Body", primitive_box(1.0));
+        app.selection.select_node(id);
+        app.rig_bones = 2;
+        app.rig_create();
+        let node = app.rig_node.expect("the rig is on a node");
+        let mesh = app.scene.get(node).unwrap().mesh().unwrap().clone();
+        let world = app.scene.world_matrix(node).unwrap();
+        let centre = world.transform_point3(mesh.positions[0]);
+
+        // The brush covers the vertices under it, at full strength, and fades
+        // out with the distance.
+        app.rig_brush_radius = 0.6;
+        app.rig_weight = 0.4;
+        let amounts = app.rig_brush_amounts(centre, &mesh, world);
+        assert!(!amounts.is_empty(), "the brush covers the vertex under it");
+        assert_eq!(amounts[0].0, 0, "the vertex itself is first");
+        assert!((amounts[0].1 - 0.4).abs() < 1e-5, "at full strength: {:?}", amounts[0]);
+        // Every covered amount is smaller than the first, and no further than
+        // the radius away.
+        for (vertex, amount) in &amounts {
+            assert!(*amount <= 1.0 + 1e-5, "no more than the strength");
+            let d = (world.transform_point3(mesh.positions[*vertex as usize]) - centre).length();
+            assert!(d <= app.rig_brush_radius + 1e-5, "within the radius");
+        }
+
+        // The stroke moves the weight onto the active bone.
+        app.rig_bone = 1;
+        let before: f32 = app
+            .rig_weights
+            .as_ref()
+            .unwrap()
+            .influences(0)
+            .unwrap()
+            .iter()
+            .find(|i| i.bone == 1)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        let changed = app.rig_paint_weights(&amounts);
+        assert!(changed > 0, "the stroke moved something");
+        let after: f32 = app
+            .rig_weights
+            .as_ref()
+            .unwrap()
+            .influences(0)
+            .unwrap()
+            .iter()
+            .find(|i| i.bone == 1)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        assert!(after > before, "the bone took the weight: {before} -> {after}");
+
+        // And a subtracting stroke takes it back.
+        app.rig_brush_subtract = true;
+        let amounts = app.rig_brush_amounts(centre, &mesh, world);
+        app.rig_paint_weights(&amounts);
+        let back: f32 = app
+            .rig_weights
+            .as_ref()
+            .unwrap()
+            .influences(0)
+            .unwrap()
+            .iter()
+            .find(|i| i.bone == 1)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        assert!(back < after, "and the stroke took it away again: {after} -> {back}");
     }
 
 }

@@ -137,6 +137,71 @@ impl SkinWeights {
         changed
     }
 
+    /// Move a signed amount of each vertex's influence onto `bone`.
+    ///
+    /// This is what a weight brush does: a stroke adds to the bone under the
+    /// cursor and takes the same share from the others, so the vertex's total
+    /// stays one. A negative amount takes the bone's share away instead, and
+    /// the others take it back.
+    ///
+    /// `amounts` is one signed amount per vertex — the brush's falloff folded
+    /// into the stroke's strength — so a stroke can fade out with the
+    /// distance from the cursor. The amount is clamped to what the vertex can
+    /// carry: a vertex already fully on the bone cannot take more, and one
+    /// with nothing on it cannot give any away.
+    ///
+    /// Returns how many vertices changed.
+    pub fn brush(&mut self, amounts: &[(u32, f32)], bone: usize) -> usize {
+        let mut changed = 0;
+        for &(vertex, amount) in amounts {
+            if !amount.is_finite() || amount == 0.0 {
+                continue;
+            }
+            let vertex = vertex as usize;
+            let Ok(existing) = self.influences(vertex) else {
+                continue;
+            };
+            let current: f32 = existing
+                .iter()
+                .find(|influence| influence.bone == bone)
+                .map(|influence| influence.weight)
+                .unwrap_or(0.0);
+            let others: f32 = existing
+                .iter()
+                .filter(|influence| influence.bone != bone)
+                .map(|influence| influence.weight)
+                .sum();
+            // Nothing to take from, or nowhere to give it: a vertex's
+            // influences always add up to one, so weight can only move
+            // between the bones that are there.
+            if (amount > 0.0 && current >= 1.0 - 1e-6) || (amount < 0.0 && others <= 1e-6) {
+                continue;
+            }
+            let new = (current + amount).clamp(0.0, 1.0);
+            let delta = new - current;
+            if delta.abs() < 1e-6 {
+                continue;
+            }
+            // The other bones keep their proportions of what is left.
+            let scale = if current >= 1.0 - 1e-6 {
+                0.0
+            } else {
+                (1.0 - new) / (1.0 - current).max(1e-6)
+            };
+            let mut pairs: Vec<(usize, f32)> = existing
+                .iter()
+                .filter(|influence| influence.bone != bone)
+                .map(|influence| (influence.bone, influence.weight * scale))
+                .filter(|&(_, weight)| weight > 1e-6)
+                .collect();
+            pairs.push((bone, new));
+            if self.set_weights(vertex, &pairs).is_ok() {
+                changed += 1;
+            }
+        }
+        changed
+    }
+
     /// Move `weight` of every listed vertex's influence onto `bone`: the
     /// influences the vertex already carried keep their proportions of the
     /// remaining `1 - weight`, and the bone takes the rest.
@@ -571,4 +636,103 @@ mod tests {
             w.influences(1).unwrap()
         );
     }
+    #[test]
+    fn a_brush_stroke_moves_weight_onto_the_bone() {
+        let mut w = SkinWeights::new(1, 2);
+        w.set_weights(0, &[(0, 1.0)]).unwrap();
+        // Half of the vertex's weight moves to the other bone.
+        let changed = w.brush(&[(0, 0.5)], 1);
+        assert_eq!(changed, 1);
+        let infs = w.influences(0).unwrap();
+        assert!((total(&infs) - 1.0).abs() < 1e-6, "the total stays one: {infs:?}");
+        let on_bone: f32 = infs
+            .iter()
+            .find(|i| i.bone == 1)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        assert!((on_bone - 0.5).abs() < 1e-6, "the bone took the stroke: {infs:?}");
+        let on_other: f32 = infs
+            .iter()
+            .find(|i| i.bone == 0)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        assert!((on_other - 0.5).abs() < 1e-6, "and the other gave it up: {infs:?}");
+    }
+
+    #[test]
+    fn a_brush_stroke_can_take_weight_away_again() {
+        let mut w = SkinWeights::new(1, 2);
+        w.set_weights(0, &[(0, 0.5), (1, 0.5)]).unwrap();
+        // A negative stroke takes the weight off the bone, and the other bone
+        // takes it back.
+        let changed = w.brush(&[(0, -0.25)], 1);
+        assert_eq!(changed, 1);
+        let infs = w.influences(0).unwrap();
+        let on_bone: f32 = infs
+            .iter()
+            .find(|i| i.bone == 1)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        assert!((on_bone - 0.25).abs() < 1e-6, "{infs:?}");
+        let on_other: f32 = infs
+            .iter()
+            .find(|i| i.bone == 0)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        assert!((on_other - 0.75).abs() < 1e-6, "{infs:?}");
+        assert!((total(&infs) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_brush_stroke_stops_at_what_a_vertex_can_carry() {
+        let mut w = SkinWeights::new(1, 2);
+        w.set_weights(0, &[(0, 1.0)]).unwrap();
+        // More than the vertex can hold is clamped: it ends fully on the bone.
+        assert_eq!(w.brush(&[(0, 5.0)], 1), 1);
+        let on_bone: f32 = w
+            .influences(0)
+            .unwrap()
+            .iter()
+            .find(|i| i.bone == 1)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        assert!((on_bone - 1.0).abs() < 1e-6, "the vertex ended fully on the bone");
+        // A vertex that is fully on a bone has nowhere to give the weight to.
+        let mut w = SkinWeights::new(1, 2);
+        w.set_weights(0, &[(1, 1.0)]).unwrap();
+        assert_eq!(w.brush(&[(0, -0.5)], 1), 0);
+        // A non-finite or empty stroke is refused.
+        let mut w = SkinWeights::new(1, 2);
+        w.set_weights(0, &[(0, 1.0)]).unwrap();
+        assert_eq!(w.brush(&[(0, f32::NAN)], 1), 0);
+        assert_eq!(w.brush(&[(0, 0.0)], 1), 0);
+    }
+
+    #[test]
+    fn a_brush_stroke_fades_with_its_amounts() {
+        let mut w = SkinWeights::new(2, 2);
+        w.set_weights(0, &[(0, 1.0)]).unwrap();
+        w.set_weights(1, &[(0, 1.0)]).unwrap();
+        // The first vertex is under the cursor and takes the whole stroke; the
+        // second is at the brush's edge and takes a tenth of it.
+        let changed = w.brush(&[(0, 0.4), (1, 0.04)], 1);
+        assert_eq!(changed, 2);
+        let near: f32 = w
+            .influences(0)
+            .unwrap()
+            .iter()
+            .find(|i| i.bone == 1)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        let far: f32 = w
+            .influences(1)
+            .unwrap()
+            .iter()
+            .find(|i| i.bone == 1)
+            .map(|i| i.weight)
+            .unwrap_or(0.0);
+        assert!((near - 0.4).abs() < 1e-6, "{near}");
+        assert!((far - 0.04).abs() < 1e-6, "{far}");
+    }
+
 }
