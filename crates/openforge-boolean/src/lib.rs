@@ -248,6 +248,15 @@ mod tests {
 
     // --- robustness -------------------------------------------------------------
 
+    /// A box with a different size on each axis.
+    fn box_sized(center: Vec3, size: Vec3) -> Mesh {
+        let mut m = box_at(center, 2.0);
+        for p in &mut m.positions {
+            *p = center + (*p - center) * (size * 0.5);
+        }
+        m
+    }
+
     /// A closed sphere: a UV sphere with one vertex at each pole, so the
     /// surface is genuinely closed and a boolean over it has to stay closed.
     fn ball(center: Vec3, radius: f32, segments: u32, rings: u32) -> Mesh {
@@ -509,5 +518,117 @@ mod tests {
         let u = union(&a, &b).unwrap();
         assert!(is_watertight(&u), "the big union is still a closed solid");
         assert!(u.face_count() > 100, "and it really is a big mesh");
+    }
+
+    // --- the texture and the material -------------------------------------------
+
+    /// A box whose six faces each carry the unit square of UVs, so a cut
+    /// across a face has somewhere to interpolate to.
+    fn textured_box(center: Vec3, size: f32) -> Mesh {
+        let mut m = box_at(center, size);
+        for f in &mut m.faces {
+            let n = f.corners.len();
+            for (i, c) in f.corners.iter_mut().enumerate() {
+                let u = i as f32 / (n - 1) as f32;
+                c.uv = m.uvs.len() as u32;
+                m.uvs.push(glam::Vec2::new(u, 1.0 - u));
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn a_boolean_keeps_the_texture() {
+        let a = textured_box(Vec3::ZERO, 2.0);
+        let b = textured_box(Vec3::new(1.0, 0.0, 0.0), 2.0);
+        let u = union(&a, &b).unwrap();
+        assert!(!u.uvs.is_empty(), "the result still has UVs");
+        // Every corner points at a UV that exists.
+        for f in &u.faces {
+            for c in &f.corners {
+                assert!(
+                    (c.uv as usize) < u.uvs.len(),
+                    "a corner points past the UVs"
+                );
+            }
+        }
+        // And they are the *original* UVs, not a fresh pile of zeroes: the
+        // unit square's corners are all there.
+        let has_edge = u.uvs.iter().any(|uv| uv.x < 0.01 && uv.y > 0.99);
+        let has_middle = u.uvs.iter().any(|uv| uv.x > 0.4 && uv.x < 0.6);
+        assert!(has_edge, "the original UVs are still there: {:?}", u.uvs);
+        assert!(
+            has_middle,
+            "and the cut interpolated new ones along the edge: {:?}",
+            u.uvs
+        );
+    }
+
+    #[test]
+    fn a_cut_interpolates_the_uv_along_the_edge_it_crosses() {
+        // A single quad with the unit square on it, cut across by a thin
+        // box: the points where the cut crosses the edges take the UV that
+        // the edge's own span puts there.
+        let mut quad = Mesh::new();
+        for p in [
+            Vec3::new(-1.0, -1.0, 0.0),
+            Vec3::new(1.0, -1.0, 0.0),
+            Vec3::new(1.0, 1.0, 0.0),
+            Vec3::new(-1.0, 1.0, 0.0),
+        ] {
+            quad.add_vertex(p);
+        }
+        quad.add_face(&[0, 1, 2, 3]);
+        for (i, uv) in [
+            glam::Vec2::new(0.0, 1.0),
+            glam::Vec2::new(1.0, 1.0),
+            glam::Vec2::new(1.0, 0.0),
+            glam::Vec2::new(0.0, 0.0),
+        ]
+        .iter()
+        .enumerate()
+        {
+            quad.uvs.push(*uv);
+            quad.faces[0].corners[i].uv = i as u32;
+        }
+        // A thin box standing across the middle of it.
+        let cutter = box_sized(Vec3::ZERO, Vec3::new(0.2, 2.0, 2.0));
+        let polys = bsp::union(&bsp::mesh_to_polygons(&quad), &bsp::mesh_to_polygons(&cutter));
+        // The cut lands at x = ±0.1, which is u = 0.45 and u = 0.55 on the
+        // quad's own span — and not at the ends, which is what an
+        // uninterpolated split would give.
+        let interpolated = polys
+            .iter()
+            .flat_map(|p| p.uvs.iter())
+            .filter(|uv| uv.x > 0.4 && uv.x < 0.6)
+            .count();
+        assert!(
+            interpolated >= 2,
+            "the cut's own vertices carry the UV of the edge's span: {interpolated}"
+        );
+    }
+
+    #[test]
+    fn the_material_travels_with_the_face() {
+        // Two faces, two materials: the result keeps both, and the face that
+        // came from the second solid still points at the second material.
+        let mut a = box_at(Vec3::ZERO, 2.0);
+        for (i, f) in a.faces.iter_mut().enumerate() {
+            f.material = i as u32 % 2;
+        }
+        let mut b = box_at(Vec3::new(1.0, 0.0, 0.0), 2.0);
+        for f in &mut b.faces {
+            f.material = 7;
+        }
+        let u = union(&a, &b).unwrap();
+        let materials: std::collections::HashSet<u32> = u.faces.iter().map(|f| f.material).collect();
+        assert!(
+            materials.contains(&0) && materials.contains(&1),
+            "the first solid's materials are still there: {materials:?}"
+        );
+        assert!(
+            materials.contains(&7),
+            "and the second solid's material came with it: {materials:?}"
+        );
     }
 }

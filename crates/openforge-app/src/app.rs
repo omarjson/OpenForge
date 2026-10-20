@@ -931,10 +931,7 @@ impl OpenForgeApp {
             return;
         }
         let (a, b) = (ids[0], ids[1]);
-        let (Some(ma), Some(mb)) = (
-            self.scene.get(a).ok().and_then(|n| n.mesh()).cloned(),
-            self.scene.get(b).ok().and_then(|n| n.mesh()).cloned(),
-        ) else {
+        let Some((ma, mb, slots)) = self.boolean_inputs(a, b) else {
             self.status = "Could not read the two meshes.".into();
             return;
         };
@@ -952,8 +949,14 @@ impl OpenForgeApp {
                 let closed = openforge_boolean::is_watertight(&mesh);
                 self.with_edit(kind, |app| {
                     if let Ok(node) = app.scene.get_mut(a) {
-                        if let Some(slot) = node.mesh_mut() {
-                            *slot = mesh;
+                        if let NodeKind::Mesh {
+                            mesh: slot_mesh,
+                            material_slots,
+                        } = &mut node.kind
+                        {
+                            *slot_mesh = mesh;
+                            // The two solids' materials live in one list now.
+                            *material_slots = slots;
                         }
                     }
                     app.scene.remove_subtree(b);
@@ -969,6 +972,43 @@ impl OpenForgeApp {
             }
             Err(e) => self.status = format!("Boolean failed: {}", e),
         }
+    }
+
+    /// The two nodes' meshes with their per-face material indices renumbered
+    /// into one list, and that list.
+    ///
+    /// A face's material is an index into its *own* node's slot list, so the
+    /// second solid's faces are moved past the first's slots: the result then
+    /// carries both nodes' materials, and the library entries behind them are
+    /// the same ones the two nodes were showing.
+    fn boolean_inputs(&self, a: NodeId, b: NodeId) -> Option<(Mesh, Mesh, Vec<u32>)> {
+        let (ma, slots_a) = self.node_mesh_and_slots(a)?;
+        let (mut mb, slots_b) = self.node_mesh_and_slots(b)?;
+        for f in &mut mb.faces {
+            f.material += slots_a.len() as u32;
+        }
+        let mut slots = slots_a;
+        slots.extend(slots_b);
+        Some((ma, mb, slots))
+    }
+
+    /// A node's mesh and its material slots, an empty slot list read as the
+    /// default material — the fallback the node itself uses.
+    fn node_mesh_and_slots(&self, id: NodeId) -> Option<(Mesh, Vec<u32>)> {
+        let node = self.scene.get(id).ok()?;
+        let NodeKind::Mesh {
+            mesh,
+            material_slots,
+        } = &node.kind
+        else {
+            return None;
+        };
+        let slots = if material_slots.is_empty() {
+            vec![0]
+        } else {
+            material_slots.clone()
+        };
+        Some((mesh.clone(), slots))
     }
 
     // --- Rigging -----------------------------------------------------------------
@@ -11380,6 +11420,50 @@ mod tests {
         // And it is one undo step back.
         app.undo_edit();
         assert!(app.scene.get(b).is_ok(), "and comes back with undo");
+    }
+
+    #[test]
+    fn a_boolean_keeps_both_meshes_materials() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let mut second = primitive_box(2.0);
+        for p in &mut second.positions {
+            *p += Vec3::new(1.0, 0.0, 0.0);
+        }
+        let a = app.scene.create_mesh("a", primitive_box(2.0));
+        let b = app.scene.create_mesh("b", second);
+        // The first mesh shows library slot 3, the second slot 5.
+        for (id, slot) in [(a, 3u32), (b, 5)] {
+            if let NodeKind::Mesh { material_slots, .. } =
+                &mut app.scene.get_mut(id).unwrap().kind
+            {
+                *material_slots = vec![slot];
+            }
+        }
+        app.selection.clear();
+        app.selection.select_node(a);
+        app.selection.select_node(b);
+        app.boolean_selected("Union");
+
+        // The result carries both library slots, and each solid's faces point
+        // at the one it had.
+        let node = app.scene.get(a).unwrap();
+        let NodeKind::Mesh {
+            material_slots,
+            mesh,
+            ..
+        } = &node.kind
+        else {
+            panic!("the result is a mesh");
+        };
+        assert_eq!(material_slots, &vec![3, 5], "both slots survived");
+        assert!(
+            mesh.faces.iter().any(|f| f.material == 0),
+            "the first solid's faces still point at its own slot"
+        );
+        assert!(
+            mesh.faces.iter().any(|f| f.material == 1),
+            "and the second's moved past it"
+        );
     }
 
 }

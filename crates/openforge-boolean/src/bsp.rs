@@ -25,8 +25,8 @@
 //! repeats a vertex or folds onto itself is dropped, and the ear clipper
 //! refuses zero-area ears, so a split edge never becomes a chord across itself.
 
-use glam::DVec3 as Vec3;
-use openforge_core::mesh::Mesh;
+use glam::{DVec3 as Vec3, Vec2};
+use openforge_core::mesh::{Corner, Face, Mesh};
 use std::collections::HashMap;
 
 /// Plane-classification tolerance, in normalized units: a vertex this close to
@@ -126,17 +126,26 @@ impl Plane {
                 let n = poly.vertices.len();
                 let mut f: Vec<Vec3> = Vec::new();
                 let mut b: Vec<Vec3> = Vec::new();
+                // The UVs travel with their vertices, and the point where the
+                // cut crosses an edge gets the UV that edge's own span puts
+                // there — so the texture does not jump across the cut.
+                let mut fu: Vec<Vec2> = Vec::new();
+                let mut bu: Vec<Vec2> = Vec::new();
                 for i in 0..n {
                     let j = (i + 1) % n;
                     let vi = poly.vertices[i];
                     let vj = poly.vertices[j];
+                    let ui = poly.uvs[i];
+                    let uj = poly.uvs[j];
                     let ti = types[i];
                     let tj = types[j];
                     if ti != 2 {
                         f.push(vi); // not strictly behind → keep on front
+                        fu.push(ui);
                     }
                     if ti != 1 {
                         b.push(vi); // not strictly in front → keep on back
+                        bu.push(ui);
                     }
                     if (ti == 2 && tj == 1) || (ti == 1 && tj == 2) {
                         // Edge crosses the plane: insert the intersection.
@@ -144,17 +153,20 @@ impl Plane {
                         let sj = self.normal.dot(vj) - self.w;
                         let t = si / (si - sj);
                         let p = vi + (vj - vi) * t;
+                        let uv = ui + (uj - ui) * (t as f32);
                         f.push(p);
+                        fu.push(uv);
                         b.push(p);
+                        bu.push(uv);
                     }
                 }
                 if f.len() >= 3 {
-                    if let Some(p) = Polygon::from_points(f, poly.plane) {
+                    if let Some(p) = Polygon::from_points(f, fu, poly.plane, poly.material) {
                         front.push(p);
                     }
                 }
                 if b.len() >= 3 {
-                    if let Some(p) = Polygon::from_points(b, poly.plane) {
+                    if let Some(p) = Polygon::from_points(b, bu, poly.plane, poly.material) {
                         back.push(p);
                     }
                 }
@@ -164,42 +176,68 @@ impl Plane {
 }
 
 /// A convex polygon (triangle, quad, or n-gon) plus the plane it lies on.
+///
+/// The UV of each vertex travels with it, and the face's material travels
+/// with the polygon, so a boolean does not take the texture off the surface
+/// it cuts.
 #[derive(Clone, Debug)]
 pub(crate) struct Polygon {
     pub vertices: Vec<Vec3>,
     pub plane: Plane,
+    /// The UV of each vertex, in the same order.
+    pub uvs: Vec<Vec2>,
+    /// The face's material, as an index into the owning node's slot list.
+    pub material: u32,
 }
 
 impl Polygon {
     /// Build a polygon from counter-clockwise vertices on the given plane,
     /// dropping repeated neighbours. Returns `None` for a loop that is too
     /// short, or too thin, to have an interior.
-    fn from_points(vertices: Vec<Vec3>, plane: Plane) -> Option<Self> {
-        let vertices = compress_loop(&vertices);
-        if vertices.len() < 3 {
+    fn from_points(
+        vertices: Vec<Vec3>,
+        uvs: Vec<Vec2>,
+        plane: Plane,
+        material: u32,
+    ) -> Option<Self> {
+        let kept = compress_indices(&vertices);
+        if kept.len() < 3 {
             return None;
         }
+        let vertices: Vec<Vec3> = kept.iter().map(|&i| vertices[i]).collect();
+        let uvs: Vec<Vec2> = kept.iter().map(|&i| uvs.get(i).copied().unwrap_or(Vec2::ZERO)).collect();
         if loop_area(&vertices, plane.normal) <= 0.0 {
             return None; // degenerate, or wound the wrong way for its plane
         }
-        Some(Self { vertices, plane })
+        Some(Self {
+            vertices,
+            plane,
+            uvs,
+            material,
+        })
     }
 }
 
-/// Drop consecutive vertices closer together than the weld tolerance — the
-/// closing point included — so a split that lands a hair from an existing
-/// vertex does not leave a zero-length edge behind.
-fn compress_loop(verts: &[Vec3]) -> Vec<Vec3> {
-    let mut out: Vec<Vec3> = Vec::with_capacity(verts.len());
-    for &v in verts {
-        if out.last().is_none_or(|last| (v - *last).length() > WELD) {
-            out.push(v);
+/// The indices of the loop's vertices worth keeping: consecutive vertices
+/// closer together than the weld tolerance are one vertex, and the closing
+/// point is dropped when it folds back onto the first.
+///
+/// The indices come back rather than the points, so the UVs that go with them
+/// can be kept in step.
+fn compress_indices(verts: &[Vec3]) -> Vec<usize> {
+    let mut kept: Vec<usize> = Vec::with_capacity(verts.len());
+    for (i, &v) in verts.iter().enumerate() {
+        let duplicate = kept
+            .last()
+            .is_some_and(|&k| (v - verts[k]).length() <= WELD);
+        if !duplicate {
+            kept.push(i);
         }
     }
-    while out.len() > 1 && (out[out.len() - 1] - out[0]).length() <= WELD {
-        out.pop();
+    while kept.len() > 1 && (verts[*kept.last().unwrap()] - verts[kept[0]]).length() <= WELD {
+        kept.pop();
     }
-    out
+    kept
 }
 
 /// The signed area of a planar loop as seen from `normal`'s side.
@@ -307,6 +345,7 @@ impl Node {
         for poly in &mut self.polygons {
             poly.plane.flip();
             poly.vertices.reverse();
+            poly.uvs.reverse();
         }
         if let Some(f) = &mut self.front {
             f.invert();
@@ -386,6 +425,11 @@ impl Fit {
                     normal: p.plane.normal,
                     w: (p.plane.w - p.plane.normal.dot(self.center)) * self.scale,
                 },
+                // A uniform scale and a translation leave the texture where
+                // it was: the UVs are a picture of the surface, not of where
+                // the surface sits.
+                uvs: p.uvs.clone(),
+                material: p.material,
             })
             .collect()
     }
@@ -417,15 +461,24 @@ pub(crate) fn mesh_to_polygons(mesh: &Mesh) -> Vec<Polygon> {
             .filter_map(|c| mesh.positions.get(c.position as usize).copied())
             .map(|p| p.as_dvec3())
             .collect();
+        // The corner's own UV, so the texture travels with the face.
+        let uvs: Vec<Vec2> = f
+            .corners
+            .iter()
+            .map(|c| mesh.uvs.get(c.uv as usize).copied().unwrap_or(Vec2::ZERO))
+            .collect();
         if pts.len() < 3 {
             continue;
         }
         for i in 1..pts.len() - 1 {
             let tri = vec![pts[0], pts[i], pts[i + 1]];
+            let tri_uvs = vec![uvs[0], uvs[i], uvs[i + 1]];
             if let Some(plane) = Plane::from_points(tri[0], tri[1], tri[2]) {
                 out.push(Polygon {
                     vertices: tri,
                     plane,
+                    uvs: tri_uvs,
+                    material: f.material,
                 });
             }
         }
@@ -441,14 +494,23 @@ pub(crate) fn mesh_to_polygons(mesh: &Mesh) -> Vec<Polygon> {
 /// this question is asked once per edge of every polygon in the result, and
 /// the answer is nearly always "nothing here", so the grid is what keeps a
 /// boolean of a real scene from taking minutes.
-fn expand_t_junctions(verts: &[Vec3], grid: &PointGrid, tol: f64) -> Vec<Vec3> {
+fn expand_t_junctions(
+    verts: &[Vec3],
+    uvs: &[Vec2],
+    grid: &PointGrid,
+    tol: f64,
+) -> (Vec<Vec3>, Vec<Vec2>) {
     let tol2 = tol * tol;
     let mut out: Vec<Vec3> = Vec::with_capacity(verts.len());
+    let mut out_uvs: Vec<Vec2> = Vec::with_capacity(verts.len());
     let n = verts.len();
     for i in 0..n {
         let a = verts[i];
         let b = verts[(i + 1) % n];
+        let ua = uvs.get(i).copied().unwrap_or(Vec2::ZERO);
+        let ub = uvs.get((i + 1) % n).copied().unwrap_or(Vec2::ZERO);
         out.push(a);
+        out_uvs.push(ua);
         let ab = b - a;
         let l2 = ab.length_squared();
         if l2 < tol2 {
@@ -470,11 +532,14 @@ fn expand_t_junctions(verts: &[Vec3], grid: &PointGrid, tol: f64) -> Vec<Vec3> {
         for t in ts {
             if t - last > tol {
                 out.push(a + ab * t);
+                // The point's UV is where it falls on the edge's own span, so
+                // the texture runs along the edge without a jump.
+                out_uvs.push(ua + (ub - ua) * (t as f32));
                 last = t;
             }
         }
     }
-    out
+    (out, out_uvs)
 }
 
 /// A uniform grid over a point cloud, for "which points lie within `tol` of
@@ -647,14 +712,23 @@ fn ear_clip(loop_idx: &[u32], pos: &[Vec3], normal: Vec3) -> Vec<[u32; 3]> {
             if cross.dot(normal) <= 0.0 {
                 continue;
             }
-            // Ensure no other loop vertex lies inside this ear.
+            // Ensure no other loop vertex lies inside this ear. A vertex
+            // that is one of the ear's own corners — the same place reached
+            // through the weld — is not inside it.
             let mut occupied = false;
             for &v in &idx {
                 let vi = v as usize;
                 if vi == ip || vi == ic || vi == inx {
                     continue;
                 }
-                if point_in_tri(pos[vi], a, b, c, normal) {
+                let p = pos[vi];
+                if (p - a).length() <= WELD
+                    || (p - b).length() <= WELD
+                    || (p - c).length() <= WELD
+                {
+                    continue;
+                }
+                if point_in_tri(p, a, b, c, normal) {
                     occupied = true;
                     break;
                 }
@@ -715,14 +789,17 @@ pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
         if poly.vertices.len() < 3 {
             continue;
         }
-        let loop_pts = expand_t_junctions(&poly.vertices, &grid, WELD);
+        let (loop_pts, loop_uvs) = expand_t_junctions(&poly.vertices, &poly.uvs, &grid, WELD);
         let m = loop_pts.len();
         if m < 3 {
             continue;
         }
-        // Weld the loop into indexed vertices.
+        // Weld the loop into indexed vertices. The UV does not weld with the
+        // position: a seam is a place where two faces want different UVs at
+        // the same point, and welding them would flatten the texture there.
         let mut idx: Vec<u32> = Vec::with_capacity(m);
-        for &v in &loop_pts {
+        let mut uv_index: Vec<u32> = Vec::with_capacity(m);
+        for (k, &v) in loop_pts.iter().enumerate() {
             match welder.find(v) {
                 Some(i) => idx.push(i),
                 None => {
@@ -732,13 +809,19 @@ pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
                     idx.push(i);
                 }
             }
+            uv_index.push(mesh.uvs.len() as u32);
+            mesh.uvs.push(loop_uvs[k]);
         }
-        // Ear-clip, skipping degenerate triangles, so split edges stay split.
-        for tri in ear_clip(&idx, &points, poly.plane.normal) {
+        // The clipper works on the *welded* geometry — that is the geometry
+        // the faces will point at — but it keeps the loop's own numbering, so
+        // each corner still knows its UV.
+        let geom: Vec<Vec3> = idx.iter().map(|&i| points[i as usize]).collect();
+        let positions: Vec<u32> = (0..m as u32).collect();
+        for tri in ear_clip(&positions, &geom, poly.plane.normal) {
             let (p0, p1, p2) = (
-                points[tri[0] as usize],
-                points[tri[1] as usize],
-                points[tri[2] as usize],
+                geom[tri[0] as usize],
+                geom[tri[1] as usize],
+                geom[tri[2] as usize],
             );
             // A face that is *exactly* degenerate (three identical points) is
             // dropped: it would be a zero-length edge in the mesh. A merely
@@ -748,7 +831,21 @@ pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
             if (p1 - p0).cross(p2 - p0).length_squared() == 0.0 {
                 continue;
             }
-            mesh.add_face(&tri);
+            let corners: Vec<Corner> = tri
+                .iter()
+                .map(|&p| {
+                    let k = p as usize;
+                    Corner {
+                        position: idx[k],
+                        normal: 0,
+                        uv: uv_index[k],
+                    }
+                })
+                .collect();
+            mesh.faces.push(Face {
+                corners,
+                material: poly.material,
+            });
         }
     }
     mesh.compute_flat_normals();
