@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 13 crates (717 `#[test]` fns; 720 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 13 crates (729 `#[test]` fns; 732 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -54,11 +54,11 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-animation` | 54 | Keyframe tracks, interpolation, clips, player — and the key *editing* maths: `Track::retime_key`/`index_at`, `TransformTrack::key_times`/`retime_keys`/`remove_keys_at` (the timeline's columns). |
 | `openforge-algorithms` | 24 | Primitives, Catmull-Clark, Perlin/fBm noise, L-systems. |
 | `openforge-uv` | 56 | Planar/cylindrical/spherical/box projections, unwrap, pack, **UV islands by continuity with per-island atlas packing** (`islands.rs`), per-selection affine edits for the UV editor, and island-scale edits (`edit.rs`): **weld** pulls UVs to their cluster average (the island walk reads positions, so a weld makes two patches one), **split** gives selected faces private copies of corners they share outside the set, **mirror** reflects a selection about its own bounds. |
-| `openforge-boolean` | 9 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks. |
+| `openforge-boolean` | 20 | BSP CSG: union/subtract/intersect, watertight output, volume/watertight checks — **run in normalized `f64` space, so the tolerances are relative to the model and the same geometry gives the same answer at any scale (#40)**, with the result's shared vertices welded by tolerance rather than by a rounding grid, slivers kept rather than dropped (dropping them left holes in every boolean over curved solids), and the T-junction pass fed by a grid instead of a quadratic walk. |
 | `openforge-rig` | 25 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights` (with the weight *editing* maths: `assign`, `blend`, `smooth`), `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
 | `openforge-project` | 15 | The project file: one versioned JSON document holding the scene (nodes listed parents-first, every reference a position in that list — ids never reach the file), the material library (textures as base64 RGBA8; each material's four maps as optional fields, so a file written before one existed still loads), the animation clips and — since version 2 — the skinned rig (skeleton with both poses, weights, bind positions, driven node; version-1 files still load, without a rig). It has its own document structs and a bridge to the engine types, rebuilds the rig through the rig crate's own API (parents-first, validated weights), and every refusal says what it found: not JSON, not ours, too new, or malformed. |
-| `openforge-app` | 258 (bin) | eframe/egui GUI. `app.rs` (~10700 lines) + `gizmo.rs` (screen-space transform gizmo: **axis arms, one grab handle per coordinate plane and a centre handle that moves or scales in the plane facing the camera**, in **three axis modes — World, the selection's own axes (Local) or the screen's (Screen) — with a placeable pivot the whole selection turns and scales about**, with the one `Layout` driving both the hit-test and the paint) + `snap.rs` (snapping settings + pure snap maths, confined per handle to the axes it can move) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback; the `Camera` is either the free orbit camera or one of the six **axis-aligned orthographic views** — `ViewKind` carries the angle pair, the up vector and the label, and picking, the grid and the gizmo all read the same `view_proj`) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the recent-projects list, the shortcut table — and the settings file: a small JSON document in the platform's config directory, loaded only by the real constructor, written when the Preferences window closes and quietly when the recent list changes) + its project block (File ▸ Open/Save/Save As over `openforge-project`; `current_file` is the remembered document path, which the status bar shows; the live rig rides the save and comes back through undo's rig snapshot; the title carries the document's name and a star while `modified` holds unsaved edits, File ▸ Open Recent lists the recent projects and the unsaved-changes guard holds New, a chosen project file and Quit — the window's own X included — until the edits are answered). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest), and the **materials panel** edits the library's textures (import, checker presets) and materials — one row per map kind with its texture combo and a thumbnail of what it holds. View ▸ Viewport lists the seven projections (the current one ticked, 0–6 on the digits, the corner label naming what shows), and the **Properties panel** edits a single node's transform as three rows of numbers — translation, XYZ Euler degrees and per-axis scale — one undo entry per edit named for what moved. |
+| `openforge-app` | 259 (bin) | eframe/egui GUI. `app.rs` (~10700 lines) + `gizmo.rs` (screen-space transform gizmo: **axis arms, one grab handle per coordinate plane and a centre handle that moves or scales in the plane facing the camera**, in **three axis modes — World, the selection's own axes (Local) or the screen's (Screen) — with a placeable pivot the whole selection turns and scales about**, with the one `Layout` driving both the hit-test and the paint) + `snap.rs` (snapping settings + pure snap maths, confined per handle to the axes it can move) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback; the `Camera` is either the free orbit camera or one of the six **axis-aligned orthographic views** — `ViewKind` carries the angle pair, the up vector and the label, and picking, the grid and the gizmo all read the same `view_proj`) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the recent-projects list, the shortcut table — and the settings file: a small JSON document in the platform's config directory, loaded only by the real constructor, written when the Preferences window closes and quietly when the recent list changes) + its project block (File ▸ Open/Save/Save As over `openforge-project`; `current_file` is the remembered document path, which the status bar shows; the live rig rides the save and comes back through undo's rig snapshot; the title carries the document's name and a star while `modified` holds unsaved edits, File ▸ Open Recent lists the recent projects and the unsaved-changes guard holds New, a chosen project file and Quit — the window's own X included — until the edits are answered). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest), and the **materials panel** edits the library's textures (import, checker presets) and materials — one row per map kind with its texture combo and a thumbnail of what it holds. View ▸ Viewport lists the seven projections (the current one ticked, 0–6 on the digits, the corner label naming what shows), and the **Properties panel** edits a single node's transform as three rows of numbers — translation, XYZ Euler degrees and per-axis scale — one undo entry per edit named for what moved. |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -397,13 +397,13 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **720 tests pass** (717 `#[test]`
+workspace builds with **0 warnings**, **732 tests pass** (729 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Thirty-nine work-streams are done — the engine layer from the **wgpu
+Forty work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
-through **gizmo axes modes and a placed pivot** (#39), each narrated further
-down — plus a progress report:
+through **gizmo axes modes and a placed pivot** (#39) and **boolean CSG that
+stays closed** (#40), each narrated further down — plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -1827,9 +1827,64 @@ down — plus a progress report:
   a point off to the side is off-target and still on the ground plane, and a
   front view refuses with a status that says why).
 
+- **Boolean CSG that stays closed, and the same answer at any scale**
+  (work-stream #40). The boolean engine was the lowest-scoring area left that
+  was not blocked by the clean-room constraint, and it had two real faults: a
+  union of two overlapping spheres came out **full of holes** (797 open edges
+  where there should have been none), and the same geometry in millimetres
+  instead of metres came out **empty**.
+  - **The work happens in normalized `f64` space.** `bsp::Fit` centres both
+    solids and scales them to an extent of about one before anything is
+    split, and the finished mesh is mapped back. Every tolerance in the
+    engine is therefore *relative to the model*: a scene in millimetres and a
+    scene in kilometres take the same path with the same accuracy, where the
+    old absolute `1e-4` swallowed a small scene whole and lost accuracy in a
+    large one. The splitting itself is now double precision, and the result is
+    rounded to single precision once, on the way out.
+  - **Slivers are kept, not dropped.** This was the hole. The mesh rebuild
+    dropped any face thinner than a tolerance, and a split edge always leaves
+    slivers — so each dropped sliver was a hole in the surface, and the
+    result of a boolean over curved solids was a shell full of them. The ear
+    clipper now refuses an ear that thin (so it never emits one) and the
+    rebuild keeps what the clipper does emit: a sliver is ugly, but it is part
+    of the surface, and dropping it leaves a hole where the two solids met.
+    The union of two overlapping spheres is now **closed** — every edge shared
+    by exactly two faces.
+  - **Shared vertices are welded by tolerance, not by a grid.** A rounding
+    grid puts two points a hair apart in different cells and leaves a crack;
+    the welder looks at the neighbouring cells too, so a vertex that appears
+    in several polygons (or in both solids) is one index however it rounds.
+    The T-junction pass — which inserts a neighbour's vertex into an edge that
+    was split without it — is fed by a **uniform grid** over the result's
+    points now, instead of walking every point for every edge: that walk was
+    quadratic, and a boolean of a real scene spent most of its time in it.
+  - **Degenerate input is tolerated.** A face with no area (two of its
+    corners at the same point) is dropped on the way in, a polygon whose loop
+    folds onto itself is refused, and a plane is only built from a triangle
+    whose area is not negligible *relative to its own sides* — so a sliver is
+    told apart from a small but honest face, which an absolute area test
+    cannot do.
+  - **The app says whether the result is a solid.** The Boolean menu's status
+    now reads "Union: result has 812 vertices, closed" — or "open — not a
+    closed solid" — because the difference between a solid and a puddle is
+    worth saying out loud.
+- **12 new tests.** `openforge-boolean` gained eleven: two boxes that share a
+  face union into one solid (and subtracting one that only touches leaves the
+  other alone); two boxes that overlap half way with coplanar faces give the
+  right volume; a box inside another subtracts to a shell that is closed all
+  the way round, and intersects to the inner box; a notch cut out of a box
+  leaves the expected volume; **the union and the difference of two spheres
+  are closed solids** (no open edges, no edge shared by three faces, no
+  degenerate face, no two vertices in the same place); **the same geometry
+  gives the same answer at 0.001, 1 and 1000 times the scale**; a face
+  collapsed to a line does not break the boolean; the result stays inside the
+  two inputs' own bounds; and a boolean of two thousand faces finishes. The
+  app gained one: the Boolean menu's status says whether the result came out
+  closed, the second mesh is consumed, and undo brings it back.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **720 pass, 0 failures**
+build too); `cargo test --workspace` → **732 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The #30 windows are
 measured headless too: the theme is asserted on a bare egui context, the
 grid's lines are counted through a real view-projection with the grid on and
@@ -1906,7 +1961,13 @@ plus the panel round with its one-step undo. The file options are pinned at the
 boundary: both turns, the exact inverse over a round trip, the bad-scale
 fallback, and the app-level import/export round written back to disk.
 Decimation joins them: the grid collapse, the guards, and the app's LOD round
-with its one-step undo. The tool list is measured from the registry too: four
+with its one-step undo. The boolean engine is pinned the same way, and at
+both ends: the volumes of unions, differences and intersections against the
+arithmetic that predicts them, the *closedness* of the result (every edge
+shared by exactly two faces) for boxes that share a face, for a box inside
+another, and for two overlapping spheres, the same geometry at three
+different scales, and the app's own round with its one-step undo and its
+report of whether the result came out closed. The tool list is measured from the registry too: four
 entries with the host's own descriptions, an empty list and a refusal when the
 plugin goes, the full list when it returns. And a key edit is a step of the
 scene's own stack now: the snapshot carries the clip library, so undo after a
@@ -1985,7 +2046,10 @@ show the thinning),
 and the **Plugins panel** by eye (uncheck `openforge.interchange`: the row
 should stay with its formats still listed, the report below should shrink to
 the core-tools counts, and importing a `.obj` should refuse with the
-all-disabled message), and the **UV Tools row** by eye (Weld / Split / Mirror U
+all-disabled message), and the **boolean results** by eye (the Game menu's Union / Subtract /
+Intersect: two overlapping boxes should make one solid with no hole in it, a
+notch cut into a box should leave a closed groove, and the status should say
+whether the result came out closed), and the **UV Tools row** by eye (Weld / Split / Mirror U
 / Mirror V and the Snap box: a snapped drag should step in 0.05 jumps, and
 Split should leave the neighbour's UVs standing), and the **Rig row** by eye
 (Create Rig should build a chain and auto-weight; the bone combo should list
@@ -2009,7 +2073,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **76.1%**, shown as 76%). The engine
+16 curated areas is **76.5%**, shown as 76%). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -2052,7 +2116,10 @@ orthographic views as one camera's projections, on a digit or from the
 Viewport menu, mirrored on the GPU path) as of #38, and the gizmo's world /
 local / screen axes with a pivot a transform swings about (the Axes Mode
 toolbar row and the Pivot menu, snapping confined to the frame's own axes)
-as of #39.
+as of #39, and the boolean CSG (normalized `f64`, so the tolerances are
+relative to the model; slivers kept, so the result is a closed solid; the
+shared vertices welded by tolerance; the T-junction pass on a grid) as of
+#40.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -2066,7 +2133,17 @@ Prioritized next steps:
    viewport surface: a **multi-view layout** (ZModeler's Layout 1/2/3 put
    several viewports side by side — #38 brought the projections, not the split),
    shadowing / ambient occlusion and a configurable shading mode.
-2. **Extend the gizmo further** (`gizmo.rs`, all additive). Axis arms, rings,
+2. **Deepen the boolean engine.** The three operations land closed solids
+   now (#40: normalized `f64`, slivers kept, tolerance welding, the
+   T-junction pass on a grid), and the app says whether the result came out
+   closed. What is still missing: **attributes through the boolean** (the
+   result comes back with fresh normals and no UVs or per-face materials, so
+   a cut object loses its texture), the operations a modeller expects around
+   them (split along a plane, shave a face, a "solid from a curve" op), and
+   repairing self-intersecting input rather than leaving the caller to fix
+   it first.
+
+3. **Extend the gizmo further** (`gizmo.rs`, all additive). Axis arms, rings,
    one square per coordinate plane and the screen-plane centre handle are in
    (#37), with rotation and scale typed in the Properties panel beside
    translation, and the **world / local / screen axes modes with a placeable
@@ -2082,35 +2159,35 @@ Prioritized next steps:
    gaps. (Sub-object pivots are done: a
    vertex/face-level drag moves only its own geometry, via `gizmo::Targets` +
    `viewport::element_centroid`.)
-3. **Deepen the UV editor.** The texture background (#11), island selection
+4. **Deepen the UV editor.** The texture background (#11), island selection
    plus per-island packing (#12) and the island-scale tools — weld, split,
    mirror, grid snap (#23) — landed; still missing: per-face map assignment
    from the canvas, and the 3D face selection staying in sync with the UV
    selection rather than being pushed on demand.
-4. **Deepen the plugin host.** The host is in, the app goes through it and the
+5. **Deepen the plugin host.** The host is in, the app goes through it and the
    toolbar and hotkeys now walk the tool registry (#26), but two pieces are
    still hard-wired: a `Service` carries a name and a description rather than
    behaviour, and plugins are compiled in rather than *loaded* — a
    `cdylib`/WASM filter discovered at runtime is the real prize. That is the
    long road to true parity.
-5. **IO expansion.** COLLADA/DAE and OFF landed in #29 and ASCII FBX in #34
+6. **IO expansion.** COLLADA/DAE and OFF landed in #29 and ASCII FBX in #34
    (the geometry subset: node transforms, the `Materials` section and its
    connections and animation are out of scope); USDZ, FBX's binary form and
    more of the COLLADA schema (node transforms, effects, animation) widen
    coverage next.
-6. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
+7. **Materials node editor.** Replace basic Phong/Lambert with a node graph.
    The GPU scene pass now samples **all four maps** (#36: diffuse #11, then
    normal, specular and emissive, each on both paths). What is left of the
    material system: a node graph in place of the fixed Phong surface,
    mipmapped/anisotropic sampling, per-map UV *channel* choice, opacity/blend
    modes, and bump/displacement and environment maps. Per-face material
    assignment — the reason slots exist per face — landed in #9.
-7. **Finish the panel/dialog surface.** Preferences, Keyboard Shortcuts and
+8. **Finish the panel/dialog surface.** Preferences, Keyboard Shortcuts and
    About landed in #30 and the window's choices now persist across runs
    (#33), and the Properties panel edits a whole transform as numbers (#37); an
    asset browser, window-layout memory and the deeper
    ZModeler-style dialogs have no home yet.
-8. **Deepen the project format.** The scene, the materials, the clips and
+9. **Deepen the project format.** The scene, the materials, the clips and
    (since version 2) the rig are in the file; preferences are settled as
    machine choices (#33) rather than document state, and the conveniences
    around the file — the recent-projects list, the dirty marker in the title
@@ -2119,7 +2196,11 @@ Prioritized next steps:
 
 **Honest gap to parity:** format-specific game tooling (vehicles, TXD
 dictionaries, per-game export paths — the generic half, LOD tags, dummies,
-their triangle budget and the LOD generator, landed in #21/#25), the
+their triangle budget and the LOD generator, landed in #21/#25), the boolean
+engine beyond the three operations it has (no "split", no "shave" against a
+plane, no **attributes through the boolean** — the result comes back with
+fresh normals and no UVs or per-face materials — and self-intersecting input
+is not repaired), the
 panel/dialog surface beyond the new shell (the preferences persist now, as
 machine choices rather than document state; there is no asset browser, no
 window-layout memory, and ZModeler's deeper dialogs have no home yet),
