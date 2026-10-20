@@ -16,7 +16,7 @@
 
 use crate::{finalize_mesh, IoError, IoResult, LoadedScene, MeshData};
 use openforge_core::mesh::Mesh;
-use openforge_core::Vec3;
+use openforge_core::{Mat4, Quat, Vec3};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -366,6 +366,8 @@ fn index_list(primitive: &Element) -> IoResult<Vec<usize>> {
 struct Builder<'a> {
     sources: &'a BTreeMap<String, Vec<f32>>,
     z_up: bool,
+    /// The transform the visual scene's node puts this geometry through.
+    transform: Mat4,
     mesh: Mesh,
     /// `(source id, source index)` → mesh vertex.
     vertex_map: BTreeMap<(String, usize), u32>,
@@ -389,10 +391,16 @@ impl Builder<'_> {
             .get(base..base + 3)
             .map(|c| Vec3::new(c[0], c[1], c[2]))
             .ok_or_else(|| parse_err(format!("index {index} is outside `{source}`")))?;
+        // The node's transform is in the file's own space, so it is applied
+        // before the up-axis turn.
+        let position = self.transform.transform_point3(position);
         let turn = |v: Vec3| if self.z_up { Vec3::new(v.x, v.z, -v.y) } else { v };
         let normal = normals
             .and_then(|floats| floats.get(base..base + 3))
-            .map(|n| turn(Vec3::new(n[0], n[1], n[2])));
+            .map(|n| {
+                let n = self.transform.transform_vector3(Vec3::new(n[0], n[1], n[2]));
+                turn(n)
+            });
         let vertex = self.mesh.add_vertex(turn(position));
         self.vertex_normal.push(normal);
         self.vertex_map.insert((source.to_string(), index), vertex);
@@ -417,6 +425,81 @@ impl Builder<'_> {
     }
 }
 
+/// The transform each geometry is placed by, gathered from the visual scene's
+/// node tree.
+///
+/// COLLADA keeps the geometry in a library and *places* it with the nodes of
+/// the visual scene: a node carries a matrix (or a translate, rotate and
+/// scale) and an `<instance_geometry>` naming the geometry it shows. The
+/// reader bakes those transforms into the vertices, so an imported model
+/// lands where the file put it.
+fn node_transforms(root: &Element) -> BTreeMap<String, Mat4> {
+    let mut out = BTreeMap::new();
+    let Some(scenes) = root.child("library_visual_scenes") else {
+        return out;
+    };
+    for scene in scenes.children_named("visual_scene") {
+        for node in scene.children_named("node") {
+            walk_nodes(node, Mat4::IDENTITY, &mut out);
+        }
+    }
+    out
+}
+
+/// Walk a node and its children, accumulating the transforms down the tree.
+fn walk_nodes(node: &Element, parent: Mat4, out: &mut BTreeMap<String, Mat4>) {
+    let world = parent * node_transform(node);
+    for instance in node.children_named("instance_geometry") {
+        let Some(url) = instance.attr("url") else {
+            continue;
+        };
+        // A geometry instanced more than once is one mesh: the first
+        // placement is as good as any, and taking the last would make the
+        // import depend on the file's order.
+        out.entry(url.trim_start_matches('#').to_string())
+            .or_insert(world);
+    }
+    for child in node.children_named("node") {
+        walk_nodes(child, world, out);
+    }
+}
+
+/// A node's own transform: its `<matrix>`, or its translate, rotate and
+/// scale.
+fn node_transform(node: &Element) -> Mat4 {
+    if let Some(matrix) = node.child("matrix") {
+        let values = parse_floats(matrix.text_trimmed()).unwrap_or_default();
+        if values.len() >= 16 {
+            // COLLADA writes the matrix in column-major order.
+            let mut cols = [0.0f32; 16];
+            cols.copy_from_slice(&values[..16]);
+            return Mat4::from_cols_array(&cols);
+        }
+    }
+    let mut m = Mat4::IDENTITY;
+    if let Some(t) = node.child("translate") {
+        let v = parse_floats(t.text_trimmed()).unwrap_or_default();
+        if v.len() >= 3 {
+            m = m * Mat4::from_translation(Vec3::new(v[0], v[1], v[2]));
+        }
+    }
+    if let Some(r) = node.child("rotate") {
+        let v = parse_floats(r.text_trimmed()).unwrap_or_default();
+        if v.len() >= 4 {
+            let axis = Vec3::new(v[0], v[1], v[2]).normalize_or_zero();
+            let angle = v[3].to_radians();
+            m = m * Mat4::from_quat(Quat::from_axis_angle(axis, angle));
+        }
+    }
+    if let Some(s) = node.child("scale") {
+        let v = parse_floats(s.text_trimmed()).unwrap_or_default();
+        if v.len() >= 3 {
+            m = m * Mat4::from_scale(Vec3::new(v[0], v[1], v[2]));
+        }
+    }
+    m
+}
+
 pub fn import(path: &Path) -> IoResult<LoadedScene> {
     let text = fs::read_to_string(path)?;
     import_str(&text)
@@ -435,6 +518,10 @@ pub fn import_str(text: &str) -> IoResult<LoadedScene> {
     let library = root
         .child("library_geometries")
         .ok_or_else(|| parse_err("no <library_geometries>"))?;
+
+    // The visual scene's nodes place the geometry; the transforms are baked
+    // into the vertices, so an imported model lands where the file put it.
+    let transforms = node_transforms(&root);
 
     let mut meshes = Vec::new();
     let mut materials: Vec<String> = Vec::new();
@@ -462,9 +549,16 @@ pub fn import_str(text: &str) -> IoResult<LoadedScene> {
             }
         }
 
+        // Where the visual scene's nodes put this geometry.
+        let transform = geometry
+            .attr("id")
+            .and_then(|id| transforms.get(id))
+            .copied()
+            .unwrap_or(Mat4::IDENTITY);
         let mut builder = Builder {
             sources: &sources,
             z_up,
+            transform,
             mesh: Mesh::new(),
             vertex_map: BTreeMap::new(),
             vertex_normal: Vec::new(),
@@ -865,4 +959,127 @@ mod tests {
         assert_eq!(loaded.meshes[0].name, "pörşan & <rig>");
         assert_eq!(loaded.meshes[0].material.as_deref(), Some("A&B"));
     }
+    /// A document with one geometry and a visual scene that places it.
+    fn placed_document(node_body: &str) -> String {
+        format!(
+            r##"<COLLADA>
+  <asset><up_axis>Y_UP</up_axis></asset>
+  <library_geometries>
+    <geometry id="g" name="Quad"><mesh>
+      <source id="p">
+        <float_array id="p-array" count="9">0 0 0 1 0 0 1 1 0</float_array>
+      </source>
+      <vertices id="v"><input semantic="POSITION" source="#p"/></vertices>
+      <triangles count="1" material="mat">
+        <input semantic="VERTEX" source="#v" offset="0"/>
+        <p>0 1 2</p>
+      </triangles>
+    </mesh></geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="s">
+      <node id="n" name="Placed">
+        {node_body}
+        <instance_geometry url="#g"/>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+</COLLADA>"##
+        )
+    }
+
+    #[test]
+    fn a_nodes_transform_is_baked_into_the_imported_mesh() {
+        // A node that moves the geometry five units along X.
+        let text = placed_document("<translate>5 0 0</translate>");
+        let loaded = import_str(&text).unwrap();
+        let mesh = &loaded.meshes[0].mesh;
+        assert_eq!(mesh.vertex_count(), 3);
+        assert!(
+            (mesh.positions[0] - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-5,
+            "the vertex moved with the node: {:?}",
+            mesh.positions[0]
+        );
+        assert!(
+            (mesh.positions[2] - Vec3::new(6.0, 1.0, 0.0)).length() < 1e-5,
+            "and the others with it: {:?}",
+            mesh.positions[2]
+        );
+    }
+
+    #[test]
+    fn a_nodes_matrix_is_baked_into_the_imported_mesh() {
+        // A column-major matrix: a scale of two in X.
+        let text = placed_document(
+            "<matrix>2 0 0 0  0 1 0 0  0 0 1 0  0 0 0 1</matrix>",
+        );
+        let loaded = import_str(&text).unwrap();
+        let mesh = &loaded.meshes[0].mesh;
+        assert!(
+            (mesh.positions[0] - Vec3::ZERO).length() < 1e-5,
+            "the origin stayed: {:?}",
+            mesh.positions[0]
+        );
+        assert!(
+            (mesh.positions[1] - Vec3::new(2.0, 0.0, 0.0)).length() < 1e-5,
+            "and the rest stretched: {:?}",
+            mesh.positions[1]
+        );
+    }
+
+    #[test]
+    fn a_nested_nodes_transforms_are_accumulated() {
+        // A child node under a parent that moves the whole thing.
+        let text = r##"<COLLADA>
+  <asset><up_axis>Y_UP</up_axis></asset>
+  <library_geometries>
+    <geometry id="g" name="Quad"><mesh>
+      <source id="p">
+        <float_array id="p-array" count="9">0 0 0 1 0 0 1 1 0</float_array>
+      </source>
+      <vertices id="v"><input semantic="POSITION" source="#p"/></vertices>
+      <triangles count="1"><input semantic="VERTEX" source="#v" offset="0"/><p>0 1 2</p></triangles>
+    </mesh></geometry>
+  </library_geometries>
+  <library_visual_scenes>
+    <visual_scene id="s">
+      <node id="parent">
+        <translate>10 0 0</translate>
+        <node id="child">
+          <translate>0 3 0</translate>
+          <instance_geometry url="#g"/>
+        </node>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+</COLLADA>"##;
+        let loaded = import_str(&text).unwrap();
+        let mesh = &loaded.meshes[0].mesh;
+        assert!(
+            (mesh.positions[0] - Vec3::new(10.0, 3.0, 0.0)).length() < 1e-5,
+            "the child's transform rides on the parent's: {:?}",
+            mesh.positions[0]
+        );
+    }
+
+    #[test]
+    fn a_geometry_with_no_node_stays_where_it_was() {
+        // A document with no visual scene at all: the geometry is read as it
+        // is authored.
+        let text = r##"<COLLADA>
+  <library_geometries>
+    <geometry id="g" name="Quad"><mesh>
+      <source id="p">
+        <float_array id="p-array" count="9">0 0 0 1 0 0 1 1 0</float_array>
+      </source>
+      <vertices id="v"><input semantic="POSITION" source="#p"/></vertices>
+      <triangles count="1"><input semantic="VERTEX" source="#v" offset="0"/><p>0 1 2</p></triangles>
+    </mesh></geometry>
+  </library_geometries>
+</COLLADA>"##;
+        let loaded = import_str(&text).unwrap();
+        let mesh = &loaded.meshes[0].mesh;
+        assert!((mesh.positions[1] - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5);
+    }
+
 }
