@@ -228,7 +228,9 @@ A sample GitHub Actions matrix is shown below.
   with the status saying what it did or why it did not.
 - **Import…** and **Export selected as…** ask for the file's options before
   touching disk: its **up-axis** (Y up as-is, Z up, X up) and a **uniform
-  scale**. Cancel reads and writes nothing, and dropped files take the
+  scale**. The export writes the object **where it stands** — its world
+  transform is baked into the file, so the object lands in the right place
+  rather than at the origin. Cancel reads and writes nothing, and dropped files take the
   defaults. The status names the options only when they were not the defaults.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,
