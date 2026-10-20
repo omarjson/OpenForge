@@ -48,8 +48,8 @@ Materials & textures|78|Engine
 Animation (tracks, clips, playback, key editing)|78|Engine
 Rigging & skinning|75|Engine
 UV math (project, unwrap, pack, edits)|87|Engine
-GPU viewport (depth, shading, grid, gizmo)|91|UI
-Viewport editing UX (gizmos, axes modes, pivot, orthographic views, wireframe, outlines, picking)|99|UI
+GPU viewport (depth, shading, grid, gizmo, multi-view)|93|UI
+Viewport editing UX (gizmos, axes modes, pivot, orthographic views, multi-view, wireframe, outlines, picking)|100|UI
 UV editor UI|74|UI
 Panels & dialogs (outliner, properties, toolbars, Preferences, recents, unsaved guard, workspace memory)|76|UI
 Import/export UX|74|UI

@@ -120,6 +120,11 @@ A sample GitHub Actions matrix is shown below.
   selection again — so a ring drag swings the whole selection round that point
   instead of spinning it in place. Snapping steps along whichever axes the
   handles are on.
+- **View → Layout** splits the viewport area into **Layout 1** (one viewport),
+  **Layout 2** (two side by side) or **Layout 3** (four in a grid), and
+  **Maximize / Restore** gives the active pane the whole area. Each pane has
+  its own camera, so its projection is its own: a digit key or the View menu
+  changes the pane the pointer is in and leaves the others alone.
 - **0-6** choose the viewport projection: `0` is the free perspective camera and
   `1`-`6` are the six axis-aligned **orthographic** views (Front, Back, Left,
   Right, Top, Bottom), also on **View → Viewport** with the current one ticked.
@@ -345,10 +350,10 @@ mostly application surface. Natural next steps:
   select-through switch answers from the projection instead), with a picked
   edge already highlighted in the frame and the selection tools (all / none /
   invert, grow / shrink, edge loop / ring, hide / isolate) in place: the four
-  material maps and a per-material highlight now reach the fragment stage,
-  leaving a multi-view layout (several viewports side by side, each with its own
-  projection — the projections themselves landed as the axis views), shadowing
-  and a configurable shading mode as the honest gaps, then
+  material maps and a per-material highlight now reach the fragment stage, and
+  the **multi-view layout** (several viewports side by side, each with its own
+  camera and its own offscreen target) is in, leaving shadowing and a
+  configurable shading mode as the honest gaps, then
   the materials node graph — mipmapped sampling, a per-map UV channel,
   opacity/blend and bump/environment maps on top of the four that sample today.
 - A deeper UV editor: island weld/split/mirror, snapping, and the live sync
