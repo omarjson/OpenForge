@@ -424,6 +424,14 @@ pub struct OpenForgeApp {
     /// The window's size in points, as the last frame saw it — what the
     /// workspace record keeps so the next start comes back the same size.
     window_size: [f32; 2],
+    /// Whether the Find and Replace window is open.
+    find_open: bool,
+    /// The name the search looks for, and the name a match is replaced with.
+    find_text: String,
+    find_replace: String,
+    /// Which match the last search landed on, so *Replace current* knows
+    /// which one it means.
+    find_index: usize,
     /// Whether the Preferences, Keyboard Shortcuts or About window is open.
     preferences_open: bool,
     shortcuts_open: bool,
@@ -521,6 +529,10 @@ impl OpenForgeApp {
             settings: Settings::default(),
             settings_path: None,
             applied_theme: None,
+            find_open: false,
+            find_text: String::new(),
+            find_replace: String::new(),
+            find_index: 0,
             preferences_open: false,
             shortcuts_open: false,
             about_open: false,
@@ -3466,6 +3478,7 @@ impl OpenForgeApp {
         self.handle_side_panels(ctx);
         self.handle_preferences(ctx);
         self.handle_shortcuts_window(ctx);
+        self.handle_find_window(ctx);
         self.handle_about_window(ctx);
         self.handle_central_viewport(ctx, render_state);
         self.import_dropped_files(ctx);
@@ -3616,6 +3629,10 @@ impl OpenForgeApp {
                         ui.close_menu();
                     }
                     ui.separator();
+                    if ui.button("Find and Replace…").clicked() {
+                        self.find_open = true;
+                        ui.close_menu();
+                    }
                     if ui.button("Preferences…").clicked() {
                         self.open_preferences();
                         ui.close_menu();
@@ -4758,6 +4775,181 @@ impl OpenForgeApp {
     }
 
     /// The About window: the lines `about_lines` builds.
+    /// The Find and Replace window: find an object by name, and rename it.
+    ///
+    /// The reference application has the same panel under Edit, with *Find
+    /// object*, *Find next*, *Find previous* and *Replace current*.
+    fn handle_find_window(&mut self, ctx: &egui::Context) {
+        if !self.find_open {
+            return;
+        }
+        let mut open = self.find_open;
+        egui::Window::new("Find and Replace")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                ui.label("Find:");
+                ui.text_edit_singleline(&mut self.find_text);
+                ui.label("Replace with:");
+                ui.text_edit_singleline(&mut self.find_replace);
+                ui.separator();
+                let matches = self.find_matches();
+                ui.label(format!(
+                    "{} object(s) match \"{}\".",
+                    matches.len(),
+                    self.find_text
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Find next").clicked() {
+                        self.find_next(true);
+                    }
+                    if ui.button("Find previous").clicked() {
+                        self.find_next(false);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!matches.is_empty(), egui::Button::new("Replace current"))
+                        .clicked()
+                    {
+                        self.replace_current();
+                    }
+                    if ui
+                        .add_enabled(!matches.is_empty(), egui::Button::new("Replace all"))
+                        .clicked()
+                    {
+                        self.replace_all();
+                    }
+                });
+            });
+        self.find_open = self.find_open && open;
+    }
+
+    /// The nodes whose name contains the search text, in name order.
+    fn find_matches(&self) -> Vec<NodeId> {
+        let needle = self.find_text.trim().to_lowercase();
+        if needle.is_empty() {
+            return Vec::new();
+        }
+        let mut hits: Vec<(String, NodeId)> = self
+            .scene
+            .iter()
+            .filter(|n| n.name.to_lowercase().contains(&needle))
+            .map(|n| (n.name.clone(), n.id))
+            .collect();
+        // The scene's own iteration order is a hash order, so the matches are
+        // sorted: the search walks the same list every time.
+        hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        hits.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// Select the next (or previous) match, and say which one it is.
+    fn find_next(&mut self, forward: bool) {
+        let matches = self.find_matches();
+        if matches.is_empty() {
+            self.status = "No object matches that name.".into();
+            return;
+        }
+        let current = matches
+            .iter()
+            .position(|id| self.selection.is_node_selected(*id));
+        let next = match current {
+            Some(i) if forward => (i + 1) % matches.len(),
+            Some(i) => (i + matches.len() - 1) % matches.len(),
+            None => 0,
+        };
+        let id = matches[next];
+        self.find_index = next;
+        self.selection.clear();
+        self.selection.select_node(id);
+        let name = self.scene.get(id).map(|n| n.name.clone()).unwrap_or_default();
+        self.status = format!(
+            "Found \"{name}\" ({}/{}).",
+            next + 1,
+            matches.len()
+        );
+    }
+
+    /// The name with the matched part replaced.
+    ///
+    /// The match is case-insensitive, and the case of the name around it is
+    /// kept: *Wheel_Left* with *wheel* replaced by *Rim* is *Rim_Left*.
+    fn replaced_name(&self, name: &str) -> String {
+        let needle: Vec<char> = self.find_text.trim().to_lowercase().chars().collect();
+        if needle.is_empty() {
+            return name.to_string();
+        }
+        let chars: Vec<char> = name.chars().collect();
+        let at = chars.windows(needle.len()).position(|window| {
+            window
+                .iter()
+                .zip(needle.iter())
+                .all(|(a, b)| a.to_lowercase().eq(std::iter::once(*b)))
+        });
+        match at {
+            Some(at) => {
+                let mut out: String = chars[..at].iter().collect();
+                out.push_str(&self.find_replace);
+                out.extend(chars[at + needle.len()..].iter());
+                out
+            }
+            None => name.to_string(),
+        }
+    }
+
+    /// Rename the current match.
+    fn replace_current(&mut self) {
+        let matches = self.find_matches();
+        let Some(id) = matches.get(self.find_index.min(matches.len().saturating_sub(1))).copied()
+        else {
+            self.status = "Nothing to replace.".into();
+            return;
+        };
+        let name = self.replaced_name(
+            &self
+                .scene
+                .get(id)
+                .map(|n| n.name.clone())
+                .unwrap_or_default(),
+        );
+        self.with_edit("Rename", |app| {
+            if let Ok(node) = app.scene.get_mut(id) {
+                node.name = name.clone();
+            }
+        });
+        self.status = format!("Renamed to \"{name}\".");
+    }
+
+    /// Rename every match.
+    fn replace_all(&mut self) {
+        let matches = self.find_matches();
+        if matches.is_empty() {
+            self.status = "Nothing to replace.".into();
+            return;
+        }
+        let count = matches.len();
+        let names: Vec<(NodeId, String)> = matches
+            .iter()
+            .map(|id| {
+                let old = self
+                    .scene
+                    .get(*id)
+                    .map(|n| n.name.clone())
+                    .unwrap_or_default();
+                (*id, self.replaced_name(&old))
+            })
+            .collect();
+        self.with_edit("Rename", |app| {
+            for (id, name) in &names {
+                if let Ok(node) = app.scene.get_mut(*id) {
+                    node.name = name.clone();
+                }
+            }
+        });
+        self.status = format!("Renamed {count} object(s).");
+    }
+
     fn handle_about_window(&mut self, ctx: &egui::Context) {
         if !self.about_open {
             return;
@@ -11158,6 +11350,7 @@ mod tests {
         let output = ctx.run(frame(0.0, egui::pos2(500.0, 350.0), None), |ctx| {
             app.handle_preferences(ctx);
             app.handle_shortcuts_window(ctx);
+            app.handle_find_window(ctx);
             app.handle_about_window(ctx);
         });
         assert!(!output.shapes.is_empty(), "the three windows painted");
@@ -11893,6 +12086,86 @@ mod tests {
         app.set_maximized(false);
         let back = painted_labels(&paint_once(&ctx, &mut app, frame(3.0, egui::pos2(500.0, 350.0), None)));
         assert_eq!(back.iter().filter(|l| l.contains("tris")).count(), 4);
+    }
+
+    #[test]
+    fn find_and_replace_walks_the_objects_by_name() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let a = app.scene.create_mesh("Wheel_Left", primitive_box(1.0));
+        let b = app.scene.create_mesh("Wheel_Right", primitive_box(1.0));
+        let c = app.scene.create_mesh("Body", primitive_box(1.0));
+
+        // The search is a case-insensitive substring, and it finds both
+        // wheels and not the body.
+        app.find_text = "wheel".into();
+        let matches = app.find_matches();
+        assert_eq!(matches.len(), 2, "both wheels match");
+        assert!(matches.contains(&a) && matches.contains(&b));
+        assert!(!matches.contains(&c));
+
+        // Find next walks them, and wraps around.
+        app.find_next(true);
+        let first = app.selection.selected_nodes().next();
+        assert!(first.is_some(), "a match is selected");
+        app.find_next(true);
+        let second = app.selection.selected_nodes().next();
+        assert_ne!(first, second, "the next match is a different object");
+        app.find_next(true);
+        assert_eq!(
+            app.selection.selected_nodes().next(),
+            first,
+            "and it wraps around"
+        );
+        // Find previous goes the other way.
+        app.find_next(false);
+        assert_eq!(app.selection.selected_nodes().next(), second);
+
+        // Replace current renames the object the search landed on — the one
+        // the last search found — keeping the rest of the name.
+        app.find_replace = "Rim".into();
+        let before = app.scene.get(second.unwrap()).unwrap().name.clone();
+        app.replace_current();
+        assert_eq!(app.scene.get(second.unwrap()).unwrap().name, "Rim_Right");
+        // And undo puts the name back.
+        app.undo_edit();
+        assert_eq!(app.scene.get(second.unwrap()).unwrap().name, before);
+    }
+
+    #[test]
+    fn replace_all_renames_every_match_and_leaves_the_rest() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene.create_mesh("Wheel_Left", primitive_box(1.0));
+        app.scene.create_mesh("Wheel_Right", primitive_box(1.0));
+        let body = app.scene.create_mesh("Body", primitive_box(1.0));
+        app.find_text = "wheel".into();
+        app.find_replace = "Rim".into();
+        app.replace_all();
+
+        let names: Vec<String> = app.scene.iter().map(|n| n.name.clone()).collect();
+        assert!(names.contains(&"Rim_Left".to_string()), "{names:?}");
+        assert!(names.contains(&"Rim_Right".to_string()), "{names:?}");
+        assert!(names.contains(&"Body".to_string()), "the rest is alone: {names:?}");
+        assert_eq!(app.scene.get(body).unwrap().name, "Body");
+        // One undo step puts every name back.
+        app.undo_edit();
+        let names: Vec<String> = app.scene.iter().map(|n| n.name.clone()).collect();
+        assert!(names.contains(&"Wheel_Left".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn a_search_that_matches_nothing_says_so() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene.create_mesh("Body", primitive_box(1.0));
+        app.find_text = "nothing called this".into();
+        assert!(app.find_matches().is_empty());
+        app.find_next(true);
+        assert!(
+            app.status.contains("No object"),
+            "the status says so: {}",
+            app.status
+        );
+        app.replace_all();
+        assert!(app.status.contains("Nothing"), "and nothing to replace");
     }
 
 }
