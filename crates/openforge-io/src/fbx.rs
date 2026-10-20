@@ -26,8 +26,8 @@
 
 use crate::{finalize_mesh, IoError, IoResult, LoadedScene, MeshData};
 use openforge_core::mesh::{Corner, Face, Mesh};
-use openforge_core::{Vec2, Vec3};
-use std::collections::HashMap;
+use openforge_core::{Mat4, Vec2, Vec3};
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::Path;
 
@@ -502,16 +502,140 @@ pub fn import_str(text: &str) -> IoResult<LoadedScene> {
         .iter()
         .find(|node| node.name == "Objects")
         .ok_or_else(|| parse_err("no Objects section"))?;
+    // Where the objects are placed: the `Model` objects and the connections
+    // between them say so.
+    let transforms = object_transforms(
+        objects,
+        roots.iter().find(|node| node.name == "Connections"),
+    );
     let mut meshes = Vec::new();
     for geometry in objects.children.iter().filter(|node| node.name == "Geometry") {
-        if let Some(mesh) = read_geometry(geometry)? {
-            meshes.push(mesh);
+        let mut mesh = match read_geometry(geometry)? {
+            Some(mesh) => mesh,
+            None => continue,
+        };
+        // The model's transform is baked in, so the object lands where the
+        // file put it.
+        if let Some(id) = geometry.props.first().and_then(|prop| match prop {
+            Prop::Num(number) => Some(*number as u64),
+            _ => None,
+        }) {
+            if let Some(transform) = transforms.get(&id) {
+                mesh.mesh.transform(*transform);
+            }
         }
+        meshes.push(mesh);
     }
     if meshes.is_empty() {
         return Err(parse_err("no geometry with faces"));
     }
     Ok(LoadedScene { meshes, materials: Vec::new() })
+}
+
+/// The transform each object is placed by, from the `Model` objects and the
+/// connections between them.
+///
+/// FBX keeps the geometry in `Geometry` objects and the place in `Model`
+/// objects; the `Connections` section links them, naming a child and its
+/// parent. The transforms are accumulated down the tree and baked into the
+/// vertices, so an imported model lands where the file put it.
+fn object_transforms(objects: &Node, connections: Option<&Node>) -> BTreeMap<u64, Mat4> {
+    // Each model's own transform.
+    let mut local: BTreeMap<u64, Mat4> = BTreeMap::new();
+    for model in objects.children.iter().filter(|node| node.name == "Model") {
+        let Some(id) = model.props.first().and_then(|prop| match prop {
+            Prop::Num(number) => Some(*number as u64),
+            _ => None,
+        }) else {
+            continue;
+        };
+        local.insert(id, model_transform(model));
+    }
+    // The parent of each object.
+    let mut parent: BTreeMap<u64, u64> = BTreeMap::new();
+    if let Some(connections) = connections {
+        for connection in connections.children.iter().filter(|node| node.name == "C") {
+            let numbers: Vec<u64> = connection
+                .props
+                .iter()
+                .filter_map(|prop| match prop {
+                    Prop::Num(number) => Some(*number as u64),
+                    _ => None,
+                })
+                .collect();
+            if numbers.len() >= 2 {
+                parent.insert(numbers[0], numbers[1]);
+            }
+        }
+    }
+    // The transform of every object: a geometry takes the transform of the
+    // model that shows it, and a model takes its own and its parents'.
+    let mut out: BTreeMap<u64, Mat4> = BTreeMap::new();
+    for (id, own) in &local {
+        let mut chain = vec![*own];
+        let mut current = *id;
+        while let Some(next) = parent.get(&current) {
+            let Some(node) = local.get(next) else { break };
+            chain.push(*node);
+            current = *next;
+        }
+        // A child's transform is in its parent's space, so the parent's comes
+        // first.
+        let mut m = Mat4::IDENTITY;
+        for node in chain.iter().rev() {
+            m = m * *node;
+        }
+        out.insert(*id, m);
+    }
+    // A geometry is placed by the model that connects to it.
+    for (child, parent_id) in &parent {
+        if let Some(transform) = out.get(parent_id) {
+            out.insert(*child, *transform);
+        }
+    }
+    out
+}
+
+/// A model's own transform: its local translation, rotation and scaling.
+fn model_transform(model: &Node) -> Mat4 {
+    let mut m = Mat4::IDENTITY;
+    let Some(properties) = model.child("Properties70") else {
+        return m;
+    };
+    for property in properties.children.iter().filter(|node| node.name == "P") {
+        let name = property.text().unwrap_or_default().to_string();
+        let values: Vec<f64> = property.numbers();
+        match name.as_str() {
+            "Lcl Translation" if values.len() >= 3 => {
+                m = m * Mat4::from_translation(Vec3::new(
+                    values[0] as f32,
+                    values[1] as f32,
+                    values[2] as f32,
+                ));
+            }
+            "Lcl Rotation" if values.len() >= 3 => {
+                // Euler angles in degrees, in the X, Y, Z order the format's
+                // default rotation order names: the X turn first.
+                let (x, y, z) = (
+                    values[0].to_radians() as f32,
+                    values[1].to_radians() as f32,
+                    values[2].to_radians() as f32,
+                );
+                m = m * Mat4::from_rotation_z(z)
+                    * Mat4::from_rotation_y(y)
+                    * Mat4::from_rotation_x(x);
+            }
+            "Lcl Scaling" if values.len() >= 3 => {
+                m = m * Mat4::from_scale(Vec3::new(
+                    values[0] as f32,
+                    values[1] as f32,
+                    values[2] as f32,
+                ));
+            }
+            _ => {}
+        }
+    }
+    m
 }
 
 // ---------------------------------------------------------------------------
@@ -752,8 +876,14 @@ Connections:  {
         assert_eq!(mesh.faces[1].corners.len(), 3);
         assert_eq!(mesh.vertex_count(), 7, "one vertex per distinct corner triple");
 
-        assert_eq!(mesh.positions[1], Vec3::new(1.0, 0.0, 0.0));
-        assert_eq!(mesh.positions[5], Vec3::new(0.0, 1.0, 0.0), "the triangle's middle point");
+        // The model's transform is baked in: the document's `Lcl Translation`
+        // of (1, 2, 3) moved the geometry with it.
+        assert_eq!(mesh.positions[1], Vec3::new(2.0, 2.0, 3.0));
+        assert_eq!(
+            mesh.positions[5],
+            Vec3::new(1.0, 3.0, 3.0),
+            "the triangle's middle point"
+        );
         // The Direct normal layer is per corner; every one is +Z here.
         assert_eq!(mesh.normals.len(), 7);
         assert!(mesh.normals.iter().all(|normal| *normal == Vec3::Z));
@@ -920,4 +1050,78 @@ Connections:  {
         let error = refusal(text);
         assert!(error.contains("no entry 1"), "{error:?}");
     }
+    /// A document with one triangle and the models that place it.
+    fn placed_document(models: &str, connections: &str) -> String {
+        format!(
+            "; FBX 7.4.0 project file
+Objects:  {{
+    Geometry: 100, \"Geometry::Tri\", \"Mesh\" {{
+        Vertices: *9 {{ a: 0,0,0, 1,0,0, 0,1,0 }}
+        PolygonVertexIndex: *3 {{ a: 0,1,-3 }}
+    }}
+{models}}}
+Connections:  {{
+{connections}
+}}
+"
+        )
+    }
+
+    #[test]
+    fn a_models_transform_is_baked_into_the_imported_mesh() {
+        let text = placed_document(
+            "    Model: 200, \"Model::Tri\", \"Mesh\" {\n        Version: 232\n        Properties70:  {\n            P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",5,0,0\n        }\n    }\n",
+            "    C: \"OO\",100,200\n",
+        );
+        let loaded = import_str(&text).unwrap();
+        let mesh = &loaded.meshes[0].mesh;
+        assert_eq!(mesh.vertex_count(), 3);
+        assert!(
+            (mesh.positions[1] - Vec3::new(6.0, 0.0, 0.0)).length() < 1e-5,
+            "the vertex moved with the model: {:?}",
+            mesh.positions[1]
+        );
+    }
+
+    #[test]
+    fn a_models_rotation_is_baked_into_the_imported_mesh() {
+        // A quarter turn about Z: the triangle's far corner goes up.
+        let text = placed_document(
+            "    Model: 200, \"Model::Tri\", \"Mesh\" {\n        Version: 232\n        Properties70:  {\n            P: \"Lcl Rotation\", \"Lcl Rotation\", \"\", \"A\",0,0,90\n        }\n    }\n",
+            "    C: \"OO\",100,200\n",
+        );
+        let loaded = import_str(&text).unwrap();
+        let mesh = &loaded.meshes[0].mesh;
+        assert!(
+            (mesh.positions[1] - Vec3::new(0.0, 1.0, 0.0)).length() < 1e-5,
+            "the vertex turned with the model: {:?}",
+            mesh.positions[1]
+        );
+    }
+
+    #[test]
+    fn nested_models_transforms_are_accumulated() {
+        // A model inside another model: the child's transform rides on the
+        // parent's.
+        let text = placed_document(
+            "    Model: 200, \"Model::Tri\", \"Mesh\" {\n        Version: 232\n        Properties70:  {\n            P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",5,0,0\n        }\n    }\n    Model: 300, \"Model::Group\", \"Model\" {\n        Version: 232\n        Properties70:  {\n            P: \"Lcl Translation\", \"Lcl Translation\", \"\", \"A\",0,0,10\n        }\n    }\n",
+            "    C: \"OO\",100,200\n    C: \"OO\",200,300\n",
+        );
+        let loaded = import_str(&text).unwrap();
+        let mesh = &loaded.meshes[0].mesh;
+        assert!(
+            (mesh.positions[1] - Vec3::new(6.0, 0.0, 10.0)).length() < 1e-5,
+            "the vertex sits under both models: {:?}",
+            mesh.positions[1]
+        );
+    }
+
+    #[test]
+    fn a_geometry_with_no_model_stays_where_it_was() {
+        let text = placed_document("", "");
+        let loaded = import_str(&text).unwrap();
+        let mesh = &loaded.meshes[0].mesh;
+        assert!((mesh.positions[1] - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5);
+    }
+
 }
