@@ -42,7 +42,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 13 crates (735 `#[test]` fns; 738 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 13 crates (736 `#[test]` fns; 739 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
@@ -58,7 +58,7 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 | `openforge-rig` | 25 | Skeletal rigging + linear-blend skinning: bones, hierarchy, bind/pose, `SkinWeights` (with the weight *editing* maths: `assign`, `blend`, `smooth`), `skin_mesh`. |
 | `openforge-plugin` | 18 | The plugin host: a service registry, a tool registry (factories, not shared instances) and a format-filter registry that dispatches import/export on an extension. The engine's own tools and formats are ordinary plugins registered here. |
 | `openforge-project` | 15 | The project file: one versioned JSON document holding the scene (nodes listed parents-first, every reference a position in that list — ids never reach the file), the material library (textures as base64 RGBA8; each material's four maps as optional fields, so a file written before one existed still loads), the animation clips and — since version 2 — the skinned rig (skeleton with both poses, weights, bind positions, driven node; version-1 files still load, without a rig). It has its own document structs and a bridge to the engine types, rebuilds the rig through the rig crate's own API (parents-first, validated weights), and every refusal says what it found: not JSON, not ours, too new, or malformed. |
-| `openforge-app` | 262 (bin) | eframe/egui GUI. `app.rs` (~10700 lines) + `gizmo.rs` (screen-space transform gizmo: **axis arms, one grab handle per coordinate plane and a centre handle that moves or scales in the plane facing the camera**, in **three axis modes — World, the selection's own axes (Local) or the screen's (Screen) — with a placeable pivot the whole selection turns and scales about**, with the one `Layout` driving both the hit-test and the paint) + `snap.rs` (snapping settings + pure snap maths, confined per handle to the axes it can move) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback; the `Camera` is either the free orbit camera or one of the six **axis-aligned orthographic views** — `ViewKind` carries the angle pair, the up vector and the label, and picking, the grid and the gizmo all read the same `view_proj`) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the recent-projects list, the shortcut table — and the settings file: a small JSON document in the platform's config directory, loaded only by the real constructor, written when the Preferences window closes and quietly when the recent list changes) + its project block (File ▸ Open/Save/Save As over `openforge-project`; `current_file` is the remembered document path, which the status bar shows; the live rig rides the save and comes back through undo's rig snapshot; the title carries the document's name and a star while `modified` holds unsaved edits, File ▸ Open Recent lists the recent projects and the unsaved-changes guard holds New, a chosen project file and Quit — the window's own X included — until the edits are answered). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest), and the **materials panel** edits the library's textures (import, checker presets) and materials — one row per map kind with its texture combo and a thumbnail of what it holds. View ▸ Viewport lists the seven projections (the current one ticked, 0–6 on the digits, the corner label naming what shows), and the **Properties panel** edits a single node's transform as three rows of numbers — translation, XYZ Euler degrees and per-axis scale — one undo entry per edit named for what moved. |
+| `openforge-app` | 263 (bin) | eframe/egui GUI. `app.rs` (~10700 lines) + `gizmo.rs` (screen-space transform gizmo: **axis arms, one grab handle per coordinate plane and a centre handle that moves or scales in the plane facing the camera**, in **three axis modes — World, the selection's own axes (Local) or the screen's (Screen) — with a placeable pivot the whole selection turns and scales about**, with the one `Layout` driving both the hit-test and the paint) + `snap.rs` (snapping settings + pure snap maths, confined per handle to the axes it can move) + `viewport.rs` (CPU painter + picking, edge picking included, + the rectangle projection fallback; the `Camera` is either the free orbit camera or one of the six **axis-aligned orthographic views** — `ViewKind` carries the angle pair, the up vector and the label, and picking, the grid and the gizmo all read the same `view_proj`) + `gpu_viewport.rs` (wgpu bridge + GPU pick mapping, click and rectangle) + `uv_editor.rs` (UV panel, texture background, island selection, weld/split/mirror tools, 0.05 grid snap for drags) + `file_options.rs` (the up-axis/scale maths behind the import and export options dialogs) + `settings.rs` (the Preferences state the frame itself reads: theme, ground grid, camera speeds, the recent-projects list, the shortcut table — and the settings file: a small JSON document in the platform's config directory, loaded only by the real constructor, written when the Preferences window closes and quietly when the recent list changes) + its project block (File ▸ Open/Save/Save As over `openforge-project`; `current_file` is the remembered document path, which the status bar shows; the live rig rides the save and comes back through undo's rig snapshot; the title carries the document's name and a star while `modified` holds unsaved edits, File ▸ Open Recent lists the recent projects and the unsaved-changes guard holds New, a chosen project file and Quit — the window's own X included — until the edits are answered). The Select menu, toolbar row and hotkeys drive `core::subselect` (all/none/invert, grow/shrink, edge loop/ring) — and the toolbar's tool list and the Q/W/E/R hotkeys **walk the plugin host's tool registry** rather than a hard-wired four; hide/isolate/unhide and the outliner's visibility box are undoable scene edits, **Select Through** (`occluding_picks`) is the one gate deciding whether a pick asks the ID pass or the projection, import/export (menu, dialogs, drops) all go through the plugin filter registry with the format named in every status — and the pickers ask for the file's up-axis and scale in an options dialog before anything touches disk — the **Timeline** plays `openforge-animation` clips over the scene (spin clips, Space, scrub) and its **key row** draws a diamond per key time — click to scrub, drag to retime the column, **Key**/**Delete Key** record and remove — with clips riding the same undo stack as the scene, the **Rig row** builds a bone chain, poses it and **assigns/blends/smooths** the skin weights over the vertex selection (the rig rides the undo snapshot too), the **Game menu** tags LOD levels, **generates cluster-decimated LOD 1–3 copies**, places dummies and reports the triangle budget (`LodReport`), the **Plugins panel** enables/disables each built-in and says what it brings (a disable rebuilds the host from the rest), and the **materials panel** edits the library's textures (import, checker presets) and materials — one row per map kind with its texture combo and a thumbnail of what it holds. View ▸ Viewport lists the seven projections (the current one ticked, 0–6 on the digits, the corner label naming what shows), and the **Properties panel** edits a single node's transform as three rows of numbers — translation, XYZ Euler degrees and per-axis scale — one undo entry per edit named for what moved. |
 
 ## 5. Architecture & conventions (follow these exactly)
 
@@ -397,15 +397,16 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **738 tests pass** (735 `#[test]`
+workspace builds with **0 warnings**, **739 tests pass** (736 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Forty-two work-streams are done — the engine layer from the **wgpu
+Forty-three work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
 through **gizmo axes modes and a placed pivot** (#39), **boolean CSG that
-stays closed** (#40), **a boolean that keeps the texture** (#41) and **a UV
-editor that follows the 3D selection** (#42), each narrated further down —
-plus a progress report:
+stays closed** (#40), **a boolean that keeps the texture** (#41), **a UV
+editor that follows the 3D selection** (#42) and **a workspace that
+remembers itself** (#43), each narrated further down — plus a progress
+report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -1940,9 +1941,34 @@ plus a progress report:
   canvas highlights, a pick in the canvas selects the face in the viewport,
   and below the face level the canvas keeps its own picks.
 
+- **The workspace remembers itself** (work-stream #43). The reference
+  application files a `Workspace@WxH` record per window size — the docked
+  panels' rectangles and the toolbars — and the app now keeps the part of
+  that it can keep honestly.
+  - **The settings file grew a workspace.** `Settings` carries the window's
+    size in points and a `WorkspacePanels` record: the outliner, the
+    properties (with the materials and plugins panels) side, the UV editor and
+    the timeline. Both ride the existing file, so they are machine state like
+    the rest of it, and `serde(default)` keeps the old files readable.
+  - **The window comes back the size it was.** `main.rs` reads the settings
+    before it builds the viewport, and the app notes the window's own size
+    every frame. eframe asks the app to save when the window closes, and that
+    is when the workspace is written down.
+  - **The panels can be hidden, and the hiding is remembered.** The View menu
+    grew *Outliner* and *Properties* toggles beside *Timeline* and *UV
+    Editor*, and every one of them writes the workspace record as it goes —
+    so the next start comes back to the workspace the user left, not to a
+    fixed one.
+  - **The panels are applied when the file is read**, not every frame: the
+    theme is applied every frame (it is a style), but a panel's visibility is
+    the user's, and re-applying it each frame would undo every toggle.
+- **1 new test**, plus the settings round trip extended: the workspace as the
+  user left it is recorded, a frame notices the window's own size, and a
+  fresh app with that file comes back to the same panels and the same size.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **738 pass, 0 failures**
+build too); `cargo test --workspace` → **739 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The #30 windows are
 measured headless too: the theme is asserted on a bare egui context, the
 grid's lines are counted through a real view-projection with the grid on and
@@ -2134,7 +2160,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **77.0%**, shown as 77). The engine
+16 curated areas is **77.2%**, shown as 77). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -2185,7 +2211,10 @@ through (the UVs interpolated across a cut, the per-face materials carried
 through and the two nodes' slot lists merged) as of #41, and the UV editor
 and the 3D view sharing one face-level selection (the canvas shows the
 selected faces' UV entries and a pick in the canvas selects the faces, with
-a per-face material assignable from the canvas) as of #42.
+a per-face material assignable from the canvas) as of #42, and the
+workspace remembering its panels and the window's size (the View menu's
+Outliner and Properties toggles, the size the window is left at, and both
+written into the settings file) as of #43.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -2251,9 +2280,10 @@ Prioritized next steps:
    assignment — the reason slots exist per face — landed in #9.
 8. **Finish the panel/dialog surface.** Preferences, Keyboard Shortcuts and
    About landed in #30 and the window's choices now persist across runs
-   (#33), and the Properties panel edits a whole transform as numbers (#37); an
-   asset browser, window-layout memory and the deeper
-   ZModeler-style dialogs have no home yet.
+   (#33), the Properties panel edits a whole transform as numbers (#37), and
+   the workspace remembers which panels were open and how big the window was
+   (#43); an asset browser and the deeper ZModeler-style dialogs have no home
+   yet.
 9. **Deepen the project format.** The scene, the materials, the clips and
    (since version 2) the rig are in the file; preferences are settled as
    machine choices (#33) rather than document state, and the conveniences

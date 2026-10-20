@@ -356,10 +356,11 @@ mostly application surface. Natural next steps:
   the canvas); what is left is a real unwrap, packing that respects a chosen
   scale, and baking a texture into the layout.
 - The app's settings persist across runs now (the platform's config
-  directory), and the project's own conveniences — the recent-projects list,
-  the title's star and the unsaved-changes guard — are in; what remains here
-  is window-layout memory, an asset browser and the deeper panel/dialog
-  surface.
+  directory) — including the **workspace**: which panels were open (View ▸
+  Outliner, Properties, UV Editor, Timeline) and how big the window was — and
+  the project's own conveniences (the recent-projects list, the title's star
+  and the unsaved-changes guard) are in; what remains here is an asset browser
+  and the deeper panel/dialog surface.
 - More standard formats (USDZ, binary FBX, glTF extensions) and a fuller
   COLLADA and FBX (node transforms, effects, animation, the FBX `Materials`
   section) behind the same `openforge-io` traits.
