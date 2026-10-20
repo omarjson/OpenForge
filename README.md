@@ -230,7 +230,9 @@ A sample GitHub Actions matrix is shown below.
   touching disk: its **up-axis** (Y up as-is, Z up, X up) and a **uniform
   scale**. The export writes the object **where it stands** — its world
   transform is baked into the file, so the object lands in the right place
-  rather than at the origin. Cancel reads and writes nothing, and dropped files take the
+  rather than at the origin — and the **COLLADA and FBX importers bake the
+  file's own node transforms in**, so an imported model arrives where the file
+  had it instead of stacked at the origin. Cancel reads and writes nothing, and dropped files take the
   defaults. The status names the options only when they were not the defaults.
 - **Picking matches the picture.** In the wgpu viewport a Vertex-, Edge- or
   Face-level click resolves through an ID pass drawn with the same geometry,

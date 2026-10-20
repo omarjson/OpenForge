@@ -42,12 +42,12 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 - CI: `gh run list --repo omarjson/OpenForge`; each run is ~3–5 min across 7
   jobs. Watch with `gh run watch <id> --repo omarjson/OpenForge --exit-status`.
 
-## 4. Repo layout — 13 crates (753 `#[test]` fns; 756 tests pass, 2 doc-tests ignored)
+## 4. Repo layout — 13 crates (761 `#[test]` fns; 764 tests pass, 2 doc-tests ignored)
 
 | Crate | Tests | Purpose |
 |-------|-------|---------|
 | `openforge-core` | 54 | `Mesh`, `Scene`, nodes, selection, undo (a stack generic over its snapshot, so the app restores a scene and its clip library together), tools. The data model. `uv_sphere` carries spherical UVs; **`Mesh::edges()` is the one edge enumeration** the whole app numbers edges by, `Selection::selected_faces` is the one face-set read (it answers only at the face level — an edge index is not a face index), **`selected_element_node` is the one answer to which node a sub-object selection belongs to** (Local gizmo axes fall back to it when nothing but sub-objects is selected), and **`subselect` holds the Select menu's maths** (all/invert/grow/shrink plus the edge loop/ring walks) on that same edge list. `Node::lod` is the one game tag (untagged by default). `Transform::euler_degrees`/`set_euler_degrees` are the one XYZ-Euler view of a rotation the panels edit through. |
-| `openforge-io` | 33 | Import/export: OBJ, glTF/GLB, PLY, STL, COLLADA (a hand-written XML subset reader), OFF and FBX ASCII (a hand-written reader for the FBX text schema — node tree, complement-closed n-gons, the normal/UV/material layers — plus a writer for the same subset). |
+| `openforge-io` | 41 | Import/export: OBJ, glTF/GLB, PLY, STL, COLLADA (a hand-written XML subset reader), OFF and FBX ASCII (a hand-written reader for the FBX text schema — node tree, complement-closed n-gons, the normal/UV/material layers — plus a writer for the same subset). |
 | `openforge-ops` | 19 | `MeshOps` extension trait: bevel, bridge, mirror, triangulate, flip, delete_edges, edge_loops, ring, **taper/twist/bend deformers**, and **grid-cluster decimation** (`decimate_clustered`) for LOD chains. |
 | `openforge-materials` | 49 | Phong/Lambert materials, colours, `Texture` (+ `resized` for shared-size texture arrays), and the **four map kinds** (`MapKind::Diffuse`/`Normal`/`Specular`/`Emissive` as `Material` fields with `map`/`set_map`). `maps.rs` is the sampler of record — `MapTexels::sample`/`IDENTITY`, `tangent_frame` (a frame from a triangle's positions and UVs alone), `apply_normal_map` — and `shading.rs` holds `shade_surface`, **the one Phong surface the CPU painter and the GPU shader both mirror**. |
 | `openforge-render` | 105 | Camera/vertex/uniform plumbing — the orbit camera also carries the **orthographic** projection and its own up vector, which is what makes the GPU image agree with the CPU picking rays in an axis view (#38) — **plus the wgpu viewport backend** (`gpu` feature): offscreen color+depth target (multi-sampled when supported), scene/grid/edge/gizmo pipelines, **a material texture array the scene pass samples per face — four map layers per vertex (diffuse, normal, specular, emissive) over three reserved identity layers, with the per-material specular colour/exponent and emissive colour riding the same vertex and the tangent frame read back from each fragment's own position and UVs**, **an ID pass that resolves exactly what the frame draws when picking — faces as triangles, edges as lines, vertices as points, through a click patch or a whole rectangle** (`pick.rs` holds the geometry/element table/patch maths), frame stats. |
@@ -397,9 +397,9 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **756 tests pass** (753 `#[test]`
+workspace builds with **0 warnings**, **764 tests pass** (761 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Forty-seven work-streams are done — the engine layer from the **wgpu
+Forty-nine work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
 through **gizmo axes modes and a placed pivot** (#39), **boolean CSG that
@@ -407,8 +407,9 @@ stays closed** (#40), **a boolean that keeps the texture** (#41), **a UV
 editor that follows the 3D selection** (#42), **a workspace that remembers
 itself** (#43), **several viewports side by side** (#44), **find and replace
 by name** (#45), **a weight brush for the rig** (#46) and **an export that
-writes the object where it stands** (#47), each narrated further down — plus a
-progress report:
+writes the object where it stands** (#47) and **the importers putting the
+objects where the file put them** (#48, #49), each narrated further down —
+plus a progress report:
 
 - **`scripts/progress.sh`** draws a progress bar per parity area and can
   rewrite [`PROGRESS.md`](PROGRESS.md) (`--write`). It keeps *measured* counts
@@ -2080,9 +2081,39 @@ progress report:
   lands in the same two places relative to each other, and a turned and
   stretched box lands with its long axis turned).
 
+- **The importers put the objects where the file put them** (work-streams #48
+  and #49). COLLADA and FBX ASCII both keep the geometry in one place and the
+  *place* somewhere else — a node tree — and both readers threw the place
+  away, so every imported object landed at the origin.
+  - **COLLADA's visual scene.** The reader now walks
+    `<library_visual_scenes>` → `<visual_scene>` → `<node>`, and each node's
+    `<matrix>` (or its `<translate>`, `<rotate>` and `<scale>`) is
+    accumulated down the tree. The transform is in the file's own space, so it
+    is applied **before** the up-axis turn ✓ — a Z-up document is turned onto
+    Y after the node has placed it, not before.
+  - **FBX's models and connections.** The reader reads the `Model` objects
+    (their `Lcl Translation`, `Lcl Rotation` and `Lcl Scaling`) and the
+    `Connections` section, which names a child and its parent, and
+    accumulates the transforms down that chain. A model's rotation is read as
+    Euler angles in degrees in the X, Y, Z order the format's default names.
+  - **Both bake the transform into the vertices**, because the interchange
+    layer carries geometry and nothing else — so an imported model lands where
+    the file had it, and the app's own up-axis and scale options still mean
+    what they say.
+  - **A geometry with no node stays where it was authored** ✓, and a geometry
+    instanced more than once takes its first placement, so the import does not
+    depend on the order the file happens to list things in.
+- **8 new tests**: four for COLLADA (a node's translate is baked in, a
+  node's matrix is baked in, nested nodes' transforms accumulate, and a
+  geometry with no visual scene stays put) and four for FBX (a model's
+  translation is baked in, its rotation is baked in, nested models'
+  transforms accumulate, and a geometry with no model stays put). The FBX
+  reader's own sample document now expects the *placed* positions, since the
+  model's translation is applied.
+
 **Verified (build/tests):** `cargo build --release -p openforge-app` (the CI
 build job) → 0 warnings; `cargo build --workspace` → 0 warnings (and the test
-build too); `cargo test --workspace` → **756 pass, 0 failures**
+build too); `cargo test --workspace` → **764 pass, 0 failures**
 (`cargo build --workspace ... | grep -c warning` → 0). The #30 windows are
 measured headless too: the theme is asserted on a bare egui context, the
 grid's lines are counted through a real view-projection with the grid on and
@@ -2274,7 +2305,7 @@ in `openforge-core` (`needless_range_loop` in `edit.rs`) and `openforge-io`
 
 **Progress toward full ZModeler parity: see [`PROGRESS.md`](PROGRESS.md)** for
 the per-area bars (`scripts/progress.sh --write` regenerates it; the mean of the
-16 curated areas is **78.0%**, shown as 78). The engine
+16 curated areas is **78.3%**, shown as 78). The engine
 layer is essentially done, and the largest application-surface gaps — the GPU
 viewport, the UV editor and the editing UX around the gizmo — now have real
 implementations, with materials shading per face on both paths as of #9, the
@@ -2334,7 +2365,9 @@ paths — as of #44, and the find-and-replace window (an object by name, and
 the rename that follows) as of #45, and the rig's weight brush (a stroke
 paints the active bone's weight onto the vertices under the cursor, with a
 falloff and a radius, and the whole stroke is one undo step) as of #46, and the export writing the
-object where it stands rather than at the origin as of #47.
+object where it stands rather than at the origin as of #47, and the COLLADA
+and FBX importers placing the objects where the file put them as of #48 and
+#49.
 Prioritized next steps:
 
 1. **Deepen the GPU viewport.** MSAA, the depth-tested edge overlay, per-face
@@ -2428,9 +2461,9 @@ the CPU path), the material system beyond the
 four maps (no node graph, no per-map UV channel, no opacity/blend, no
 bump/displacement or environment maps, no mipmapped/anisotropic sampling),
 and exact format breadth
-(seven formats, none proprietary; COLLADA and FBX are geometry subsets, without
-node transforms, effects or animation) remain the largest deltas and are many
-work-streams, not one push.
+(seven formats, none proprietary; COLLADA and FBX are geometry subsets —
+their node transforms are read now, #48/#49, but their effects and animation
+are not) remain the largest deltas and are many work-streams, not one push.
 
 ## 8. Known gotchas when using AI subagents here
 

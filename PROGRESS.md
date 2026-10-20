@@ -7,7 +7,7 @@ OpenForge — progress toward ZModeler parity
 
 ENGINE
   Data model (nodes, mesh, selection, undo, tools)     █████████████████░░░  87%
-  Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII) ███████████████░░░░░  76%
+  Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII) ████████████████░░░░  82%
   Modeling ops (extrude, inset, bevel, mirror, weld, deformers) ████████████████░░░░  80%
   Boolean CSG                                          ███████████████░░░░░  76%
   Generators & algorithms (primitives, Catmull-Clark, noise, L-systems) ████████████████░░░░  80%
@@ -27,8 +27,8 @@ APPLICATION SURFACE
 
   OVERALL (unweighted mean of 16 areas)                ███████████████░░░░░  78%
 
-Measured from the repo: 13 crates · 757 test fns · 45,492 lines of Rust
-Exact mean of the curated area scores: 78.0% (sum 1248 over 16 areas)
+Measured from the repo: 13 crates · 761 test fns · 45,696 lines of Rust
+Exact mean of the curated area scores: 78.3% (sum 1254 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
 

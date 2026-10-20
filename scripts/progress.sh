@@ -40,7 +40,7 @@ rust_loc=$(find crates -name '*.rs' -print0 | xargs -0 cat | wc -l | tr -d ' ')
 
 AREAS=$(cat <<'DATA'
 Data model (nodes, mesh, selection, undo, tools)|87|Engine
-Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII)|76|Engine
+Standard format IO (OBJ, glTF/GLB, PLY, STL, COLLADA, OFF, FBX ASCII)|82|Engine
 Modeling ops (extrude, inset, bevel, mirror, weld, deformers)|80|Engine
 Boolean CSG|76|Engine
 Generators & algorithms (primitives, Catmull-Clark, noise, L-systems)|80|Engine
