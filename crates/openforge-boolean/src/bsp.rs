@@ -4,27 +4,73 @@
 //! (build a tree of splitting planes, then clip one tree against another to
 //! resolve union / difference / intersection). It is a direct expression of
 //! the published algorithm, not a port of any specific library.
+//!
+//! Two things make it hold up on real meshes rather than only on paper:
+//!
+//! * **The work happens in normalized `f64` space.** [`Fit`] centres both
+//!   solids and scales them to an extent of about one before anything is
+//!   split, and the result is mapped back afterwards. Every tolerance below is
+//!   therefore *relative to the model*: a scene measured in millimetres and one
+//!   measured in thousands take the same path with the same accuracy, where an
+//!   absolute `1e-4` would be a no-op on one and a blunt instrument on the
+//!   other. Splitting also accumulates far less error in double precision, and
+//!   the result is rounded once, on the way back out.
+//! * **Shared vertices are welded by tolerance, not by a grid.** A
+//!   quantization grid splits two points a nanometre apart across a cell
+//!   boundary and leaves a crack in the surface; [`VertexWelder`] looks at the
+//!   neighbouring cells too, so a vertex that appears in several polygons (or
+//!   in both solids) becomes one index however it is rounded.
+//!
+//! Slivers are compressed away rather than emitted: a polygon whose loop
+//! repeats a vertex or folds onto itself is dropped, and the ear clipper
+//! refuses zero-area ears, so a split edge never becomes a chord across itself.
 
-use glam::Vec3;
+use glam::DVec3 as Vec3;
 use openforge_core::mesh::Mesh;
 use std::collections::HashMap;
 
-const EPSILON: f32 = 1e-5;
+/// Plane-classification tolerance, in normalized units: a vertex this close to
+/// a splitting plane is *on* it. The model is about a unit across by the time
+/// this is used, so this is a relative 1e-5 of the model's size.
+///
+/// The value is a trade: a tighter tolerance splits more polygons (a bigger
+/// tree, more work), a looser one snaps vertices that are not quite on the
+/// plane onto it. It has to be no tighter than [`WELD`], or two solids that
+/// share a face would keep a hairline crack between them.
+const EPSILON: f64 = 1e-5;
+
+/// Distance at which two points are the same point (normalized units), for
+/// welding and for T-junction insertion along an edge.
+const WELD: f64 = 1e-5;
 
 /// A plane in the form `normal · x = w`. Points with `normal · x - w > 0` are
 /// in front; `< 0` are behind.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Plane {
     pub normal: Vec3,
-    pub w: f32,
+    pub w: f64,
 }
 
 impl Plane {
     /// Build a plane through three counter-clockwise points.
+    ///
+    /// A triangle is rejected as degenerate when its area is negligible
+    /// *relative to its own sides*, which is what tells a sliver (a long, very
+    /// thin triangle) apart from a small but honest one: an absolute area test
+    /// throws away legitimate detail in a dense mesh and keeps garbage in a
+    /// coarse one.
     fn from_points(a: Vec3, b: Vec3, c: Vec3) -> Option<Self> {
-        let normal = (b - a).cross(c - a).normalize_or_zero();
-        if normal.length_squared() < EPSILON * EPSILON {
-            return None; // degenerate / collinear
+        let ab = b - a;
+        let ac = c - a;
+        let cross = ab.cross(ac);
+        let area2 = cross.length();
+        let sides = ab.length() * ac.length();
+        if !area2.is_finite() || sides <= 0.0 || area2 <= sides * 1e-12 {
+            return None; // collinear, or too thin to carry a normal
+        }
+        let normal = cross / area2;
+        if !normal.is_finite() {
+            return None;
         }
         Some(Self {
             normal,
@@ -125,14 +171,44 @@ pub(crate) struct Polygon {
 }
 
 impl Polygon {
-    /// Build a polygon from counter-clockwise vertices on the given plane.
-    /// Returns `None` if degenerate.
+    /// Build a polygon from counter-clockwise vertices on the given plane,
+    /// dropping repeated neighbours. Returns `None` for a loop that is too
+    /// short, or too thin, to have an interior.
     fn from_points(vertices: Vec<Vec3>, plane: Plane) -> Option<Self> {
+        let vertices = compress_loop(&vertices);
         if vertices.len() < 3 {
             return None;
         }
+        if loop_area(&vertices, plane.normal) <= 0.0 {
+            return None; // degenerate, or wound the wrong way for its plane
+        }
         Some(Self { vertices, plane })
     }
+}
+
+/// Drop consecutive vertices closer together than the weld tolerance — the
+/// closing point included — so a split that lands a hair from an existing
+/// vertex does not leave a zero-length edge behind.
+fn compress_loop(verts: &[Vec3]) -> Vec<Vec3> {
+    let mut out: Vec<Vec3> = Vec::with_capacity(verts.len());
+    for &v in verts {
+        if out.last().is_none_or(|last| (v - *last).length() > WELD) {
+            out.push(v);
+        }
+    }
+    while out.len() > 1 && (out[out.len() - 1] - out[0]).length() <= WELD {
+        out.pop();
+    }
+    out
+}
+
+/// The signed area of a planar loop as seen from `normal`'s side.
+fn loop_area(verts: &[Vec3], normal: Vec3) -> f64 {
+    let mut acc = Vec3::ZERO;
+    for i in 0..verts.len() {
+        acc += verts[i].cross(verts[(i + 1) % verts.len()]);
+    }
+    acc.dot(normal) * 0.5
 }
 
 /// A BSP node: a splitting `plane` with `front`/`back` subtrees and the
@@ -254,8 +330,84 @@ impl Node {
     }
 }
 
+/// The map from world space to the normalized space the CSG runs in.
+///
+/// Both solids are centred on the origin and scaled to an extent of about one
+/// before anything is split, and the result is mapped back afterwards. Every
+/// tolerance in this module is absolute, and this is what makes those
+/// tolerances *relative to the model*: a scene measured in millimetres and one
+/// measured in thousands take the same path with the same accuracy, where a
+/// fixed `1e-4` would be a no-op on one and a blunt instrument on the other.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Fit {
+    center: Vec3,
+    scale: f64,
+}
+
+impl Fit {
+    /// A map that puts every vertex of `groups` inside a box about a unit
+    /// across, centred on their common middle.
+    pub fn of(groups: &[&[Polygon]]) -> Self {
+        let mut min = Vec3::splat(f64::INFINITY);
+        let mut max = Vec3::splat(f64::NEG_INFINITY);
+        for g in groups {
+            for p in g.iter() {
+                for &v in &p.vertices {
+                    min = min.min(v);
+                    max = max.max(v);
+                }
+            }
+        }
+        if !min.is_finite() || !max.is_finite() {
+            return Self {
+                center: Vec3::ZERO,
+                scale: 1.0,
+            };
+        }
+        let center = (min + max) * 0.5;
+        let extent = (max - min).max_element();
+        let scale = if extent > 0.0 { 1.0 / extent } else { 1.0 };
+        Self { center, scale }
+    }
+
+    /// `p` in normalized space.
+    pub fn point(&self, p: Vec3) -> Vec3 {
+        (p - self.center) * self.scale
+    }
+
+    /// The same polygons, in normalized space. A uniform scale and a
+    /// translation leave a plane's normal alone: only its offset moves.
+    pub fn polygons(&self, polys: &[Polygon]) -> Vec<Polygon> {
+        polys
+            .iter()
+            .map(|p| Polygon {
+                vertices: p.vertices.iter().map(|&v| self.point(v)).collect(),
+                plane: Plane {
+                    normal: p.plane.normal,
+                    w: (p.plane.w - p.plane.normal.dot(self.center)) * self.scale,
+                },
+            })
+            .collect()
+    }
+
+    /// A mesh built in normalized space, put back where it came from. Only the
+    /// positions move — by the same uniform map — so the faces, and the winding
+    /// the normals are computed from, come back unchanged.
+    pub fn restore(&self, mut mesh: Mesh) -> Mesh {
+        for p in &mut mesh.positions {
+            *p = (p.as_dvec3() / self.scale + self.center).as_vec3();
+        }
+        mesh.compute_flat_normals();
+        mesh
+    }
+}
+
 /// Triangulate a mesh's faces into a flat list of polygons (fan-triangulated,
 /// so every polygon is a triangle and therefore convex and planar).
+///
+/// The mesh's own `f32` positions are widened to `f64` here: the whole CSG
+/// runs in double precision, and the only rounding to single precision
+/// happens once, on the way out.
 pub(crate) fn mesh_to_polygons(mesh: &Mesh) -> Vec<Polygon> {
     let mut out = Vec::new();
     for f in &mesh.faces {
@@ -263,6 +415,7 @@ pub(crate) fn mesh_to_polygons(mesh: &Mesh) -> Vec<Polygon> {
             .corners
             .iter()
             .filter_map(|c| mesh.positions.get(c.position as usize).copied())
+            .map(|p| p.as_dvec3())
             .collect();
         if pts.len() < 3 {
             continue;
@@ -283,7 +436,12 @@ pub(crate) fn mesh_to_polygons(mesh: &Mesh) -> Vec<Polygon> {
 /// Insert any vertex that lies in the interior of a polygon edge, so that a
 /// neighbour split at that point shares the same edge subdivision instead of
 /// leaving a T-junction. Returns the expanded, ordered boundary loop.
-fn expand_t_junctions(verts: &[Vec3], all: &[Vec3], tol: f32) -> Vec<Vec3> {
+///
+/// The candidates come from a grid rather than from the whole point cloud:
+/// this question is asked once per edge of every polygon in the result, and
+/// the answer is nearly always "nothing here", so the grid is what keeps a
+/// boolean of a real scene from taking minutes.
+fn expand_t_junctions(verts: &[Vec3], grid: &PointGrid, tol: f64) -> Vec<Vec3> {
     let tol2 = tol * tol;
     let mut out: Vec<Vec3> = Vec::with_capacity(verts.len());
     let n = verts.len();
@@ -296,19 +454,19 @@ fn expand_t_junctions(verts: &[Vec3], all: &[Vec3], tol: f32) -> Vec<Vec3> {
         if l2 < tol2 {
             continue; // degenerate edge
         }
-        let mut ts: Vec<f32> = Vec::new();
-        for &p in all {
+        let mut ts: Vec<f64> = Vec::new();
+        grid.visit_near_segment(a, b, tol, |p| {
             let t = (p - a).dot(ab) / l2;
             if t <= tol || t >= 1.0 - tol {
-                continue; // too close to an endpoint
+                return; // too close to an endpoint
             }
             let proj = a + ab * t;
             if (p - proj).length() < tol {
                 ts.push(t);
             }
-        }
+        });
         ts.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
-        let mut last = -1.0f32;
+        let mut last = -1.0f64;
         for t in ts {
             if t - last > tol {
                 out.push(a + ab * t);
@@ -317,6 +475,146 @@ fn expand_t_junctions(verts: &[Vec3], all: &[Vec3], tol: f32) -> Vec<Vec3> {
         }
     }
     out
+}
+
+/// A uniform grid over a point cloud, for "which points lie within `tol` of
+/// this segment" without walking the whole cloud for every edge.
+///
+/// The cell is a sixty-fourth of the model's extent: few enough cells to fill
+/// in a moment, small enough that one holds a handful of vertices. A segment
+/// is sampled along its length, and each sample looks at its own cell and the
+/// six around it, so no point near the segment can be missed.
+struct PointGrid {
+    cell: f64,
+    cells: HashMap<(i64, i64, i64), Vec<Vec3>>,
+}
+
+impl PointGrid {
+    fn new(points: &[Vec3]) -> Self {
+        let mut min = Vec3::splat(f64::INFINITY);
+        let mut max = Vec3::splat(f64::NEG_INFINITY);
+        for &p in points {
+            min = min.min(p);
+            max = max.max(p);
+        }
+        let extent = if min.is_finite() && max.is_finite() {
+            (max - min).max_element()
+        } else {
+            0.0
+        };
+        let cell = (extent / 64.0).max(WELD * 4.0);
+        let mut cells: HashMap<(i64, i64, i64), Vec<Vec3>> = HashMap::new();
+        for &p in points {
+            cells.entry(cell_of(p, cell)).or_default().push(p);
+        }
+        Self { cell, cells }
+    }
+
+    /// Visit every point within `tol` of the segment `a`-`b`.
+    ///
+    /// The points are found by walking the cells the segment passes through
+    /// and their neighbours, and each candidate is then measured against the
+    /// segment itself, so a cell that merely happens to be nearby does not
+    /// count.
+    fn visit_near_segment(&self, a: Vec3, b: Vec3, tol: f64, mut f: impl FnMut(Vec3)) {
+        let d = b - a;
+        let l2 = d.length_squared();
+        let len = d.length();
+        let steps = (len / (self.cell * 0.5)).ceil().max(1.0);
+        let steps = if steps.is_finite() {
+            (steps as usize).min(4096)
+        } else {
+            1
+        };
+        let mut last: Option<(i64, i64, i64)> = None;
+        for i in 0..=steps {
+            let t = i as f64 / steps as f64;
+            let p = a + d * t;
+            let (cx, cy, cz) = cell_of(p, self.cell);
+            if last == Some((cx, cy, cz)) {
+                continue; // the same cell as the last sample
+            }
+            last = Some((cx, cy, cz));
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    for dz in -1..=1 {
+                        let Some(pts) = self.cells.get(&(cx + dx, cy + dy, cz + dz)) else {
+                            continue;
+                        };
+                        for &q in pts {
+                            if l2 < tol * tol {
+                                if (q - a).length() <= tol {
+                                    f(q);
+                                }
+                                continue;
+                            }
+                            let t = (q - a).dot(d) / l2;
+                            if t <= 0.0 || t >= 1.0 {
+                                continue;
+                            }
+                            let proj = a + d * t;
+                            if (q - proj).length() <= tol {
+                                f(q);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The grid cell a point falls in.
+fn cell_of(p: Vec3, cell: f64) -> (i64, i64, i64) {
+    (
+        (p.x / cell).floor() as i64,
+        (p.y / cell).floor() as i64,
+        (p.z / cell).floor() as i64,
+    )
+}
+
+/// Welds points to vertex indices by tolerance.
+///
+/// Two points closer than the tolerance are one vertex, whichever side of a
+/// rounding boundary they fall on: a quantization grid would put them in
+/// different cells and leave a crack in the surface, so this looks at the
+/// neighbouring cells as well.
+struct VertexWelder {
+    tol: f64,
+    cells: HashMap<(i64, i64, i64), Vec<(Vec3, u32)>>,
+}
+
+impl VertexWelder {
+    fn new(tol: f64) -> Self {
+        Self {
+            tol: tol.max(f64::MIN_POSITIVE),
+            cells: HashMap::new(),
+        }
+    }
+
+    /// The index of an already-welded point within tolerance, if there is one.
+    fn find(&self, p: Vec3) -> Option<u32> {
+        let (cx, cy, cz) = cell_of(p, self.tol);
+        for dx in -1..=1 {
+            for dy in -1..=1 {
+                for dz in -1..=1 {
+                    if let Some(pts) = self.cells.get(&(cx + dx, cy + dy, cz + dz)) {
+                        for (q, i) in pts {
+                            if (*q - p).length() <= self.tol {
+                                return Some(*i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Remember `p` as the vertex `index`.
+    fn insert(&mut self, p: Vec3, index: u32) {
+        self.cells.entry(cell_of(p, self.tol)).or_default().push((p, index));
+    }
 }
 
 /// Triangulate a planar, weakly-convex loop (possibly with collinear points
@@ -339,7 +637,10 @@ fn ear_clip(loop_idx: &[u32], pos: &[Vec3], normal: Vec3) -> Vec<[u32; 3]> {
             let (a, b, c) = (pos[ip], pos[ic], pos[inx]);
             let cross = (b - a).cross(c - a);
             // Skip degenerate (collinear) ears — these lie across a split edge.
-            if cross.length() < 1e-9 {
+            // The threshold is the weld tolerance, so an ear this thin is
+            // never emitted: a face that thin is dropped again by the caller,
+            // and dropping it would leave a hole in the surface.
+            if cross.length() < WELD {
                 continue;
             }
             // Convex ear relative to the loop orientation.
@@ -386,62 +687,65 @@ fn point_in_tri(p: Vec3, a: Vec3, b: Vec3, c: Vec3, normal: Vec3) -> bool {
     let d1 = (b - a).cross(p - a).dot(normal);
     let d2 = (c - b).cross(p - b).dot(normal);
     let d3 = (a - c).cross(p - c).dot(normal);
-    const T: f32 = 1e-9;
+    const T: f64 = 1e-12;
     let has_neg = d1 < -T || d2 < -T || d3 < -T;
     let has_pos = d1 > T || d2 > T || d3 > T;
     !(has_neg && has_pos)
 }
 
-/// Rebuild a mesh from polygons. Shared vertices are welded by quantized
-/// position, T-junctions along edges are resolved so the surface stays
-/// manifold, and each (now weakly-convex, possibly many-sided) polygon is
-/// ear-clipped into triangles.
+/// Rebuild a mesh from polygons. Shared vertices are welded by tolerance,
+/// T-junctions along edges are resolved so the surface stays manifold, and
+/// each (now weakly-convex, possibly many-sided) polygon is ear-clipped into
+/// triangles.
+///
+/// The polygon loop is welded *before* it is triangulated, so the ear clipper
+/// sees one index per point and a shared edge is shared exactly — which is
+/// what makes the result watertight.
 pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
-    const TOL: f32 = 1e-4;
-    // Candidate T-vertices: every vertex across every polygon.
+    // Candidate T-vertices: every vertex across every polygon, in a grid.
     let all: Vec<Vec3> = polygons.iter().flat_map(|p| p.vertices.iter().copied()).collect();
+    let grid = PointGrid::new(&all);
 
     let mut mesh = Mesh::new();
-    let mut cache: HashMap<(i64, i64, i64), u32> = HashMap::new();
-    let quant = |v: Vec3| -> (i64, i64, i64) {
-        (
-            (v.x * 1e4).round() as i64,
-            (v.y * 1e4).round() as i64,
-            (v.z * 1e4).round() as i64,
-        )
-    };
-    let add_welded = |v: Vec3, mesh: &mut Mesh, cache: &mut HashMap<(i64, i64, i64), u32>| -> u32 {
-        let key = quant(v);
-        if let Some(&i) = cache.get(&key) {
-            return i;
-        }
-        let i = mesh.add_vertex(v);
-        cache.insert(key, i);
-        i
-    };
+    let mut welder = VertexWelder::new(WELD);
+    // The welded positions, parallel to the mesh's own vertex indices.
+    let mut points: Vec<Vec3> = Vec::new();
 
     for poly in polygons {
         if poly.vertices.len() < 3 {
             continue;
         }
-        let loop_pts = expand_t_junctions(&poly.vertices, &all, TOL);
+        let loop_pts = expand_t_junctions(&poly.vertices, &grid, WELD);
         let m = loop_pts.len();
         if m < 3 {
             continue;
         }
         // Weld the loop into indexed vertices.
-        let idx: Vec<u32> = loop_pts
-            .iter()
-            .map(|&v| add_welded(v, &mut mesh, &mut cache))
-            .collect();
+        let mut idx: Vec<u32> = Vec::with_capacity(m);
+        for &v in &loop_pts {
+            match welder.find(v) {
+                Some(i) => idx.push(i),
+                None => {
+                    let i = mesh.add_vertex(v.as_vec3());
+                    welder.insert(v, i);
+                    points.push(v);
+                    idx.push(i);
+                }
+            }
+        }
         // Ear-clip, skipping degenerate triangles, so split edges stay split.
-        for tri in ear_clip(&idx, &mesh.positions, poly.plane.normal) {
+        for tri in ear_clip(&idx, &points, poly.plane.normal) {
             let (p0, p1, p2) = (
-                mesh.positions[tri[0] as usize],
-                mesh.positions[tri[1] as usize],
-                mesh.positions[tri[2] as usize],
+                points[tri[0] as usize],
+                points[tri[1] as usize],
+                points[tri[2] as usize],
             );
-            if (p1 - p0).cross(p2 - p0).length_squared() < TOL * TOL {
+            // A face that is *exactly* degenerate (three identical points) is
+            // dropped: it would be a zero-length edge in the mesh. A merely
+            // thin face is kept — it is a sliver, but it is part of the
+            // surface, and dropping it would leave a hole where the two
+            // solids met.
+            if (p1 - p0).cross(p2 - p0).length_squared() == 0.0 {
                 continue;
             }
             mesh.add_face(&tri);
@@ -499,3 +803,4 @@ impl From<&[Polygon]> for Node {
         n
     }
 }
+

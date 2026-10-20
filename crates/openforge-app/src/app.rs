@@ -947,6 +947,9 @@ impl OpenForgeApp {
         match result {
             Ok(mesh) => {
                 let verts = mesh.vertex_count();
+                // Whether the result came out closed is worth saying: an open
+                // shell is the difference between a solid and a puddle.
+                let closed = openforge_boolean::is_watertight(&mesh);
                 self.with_edit(kind, |app| {
                     if let Ok(node) = app.scene.get_mut(a) {
                         if let Some(slot) = node.mesh_mut() {
@@ -957,7 +960,12 @@ impl OpenForgeApp {
                     app.selection.clear();
                     app.selection.select_node(a);
                 });
-                self.status = format!("{}: result has {} vertices.", kind, verts);
+                self.status = format!(
+                    "{}: result has {} vertices, {}.",
+                    kind,
+                    verts,
+                    if closed { "closed" } else { "open — not a closed solid" }
+                );
             }
             Err(e) => self.status = format!("Boolean failed: {}", e),
         }
@@ -11343,6 +11351,35 @@ mod tests {
         );
         app.clear_pivot();
         assert!(app.pivot.is_none(), "the gizmo follows the selection again");
+    }
+
+    #[test]
+    fn a_boolean_of_two_meshes_says_whether_the_result_is_closed() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        // Two boxes that overlap, with the offset baked into the mesh: the
+        // boolean works on the meshes themselves.
+        let mut second = primitive_box(2.0);
+        for p in &mut second.positions {
+            *p += Vec3::new(1.0, 0.0, 0.0);
+        }
+        let a = app.scene.create_mesh("a", primitive_box(2.0));
+        let b = app.scene.create_mesh("b", second);
+        app.selection.clear();
+        app.selection.select_node(a);
+        app.selection.select_node(b);
+        app.boolean_selected("Union");
+        assert!(app.status.contains("Union"), "{}", app.status);
+        assert!(
+            app.status.contains("closed"),
+            "the result should say whether it is a closed solid: {}",
+            app.status
+        );
+        // The result went into the first node, and the second was consumed.
+        assert!(app.scene.get(a).unwrap().is_mesh());
+        assert!(app.scene.get(b).is_err(), "the second mesh is gone");
+        // And it is one undo step back.
+        app.undo_edit();
+        assert!(app.scene.get(b).is_ok(), "and comes back with undo");
     }
 
 }
