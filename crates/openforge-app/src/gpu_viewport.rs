@@ -33,10 +33,17 @@ pub const TEXTURE_LAYER_SIZE: u32 = 256;
 /// face picks at grazing angles.
 pub const PICK_RADIUS: u32 = 12;
 
-/// The wgpu viewport and the egui handle its image is drawn through.
+/// The wgpu viewport and the egui handles its images are drawn through.
+///
+/// One image per viewport pane: each pane is drawn into its own offscreen
+/// target, through its own camera, and presented as its own egui texture.
 pub struct GpuViewport {
     renderer: GpuRenderer,
-    texture_id: egui::TextureId,
+    /// The egui image of each pane, registered on its own.
+    texture_ids: Vec<Option<egui::TextureId>>,
+    /// The size each pane's image was registered at, so a resized pane is
+    /// registered again (egui holds a bind group over the old view).
+    texture_sizes: Vec<[u32; 2]>,
 }
 
 impl GpuViewport {
@@ -48,12 +55,11 @@ impl GpuViewport {
     pub fn new(state: &RenderState) -> Self {
         let samples = supported_samples(&state.adapter, COLOR_FORMAT, PREFERRED_SAMPLES);
         let renderer = GpuRenderer::new(&state.device, &state.queue, samples);
-        let texture_id = state.renderer.write().register_native_texture(
-            &state.device,
-            renderer.color_view(),
-            FilterMode::Linear,
-        );
-        Self { renderer, texture_id }
+        Self {
+            renderer,
+            texture_ids: Vec::new(),
+            texture_sizes: Vec::new(),
+        }
     }
 
     /// Upload the library's textures as the scene pass's texture array.
@@ -78,6 +84,7 @@ impl GpuViewport {
     pub fn render(
         &mut self,
         state: &RenderState,
+        pane: usize,
         size: [f32; 2],
         scene: &mut Scene,
         selection: &Selection,
@@ -87,17 +94,37 @@ impl GpuViewport {
         edges: &[GpuVertex],
     ) -> (egui::TextureId, FrameStats) {
         let size = target_size_px(size);
-        if size != self.renderer.size() {
-            self.renderer.resize(&state.device, size);
+        self.renderer.resize(&state.device, pane, size);
+        // The egui handle for this pane's image: registered on the first
+        // frame, and again whenever the pane is resized (egui holds a bind
+        // group over the old view).
+        if self.texture_ids.len() <= pane || self.texture_sizes.get(pane).copied() != Some(size) {
             let mut egui_renderer = state.renderer.write();
-            egui_renderer.free_texture(&self.texture_id);
-            self.texture_id = egui_renderer.register_native_texture(
+            if let Some(Some(old)) = self.texture_ids.get(pane) {
+                egui_renderer.free_texture(old);
+            }
+            let id = egui_renderer.register_native_texture(
                 &state.device,
-                self.renderer.color_view(),
+                self.renderer.color_view(pane),
                 FilterMode::Linear,
             );
+            while self.texture_ids.len() <= pane {
+                self.texture_ids.push(None);
+            }
+            self.texture_ids[pane] = Some(id);
+            while self.texture_sizes.len() <= pane {
+                self.texture_sizes.push([0, 0]);
+            }
+            self.texture_sizes[pane] = size;
         }
+        let texture_id = self
+            .texture_ids
+            .get(pane)
+            .copied()
+            .flatten()
+            .expect("the pane's image is registered");
         let stats = self.renderer.render(
+            pane,
             &state.device,
             &state.queue,
             scene,
@@ -107,7 +134,7 @@ impl GpuViewport {
             time,
             edges,
         );
-        (self.texture_id, stats)
+        (texture_id, stats)
     }
 
     /// Ask the GPU what sits under the pointer, nearest first.
@@ -121,14 +148,16 @@ impl GpuViewport {
     pub fn pick(
         &mut self,
         state: &RenderState,
+        pane: usize,
         rect: egui::Rect,
         pos: egui::Pos2,
         scale: f32,
         scene: &mut Scene,
         camera: &OrbitCamera,
     ) -> Vec<PickElement> {
-        let pixel = pick_pixel(pos, rect, scale, self.renderer.size());
+        let pixel = pick_pixel(pos, rect, scale, self.renderer.size(pane));
         self.renderer.pick(
+            pane,
             &state.device,
             &state.queue,
             scene,
@@ -149,6 +178,7 @@ impl GpuViewport {
     pub fn pick_rect(
         &mut self,
         state: &RenderState,
+        pane: usize,
         rect: egui::Rect,
         a: egui::Pos2,
         b: egui::Pos2,
@@ -157,8 +187,9 @@ impl GpuViewport {
         camera: &OrbitCamera,
         level: SelectLevel,
     ) -> Option<Vec<PickElement>> {
-        let pixels = marquee_pixel_rect(a, b, rect, scale, self.renderer.size())?;
+        let pixels = marquee_pixel_rect(a, b, rect, scale, self.renderer.size(pane))?;
         Some(self.renderer.pick_rect(
+            pane,
             &state.device,
             &state.queue,
             scene,

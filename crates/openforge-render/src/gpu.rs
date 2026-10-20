@@ -332,6 +332,30 @@ fn face_from_cull(cull: CullMode) -> Option<wgpu::Face> {
 
 // --- Renderer ---------------------------------------------------------------------
 
+/// One offscreen target: the colour image the app presents, the depth buffer,
+/// and the multi-sampled texture in between when the adapter supports it.
+struct Target {
+    size: [u32; 2],
+    color_texture: wgpu::Texture,
+    color_view: wgpu::TextureView,
+    depth_view: wgpu::TextureView,
+    msaa_view: Option<wgpu::TextureView>,
+}
+
+impl Target {
+    fn new(device: &wgpu::Device, size: [u32; 2], samples: u32) -> Self {
+        let (color_texture, color_view, depth_view, msaa_view) =
+            create_targets(device, size[0], size[1], samples);
+        Self {
+            size,
+            color_texture,
+            color_view,
+            depth_view,
+            msaa_view,
+        }
+    }
+}
+
 /// Offscreen wgpu renderer for one viewport.
 ///
 /// Build it once from the app's `wgpu::Device`, call [`resize`](Self::resize)
@@ -339,12 +363,10 @@ fn face_from_cull(cull: CullMode) -> Option<wgpu::Face> {
 /// once per frame. The completed image lives in [`color_texture`](Self::color_texture)
 /// / [`color_view`](Self::color_view).
 pub struct GpuRenderer {
-    size: [u32; 2],
+    /// One offscreen target per viewport pane, so several viewports can be
+    /// drawn side by side, each through its own camera.
+    targets: Vec<Target>,
     samples: u32,
-    color_texture: wgpu::Texture,
-    color_view: wgpu::TextureView,
-    depth_view: wgpu::TextureView,
-    msaa_view: Option<wgpu::TextureView>,
     bind_group_layout: wgpu::BindGroupLayout,
     frame_uniforms: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
@@ -740,16 +762,11 @@ impl GpuRenderer {
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         );
 
-        let (color_texture, color_view, depth_view, msaa_view) =
-            create_targets(device, MIN_TARGET_DIM, MIN_TARGET_DIM, samples);
+        let targets = vec![Target::new(device, [MIN_TARGET_DIM, MIN_TARGET_DIM], samples)];
 
         Self {
-            size: [MIN_TARGET_DIM, MIN_TARGET_DIM],
+            targets,
             samples,
-            color_texture,
-            color_view,
-            depth_view,
-            msaa_view,
             bind_group_layout,
             frame_uniforms,
             frame_bind_group,
@@ -786,9 +803,16 @@ impl GpuRenderer {
         }
     }
 
-    /// Current offscreen size in pixels.
-    pub fn size(&self) -> [u32; 2] {
-        self.size
+    /// Current offscreen size in pixels, of the pane given.
+    pub fn size(&self, slot: usize) -> [u32; 2] {
+        self.target(slot).size
+    }
+
+    /// The target a pane draws into, grown when the pane is new.
+    fn target(&self, slot: usize) -> &Target {
+        self.targets
+            .get(slot)
+            .unwrap_or_else(|| self.targets.first().expect("a renderer has a target"))
     }
 
     /// Size of the uploaded material texture array, in texels.
@@ -880,16 +904,16 @@ impl GpuRenderer {
         self.samples
     }
 
-    /// The rendered image. Register this with the egui renderer (or read it
-    /// back in tests).
-    pub fn color_texture(&self) -> &wgpu::Texture {
-        &self.color_texture
+    /// The rendered image of the pane given. Register this with the egui
+    /// renderer (or read it back in tests).
+    pub fn color_texture(&self, slot: usize) -> &wgpu::Texture {
+        &self.target(slot).color_texture
     }
 
     /// The rendered image's view; this is what
     /// `egui_wgpu::Renderer::register_native_texture` wants.
-    pub fn color_view(&self) -> &wgpu::TextureView {
-        &self.color_view
+    pub fn color_view(&self, slot: usize) -> &wgpu::TextureView {
+        &self.target(slot).color_view
     }
 
     /// Statistics for the last rendered frame.
@@ -897,23 +921,25 @@ impl GpuRenderer {
         self.stats
     }
 
-    /// Resize the offscreen target, clamping to `[1, 8192]`. Cheap no-op when
-    /// the size is unchanged.
-    pub fn resize(&mut self, device: &wgpu::Device, size: [u32; 2]) {
+    /// Resize a pane's offscreen target, clamping to `[1, 8192]`. Cheap no-op
+    /// when the size is unchanged, and a new target is made for a pane that
+    /// has not been drawn into yet.
+    pub fn resize(&mut self, device: &wgpu::Device, slot: usize, size: [u32; 2]) {
         let size = [
             size[0].clamp(MIN_TARGET_DIM, MAX_TARGET_DIM),
             size[1].clamp(MIN_TARGET_DIM, MAX_TARGET_DIM),
         ];
-        if size == self.size {
+        while self.targets.len() <= slot {
+            self.targets.push(Target::new(
+                device,
+                [MIN_TARGET_DIM, MIN_TARGET_DIM],
+                self.samples,
+            ));
+        }
+        if size == self.targets[slot].size {
             return;
         }
-        let (color_texture, color_view, depth_view, msaa_view) =
-            create_targets(device, size[0], size[1], self.samples);
-        self.size = size;
-        self.color_texture = color_texture;
-        self.color_view = color_view;
-        self.depth_view = depth_view;
-        self.msaa_view = msaa_view;
+        self.targets[slot] = Target::new(device, size, self.samples);
     }
 
     /// Draw the grid, the visible meshes of `scene`, the caller's `edges`
@@ -922,6 +948,7 @@ impl GpuRenderer {
     /// reserved clock (currently unused); an empty `edges` skips the line pass.
     pub fn render(
         &mut self,
+        slot: usize,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         scene: &mut Scene,
@@ -933,14 +960,14 @@ impl GpuRenderer {
     ) -> FrameStats {
         self.upload(device, queue, scene, selection, materials);
         self.upload_edges(device, queue, edges);
-        self.write_uniforms(queue, camera, time);
+        self.write_uniforms(queue, camera, time, slot);
 
-        let gizmo = gizmo_viewport(self.size);
+        let gizmo = gizmo_viewport(self.size(slot));
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("openforge-viewport"),
         });
-        self.encode(&mut encoder, gizmo);
+        self.encode(&mut encoder, gizmo, slot);
         queue.submit(Some(encoder.finish()));
 
         self.stats
@@ -965,6 +992,7 @@ impl GpuRenderer {
     /// the first one the level accepts).
     pub fn pick(
         &mut self,
+        slot: usize,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         scene: &mut Scene,
@@ -974,17 +1002,18 @@ impl GpuRenderer {
     ) -> Vec<PickElement> {
         // The patch around the cursor, clipped to the target: at the edges it
         // shrinks, and the cursor is no longer at its middle.
-        let cx = (cursor[0].floor().max(0.0) as u32).min(self.size[0] - 1);
-        let cy = (cursor[1].floor().max(0.0) as u32).min(self.size[1] - 1);
+        let size = self.size(slot);
+        let cx = (cursor[0].floor().max(0.0) as u32).min(size[0] - 1);
+        let cy = (cursor[1].floor().max(0.0) as u32).min(size[1] - 1);
         let radius = radius.min(MAX_PICK_RADIUS);
         let rect = [
             cx.saturating_sub(radius),
             cy.saturating_sub(radius),
-            (cx + radius + 1).min(self.size[0]),
-            (cy + radius + 1).min(self.size[1]),
+            (cx + radius + 1).min(size[0]),
+            (cy + radius + 1).min(size[1]),
         ];
         let Some((geometry, ids)) =
-            self.read_id_rect(device, queue, scene, camera, rect, PickDraw::EVERYTHING)
+            self.read_id_rect(slot, device, queue, scene, camera, rect, PickDraw::EVERYTHING)
         else {
             return Vec::new();
         };
@@ -1019,6 +1048,7 @@ impl GpuRenderer {
     /// reason — the faces and the lines are what it answers from.
     pub fn pick_rect(
         &mut self,
+        slot: usize,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         scene: &mut Scene,
@@ -1026,11 +1056,12 @@ impl GpuRenderer {
         rect: [u32; 4],
         level: SelectLevel,
     ) -> Vec<PickElement> {
+        let size = self.size(slot);
         let rect = [
-            rect[0].min(self.size[0]),
-            rect[1].min(self.size[1]),
-            rect[2].min(self.size[0]),
-            rect[3].min(self.size[1]),
+            rect[0].min(size[0]),
+            rect[1].min(size[1]),
+            rect[2].min(size[0]),
+            rect[3].min(size[1]),
         ];
         let draw = match level {
             SelectLevel::Face => PickDraw::FACES,
@@ -1039,7 +1070,7 @@ impl GpuRenderer {
             // included — the CPU fallback answers with positions too.
             SelectLevel::Vertex | SelectLevel::Object => PickDraw::POINTS,
         };
-        let Some((geometry, ids)) = self.read_id_rect(device, queue, scene, camera, rect, draw)
+        let Some((geometry, ids)) = self.read_id_rect(slot, device, queue, scene, camera, rect, draw)
         else {
             return Vec::new();
         };
@@ -1065,6 +1096,7 @@ impl GpuRenderer {
     /// geometry goes on top of the faces (see [`PickDraw`]).
     fn read_id_rect(
         &mut self,
+        slot: usize,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
         scene: &mut Scene,
@@ -1081,7 +1113,7 @@ impl GpuRenderer {
             return None;
         }
 
-        let size = self.size;
+        let size = self.size(slot);
         let aspect = size[0] as f32 / size[1].max(1) as f32;
         queue.write_buffer(
             &self.pick_uniforms,
@@ -1122,7 +1154,7 @@ impl GpuRenderer {
             })
         });
 
-        self.ensure_pick_target(device);
+        self.ensure_pick_target(device, slot);
         let target = self.pick_target.as_ref().expect("pick target was just built");
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("openforge-pick"),
@@ -1211,9 +1243,10 @@ impl GpuRenderer {
 
     /// Make sure the ID pass's attachments match the current viewport size,
     /// building them on the first pick and after every resize.
-    fn ensure_pick_target(&mut self, device: &wgpu::Device) {
-        if self.pick_target.as_ref().map(|t| t.size) != Some(self.size) {
-            self.pick_target = Some(PickTarget::new(device, self.size));
+    fn ensure_pick_target(&mut self, device: &wgpu::Device, slot: usize) {
+        let size = self.size(slot);
+        if self.pick_target.as_ref().map(|t| t.size) != Some(size) {
+            self.pick_target = Some(PickTarget::new(device, size));
         }
     }
 
@@ -1282,8 +1315,15 @@ impl GpuRenderer {
     }
 
     /// Upload the per-frame uniforms (scene camera + gizmo camera).
-    fn write_uniforms(&mut self, queue: &wgpu::Queue, camera: &OrbitCamera, time: f32) {
-        let aspect = self.size[0] as f32 / self.size[1].max(1) as f32;
+    fn write_uniforms(
+        &mut self,
+        queue: &wgpu::Queue,
+        camera: &OrbitCamera,
+        time: f32,
+        slot: usize,
+    ) {
+        let size = self.size(slot);
+        let aspect = size[0] as f32 / size[1].max(1) as f32;
         let frame = FrameUniforms::new(camera, aspect, KEY_LIGHT, time);
         queue.write_buffer(&self.frame_uniforms, 0, bytemuck::bytes_of(&frame));
 
@@ -1299,13 +1339,14 @@ impl GpuRenderer {
 
     /// Record the draw passes (grid, scene, edges, gizmo). `gizmo` is
     /// `[x, y, size]` in pixels.
-    fn encode(&self, encoder: &mut wgpu::CommandEncoder, gizmo: [f32; 3]) {
+    fn encode(&self, encoder: &mut wgpu::CommandEncoder, gizmo: [f32; 3], slot: usize) {
         let clear = clear_color();
+        let target = self.target(slot);
         // With MSAA the pass renders into the multi-sampled texture and
         // resolves into the single-sampled one the app presents.
-        let (color_view, resolve_target) = match &self.msaa_view {
-            Some(msaa) => (msaa, Some(&self.color_view)),
-            None => (&self.color_view, None),
+        let (color_view, resolve_target) = match &target.msaa_view {
+            Some(msaa) => (msaa, Some(&target.color_view)),
+            None => (&target.color_view, None),
         };
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("openforge-viewport"),
@@ -1318,7 +1359,7 @@ impl GpuRenderer {
                 },
             })],
             depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                view: &self.depth_view,
+                view: &target.depth_view,
                 depth_ops: Some(wgpu::Operations {
                     load: wgpu::LoadOp::Clear(1.0),
                     store: wgpu::StoreOp::Store,
@@ -1947,7 +1988,7 @@ mod tests {
         queue: &wgpu::Queue,
         renderer: &GpuRenderer,
     ) -> Vec<u8> {
-        let size = renderer.size();
+        let size = renderer.size(0);
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("openforge-readback"),
             size: (ROW_BYTES * size[1]).max(ROW_BYTES) as u64,
@@ -1959,7 +2000,7 @@ mod tests {
         });
         encoder.copy_texture_to_buffer(
             wgpu::ImageCopyTexture {
-                texture: renderer.color_texture(),
+                texture: renderer.color_texture(0),
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -2022,30 +2063,30 @@ mod tests {
         let camera = OrbitCamera::default();
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
-        assert_eq!(renderer.size(), [TARGET, TARGET]);
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        assert_eq!(renderer.size(0), [TARGET, TARGET]);
 
         // 1. The cube renders: some pixels are lit geometry, the rest are the
         //    dark background (plus the grid, which never reaches this
         //    brightness).
-        let stats = renderer.render(&device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
+        let stats = renderer.render(0, &device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
         assert!(stats.indices > 0 && stats.indices.is_multiple_of(3), "{stats:?}");
         assert_eq!(stats.draws, 3);
         let pixels = read_pixels(&device, &queue, &renderer);
-        let lit = bright_neutral_pixels(&pixels, renderer.size());
+        let lit = bright_neutral_pixels(&pixels, renderer.size(0));
         let total = (TARGET * TARGET) as usize;
         assert!(lit > 0, "nothing rendered: the offscreen target is all background");
         assert!(lit < total, "the background is missing: every pixel is geometry");
-        assert_eq!(orange_pixels(&pixels, renderer.size()), 0, "unselected cube is tinted");
+        assert_eq!(orange_pixels(&pixels, renderer.size(0)), 0, "unselected cube is tinted");
 
         // 2. Hiding the only mesh leaves an empty (but still drawn) frame.
         if let Ok(node) = scene.get_mut(cube) {
             node.visible = false;
         }
-        renderer.render(&device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
         let hidden = read_pixels(&device, &queue, &renderer);
         assert_eq!(
-            bright_neutral_pixels(&hidden, renderer.size()),
+            bright_neutral_pixels(&hidden, renderer.size(0)),
             0,
             "geometry was still drawn for a hidden node"
         );
@@ -2058,10 +2099,10 @@ mod tests {
         let mut selection = Selection::new();
         selection.select_node(cube);
         renderer
-            .render(&device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
+            .render(0, &device, &queue, &mut scene, &selection, &NodeMaterials::default(), &camera, 0.0, &[]);
         let selected = read_pixels(&device, &queue, &renderer);
         assert!(
-            orange_pixels(&selected, renderer.size()) > 0,
+            orange_pixels(&selected, renderer.size(0)) > 0,
             "selected mesh was not tinted"
         );
         assert_ne!(selected, hidden);
@@ -2070,9 +2111,9 @@ mod tests {
         //    floating clear of the cube shows up, and the stats count the
         //    extra draw.
         let unselected = Selection::new();
-        renderer.render(&device, &queue, &mut scene, &unselected, &NodeMaterials::default(), &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &unselected, &NodeMaterials::default(), &camera, 0.0, &[]);
         let plain = read_pixels(&device, &queue, &renderer);
-        assert_eq!(orange_pixels(&plain, renderer.size()), 0, "edge test baseline is tinted");
+        assert_eq!(orange_pixels(&plain, renderer.size(0)), 0, "edge test baseline is tinted");
         // Below the cube and clear of its body from the default camera, so
         // only the line itself can paint these pixels.
         let n = KEY_LIGHT.normalize();
@@ -2082,11 +2123,11 @@ mod tests {
             GpuVertex::new(Vec3::new(0.5, -1.5, 0.0), n, [0.0, 0.0], warm),
         ];
         let stats = renderer
-            .render(&device, &queue, &mut scene, &unselected, &NodeMaterials::default(), &camera, 0.0, &line);
+            .render(0, &device, &queue, &mut scene, &unselected, &NodeMaterials::default(), &camera, 0.0, &line);
         assert_eq!(stats.draws, 4, "the edge pass is its own draw");
         let edged = read_pixels(&device, &queue, &renderer);
         assert!(
-            orange_pixels(&edged, renderer.size()) > 0,
+            orange_pixels(&edged, renderer.size(0)) > 0,
             "the edge overlay never reached the target"
         );
     }
@@ -2135,8 +2176,8 @@ mod tests {
         let selection = Selection::new();
         let camera = OrbitCamera::default();
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
-        let size = renderer.size();
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        let size = renderer.size(0);
 
         let magenta = linear_from_srgb_u8([255, 20, 255]);
         let yellow = linear_from_srgb_u8([255, 255, 20]);
@@ -2149,6 +2190,7 @@ mod tests {
         faces[4] = yellow.into();
         faces[5] = yellow.into();
         renderer.render(
+            0,
             &device,
             &queue,
             &mut scene,
@@ -2171,7 +2213,7 @@ mod tests {
         // Control: one colour for the whole node paints no yellow at all, which
         // is what makes the assertion above about the per-face colours.
         let all_magenta = NodeMaterials::new().with_faces(cube, vec![magenta.into(); 6]);
-        renderer.render(&device, &queue, &mut scene, &selection, &all_magenta, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &all_magenta, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert_eq!(
             hue_pixels(&pixels, size, (0, 1), 2),
@@ -2194,7 +2236,7 @@ mod tests {
         let size = [TARGET, TARGET];
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, size);
+        renderer.resize(&device, 0, size);
         // Two 1x1 textures: layer 1 is pure red, layer 2 pure green. With four
         // texels the test would be at the sampler's mercy; one texel per layer
         // is the whole layer however it is filtered.
@@ -2221,7 +2263,7 @@ mod tests {
         faces[4] = FaceShading::textured(white, 1);
         faces[5] = FaceShading::textured(white, 1);
         let textured = NodeMaterials::new().with_faces(cube, faces);
-        renderer.render(&device, &queue, &mut scene, &selection, &textured, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &textured, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert!(
             pure_channel_pixels(&pixels, size, 0) > 0,
@@ -2235,7 +2277,7 @@ mod tests {
         // Control: the same colours with the texture off paint only neutral
         // pixels, so the hues really came from sampling.
         let flat = NodeMaterials::new().with_faces(cube, vec![white.into(); 6]);
-        renderer.render(&device, &queue, &mut scene, &selection, &flat, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &flat, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert_eq!(pure_channel_pixels(&pixels, size, 0), 0, "red without a texture");
         assert_eq!(pure_channel_pixels(&pixels, size, 1), 0, "green without a texture");
@@ -2256,8 +2298,8 @@ mod tests {
         let selection = Selection::new();
         let camera = OrbitCamera::default();
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
-        let size = renderer.size();
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        let size = renderer.size(0);
 
         // One 1x1 red texture, worn as the emissive map.
         renderer.set_textures(&device, &queue, &[TextureLayer::solid(1, 1, [255, 0, 0, 255])]);
@@ -2270,7 +2312,7 @@ mod tests {
         faces[4] = faces[4].with_emissive_map(0);
         faces[5] = faces[5].with_emissive_map(0);
         let mapped = NodeMaterials::new().with_faces(cube, faces);
-        renderer.render(&device, &queue, &mut scene, &selection, &mapped, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &mapped, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert!(
             pure_channel_pixels(&pixels, size, 0) > 0,
@@ -2280,7 +2322,7 @@ mod tests {
         // Control: the same black cube without the map gives off nothing at
         // all, which is what makes the red above the map's doing.
         let plain = NodeMaterials::new().with_faces(cube, vec![FaceShading::flat(black); 6]);
-        renderer.render(&device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert_eq!(
             pure_channel_pixels(&pixels, size, 0),
@@ -2305,8 +2347,8 @@ mod tests {
         let selection = Selection::new();
         let camera = OrbitCamera::default();
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
-        let size = renderer.size();
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        let size = renderer.size(0);
 
         // Texture 0 is white — the identity a missing specular map already
         // samples — and texture 1 is black, a highlight switched off.
@@ -2327,7 +2369,7 @@ mod tests {
             NodeMaterials::new().with_faces(cube, vec![shading; 6])
         };
         let plain = whole_cube(FaceShading::flat(grey).with_surface(highlight, [0.0; 3]));
-        renderer.render(&device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
         let without = read_pixels(&device, &queue, &renderer);
         assert!(
             bright_neutral_pixels(&without, size) > 0,
@@ -2340,7 +2382,7 @@ mod tests {
                 .with_surface(highlight, [0.0; 3])
                 .with_specular_map(0),
         );
-        renderer.render(&device, &queue, &mut scene, &selection, &white, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &white, &camera, 0.0, &[]);
         assert_eq!(
             read_pixels(&device, &queue, &renderer),
             without,
@@ -2353,7 +2395,7 @@ mod tests {
                 .with_surface(highlight, [0.0; 3])
                 .with_specular_map(1),
         );
-        renderer.render(&device, &queue, &mut scene, &selection, &black, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &black, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert_eq!(
             bright_neutral_pixels(&pixels, size),
@@ -2407,8 +2449,8 @@ mod tests {
         let selection = Selection::new();
         let camera = OrbitCamera::default();
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
-        let size = renderer.size();
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        let size = renderer.size(0);
 
         // Texture 0 is the neutral normal (0.5, 0.5, 1.0: straight out) and
         // texture 1 leans 45 degrees towards the tangent.
@@ -2428,7 +2470,7 @@ mod tests {
             NodeMaterials::new().with_faces(quad, vec![shading])
         };
         let plain = one_face(FaceShading::flat(grey));
-        renderer.render(&device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &plain, &camera, 0.0, &[]);
         let without = read_pixels(&device, &queue, &renderer);
         assert!(
             bright_neutral_pixels(&without, size) > 0,
@@ -2438,7 +2480,7 @@ mod tests {
         // The neutral texel is the identity, byte for byte: it is the same
         // "no tilt" the reserved layer gives a face with no map at all.
         let neutral = one_face(FaceShading::flat(grey).with_normal_map(0));
-        renderer.render(&device, &queue, &mut scene, &selection, &neutral, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &neutral, &camera, 0.0, &[]);
         assert_eq!(
             read_pixels(&device, &queue, &renderer),
             without,
@@ -2448,7 +2490,7 @@ mod tests {
         // A 45 degree lean changes the shading, which it can only do through a
         // frame the fragment stage read back from the quad's own UVs.
         let tilted = one_face(FaceShading::flat(grey).with_normal_map(1));
-        renderer.render(&device, &queue, &mut scene, &selection, &tilted, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &tilted, &camera, 0.0, &[]);
         assert_ne!(
             read_pixels(&device, &queue, &renderer),
             without,
@@ -2463,7 +2505,7 @@ mod tests {
             return;
         };
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
+        renderer.resize(&device, 0, [TARGET, TARGET]);
 
         // A green layer whose pixel buffer is far too short: the renderer fills
         // it white rather than leaving the layer as it was.
@@ -2482,7 +2524,7 @@ mod tests {
         let white = [1.0, 1.0, 1.0, 1.0];
         let materials =
             NodeMaterials::new().with_faces(cube, vec![FaceShading::textured(white, 1); 6]);
-        renderer.render(&device, &queue, &mut scene, &selection, &materials, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &materials, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert_eq!(
             pure_channel_pixels(&pixels, [TARGET, TARGET], 1),
@@ -2500,7 +2542,7 @@ mod tests {
         // the sample clamps to the last reserved layer, black, so the white the
         // last frame showed is gone — which is what says the rebuilt array is
         // the one being sampled.
-        renderer.render(&device, &queue, &mut scene, &selection, &materials, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &materials, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert_eq!(
             bright_neutral_pixels(&pixels, [TARGET, TARGET]),
@@ -2510,7 +2552,7 @@ mod tests {
         // A face with no map at all still comes out white: the diffuse identity
         // layer is one of the reserved ones.
         let flat = NodeMaterials::new().with_faces(cube, vec![FaceShading::flat(white); 6]);
-        renderer.render(&device, &queue, &mut scene, &selection, &flat, &camera, 0.0, &[]);
+        renderer.render(0, &device, &queue, &mut scene, &selection, &flat, &camera, 0.0, &[]);
         let pixels = read_pixels(&device, &queue, &renderer);
         assert!(bright_neutral_pixels(&pixels, [TARGET, TARGET]) > 0);
     }
@@ -2522,18 +2564,18 @@ mod tests {
             return;
         };
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        assert_eq!(renderer.size(), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
-        renderer.resize(&device, [0, 0]);
-        assert_eq!(renderer.size(), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
-        renderer.resize(&device, [200, 100]);
-        assert_eq!(renderer.size(), [200, 100]);
+        assert_eq!(renderer.size(0), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
+        renderer.resize(&device, 0, [0, 0]);
+        assert_eq!(renderer.size(0), [MIN_TARGET_DIM, MIN_TARGET_DIM]);
+        renderer.resize(&device, 0, [200, 100]);
+        assert_eq!(renderer.size(0), [200, 100]);
         // Clamped to the maximum.
-        renderer.resize(&device, [u32::MAX, 10]);
-        assert_eq!(renderer.size(), [MAX_TARGET_DIM, 10]);
+        renderer.resize(&device, 0, [u32::MAX, 10]);
+        assert_eq!(renderer.size(0), [MAX_TARGET_DIM, 10]);
         // Idempotent.
-        let before = renderer.color_texture().width();
-        renderer.resize(&device, [MAX_TARGET_DIM, 10]);
-        assert_eq!(renderer.color_texture().width(), before);
+        let before = renderer.color_texture(0).width();
+        renderer.resize(&device, 0, [MAX_TARGET_DIM, 10]);
+        assert_eq!(renderer.color_texture(0).width(), before);
     }
 
     #[test]
@@ -2553,10 +2595,11 @@ mod tests {
         let camera = OrbitCamera::default();
         let mut renderer = GpuRenderer::new(&device, &queue, samples);
         assert_eq!(renderer.samples(), samples);
-        renderer.resize(&device, [TARGET, TARGET]);
-        assert_eq!(renderer.size(), [TARGET, TARGET]);
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        assert_eq!(renderer.size(0), [TARGET, TARGET]);
 
         let stats = renderer.render(
+            0,
             &device,
             &queue,
             &mut scene,
@@ -2571,7 +2614,7 @@ mod tests {
         // leaves this black (or fails validation before we get here).
         let pixels = read_pixels(&device, &queue, &renderer);
         assert!(
-            bright_neutral_pixels(&pixels, renderer.size()) > 0,
+            bright_neutral_pixels(&pixels, renderer.size(0)) > 0,
             "nothing resolved into the color target with {samples}x MSAA"
         );
     }
@@ -2630,7 +2673,7 @@ mod tests {
         let camera = front_camera();
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
+        renderer.resize(&device, 0, [TARGET, TARGET]);
         let centre = [TARGET as f32 / 2.0, TARGET as f32 / 2.0];
         let front_face = PickElement::Face { node: front, face: 0 };
         let back_face = PickElement::Face { node: back, face: 0 };
@@ -2638,23 +2681,23 @@ mod tests {
         // The nearer quad's face is the only thing under a cursor at the
         // centre: the other is behind it, and the quad corners are ~15 px away
         // so no vertex element can reach the patch.
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 4);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, centre, 4);
         assert_eq!(hits, vec![front_face], "the near face must win");
 
         // A cursor clear of every quad resolves nothing at all.
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, [2.0, 2.0], 4);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, [2.0, 2.0], 4);
         assert!(hits.is_empty(), "empty space picked {hits:?}");
 
         // Hiding the near node lets the pick fall through to the visible one.
         scene.get_mut(front).unwrap().visible = false;
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 4);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, centre, 4);
         assert_eq!(hits, vec![back_face], "the pick must follow visibility");
         scene.get_mut(front).unwrap().visible = true;
 
         // Reversing the near quad's winding back-culls it from the frame, so
         // the pick must not find it either.
         scene.get_mut(front).unwrap().mesh_mut().unwrap().faces[0].corners.reverse();
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 4);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, centre, 4);
         assert_eq!(hits, vec![back_face], "a back-culled face must not be pickable");
     }
 
@@ -2673,13 +2716,13 @@ mod tests {
         let camera = front_camera();
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
-        let size = renderer.size();
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        let size = renderer.size(0);
 
         // A cursor on the quad's (-1,-1) corner picks that vertex, not the face
         // covering the same pixel.
         let corner = pixel_of(&camera, size, Vec3::new(-1.0, -1.0, 0.0));
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, corner, 2);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, corner, 2);
         assert_eq!(
             hits.first(),
             Some(&PickElement::Vertex { node: quad, vertex: 0 }),
@@ -2689,7 +2732,7 @@ mod tests {
         // The loose vertex projects to the centre pixel, but it sits behind the
         // quad there: the frame does not show it, so the pick must not find it.
         let centre = pixel_of(&camera, size, Vec3::ZERO);
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 2);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, centre, 2);
         assert!(
             hits.iter().all(|e| !matches!(e, PickElement::Vertex { node, .. } if *node == loose)),
             "an occluded vertex was picked: {hits:?}"
@@ -2700,7 +2743,7 @@ mod tests {
         // face there, so it resolves — while the same vertex behind the quad
         // did not.
         scene.get_mut(loose).unwrap().set_translation(Vec3::new(0.0, 0.0, 1.0));
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, centre, 2);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, centre, 2);
         assert!(
             hits.contains(&PickElement::Vertex { node: loose, vertex: 0 }),
             "a vertex in front of the surface must be picked: {hits:?}"
@@ -2725,33 +2768,33 @@ mod tests {
         let camera = front_camera();
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
+        renderer.resize(&device, 0, [TARGET, TARGET]);
         let all = [0, 0, TARGET, TARGET];
 
         // Over the whole viewport the frame shows one of the two quads, so
         // one face is all a rectangle may select.
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Face);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, all, SelectLevel::Face);
         assert_eq!(hits, vec![PickElement::Face { node: front, face: 0 }]);
 
         // A corner rectangle, clear of both quads, selects nothing.
         let corner = [0, 0, 8, 8];
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, corner, SelectLevel::Face);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, corner, SelectLevel::Face);
         assert!(hits.is_empty(), "empty space selected {hits:?}");
 
         // A rectangle of no width, or one inside out, never reaches the pass.
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, [4, 4, 4, 20], SelectLevel::Face);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, [4, 4, 4, 20], SelectLevel::Face);
         assert!(hits.is_empty());
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, [20, 20, 4, 4], SelectLevel::Face);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, [20, 20, 4, 4], SelectLevel::Face);
         assert!(hits.is_empty());
 
         // Hiding the near node lets the rectangle see the far one instead.
         scene.get_mut(front).unwrap().visible = false;
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Face);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, all, SelectLevel::Face);
         assert_eq!(hits, vec![PickElement::Face { node: back, face: 0 }]);
 
         // With the near quad hidden, an edge rectangle finds the far quad's
         // four edges — the lines the frame draws there, and nothing else.
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
         assert_eq!(hits, vec![
             PickElement::Edge { node: back, edge: 0 },
             PickElement::Edge { node: back, edge: 1 },
@@ -2771,8 +2814,8 @@ mod tests {
         let camera = front_camera();
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
-        let size = renderer.size();
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        let size = renderer.size(0);
 
         // A small rectangle around the quad's (-1,-1) corner. The vertex point
         // pass draws one pixel there; a face rectangle must still find the
@@ -2781,7 +2824,7 @@ mod tests {
         let x = corner[0].floor().max(0.0) as u32;
         let y = corner[1].floor().max(0.0) as u32;
         let around = [x.saturating_sub(1), y.saturating_sub(1), x + 2, y + 2];
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, around, SelectLevel::Face);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, around, SelectLevel::Face);
         assert_eq!(
             hits,
             vec![PickElement::Face { node: quad, face: 0 }],
@@ -2791,7 +2834,7 @@ mod tests {
         // The same rectangle at vertex level finds the corner vertex, and
         // answers with vertices alone: the face pixels are only there to hide
         // the vertices the frame does not show.
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, around, SelectLevel::Vertex);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, around, SelectLevel::Vertex);
         assert!(
             hits.contains(&PickElement::Vertex { node: quad, vertex: 0 }),
             "the corner vertex is not in {hits:?}"
@@ -2815,12 +2858,12 @@ mod tests {
         let camera = front_camera();
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
+        renderer.resize(&device, 0, [TARGET, TARGET]);
         let all = [0, 0, TARGET, TARGET];
 
         // The quad's four vertices are inside the rectangle; the loose one
         // sits behind the quad's face, which the frame draws over it.
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
         for vertex in 0..4 {
             assert!(
                 hits.contains(&PickElement::Vertex { node: quad, vertex }),
@@ -2834,7 +2877,7 @@ mod tests {
 
         // In front of the quad it is drawn, so it is inside the rectangle.
         scene.get_mut(loose).unwrap().set_translation(Vec3::new(0.0, 0.0, 1.0));
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
         assert!(
             hits.contains(&PickElement::Vertex { node: loose, vertex: 0 }),
             "a visible vertex must be selected: {hits:?}"
@@ -2855,14 +2898,14 @@ mod tests {
         let camera = front_camera();
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
+        renderer.resize(&device, 0, [TARGET, TARGET]);
         let all = [0, 0, TARGET, TARGET];
 
         // The near quad hides the far one completely, and what the frame shows
         // is its four edges. Finding exactly them is also the proof that a
         // line wins the pixels it lies on: the face underneath is at the same
         // depth, and would otherwise swallow every edge pixel.
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
         assert_eq!(hits, vec![
             PickElement::Edge { node: front, edge: 0 },
             PickElement::Edge { node: front, edge: 1 },
@@ -2872,7 +2915,7 @@ mod tests {
 
         // Hiding the near node lets the far one's edges answer instead.
         scene.get_mut(front).unwrap().visible = false;
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, all, SelectLevel::Edge);
         assert_eq!(hits, vec![
             PickElement::Edge { node: back, edge: 0 },
             PickElement::Edge { node: back, edge: 1 },
@@ -2882,7 +2925,7 @@ mod tests {
 
         // Line pixels are no vertex pixels: a vertex rectangle answers with
         // vertices alone everywhere the lines run.
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, all, SelectLevel::Vertex);
         assert!(!hits.is_empty());
         assert!(
             hits.iter().all(|e| matches!(e, PickElement::Vertex { .. })),
@@ -2891,9 +2934,9 @@ mod tests {
 
         // A corner rectangle clear of the quad, and one with no width at all,
         // select no edges.
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, [0, 0, 8, 8], SelectLevel::Edge);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, [0, 0, 8, 8], SelectLevel::Edge);
         assert!(hits.is_empty(), "empty space selected {hits:?}");
-        let hits = renderer.pick_rect(&device, &queue, &mut scene, &camera, [30, 30, 30, 40], SelectLevel::Edge);
+        let hits = renderer.pick_rect(0, &device, &queue, &mut scene, &camera, [30, 30, 30, 40], SelectLevel::Edge);
         assert!(hits.is_empty());
     }
 
@@ -2908,14 +2951,14 @@ mod tests {
         let camera = front_camera();
 
         let mut renderer = GpuRenderer::new(&device, &queue, 1);
-        renderer.resize(&device, [TARGET, TARGET]);
-        let size = renderer.size();
+        renderer.resize(&device, 0, [TARGET, TARGET]);
+        let size = renderer.size(0);
 
         // The middle of the quad's top side (positions 2 → 3): the line pass
         // draws the edge over the face at the same depth, so the nearest hit
         // is that edge — edge 2 of the quad's four.
         let cursor = pixel_of(&camera, size, Vec3::new(0.0, 1.0, 0.0));
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, cursor, 2);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, cursor, 2);
         assert_eq!(
             hits.first(),
             Some(&PickElement::Edge { node: quad, edge: 2 }),
@@ -2928,7 +2971,7 @@ mod tests {
 
         // The middle of the quad is its face, well clear of every edge.
         let cursor = pixel_of(&camera, size, Vec3::ZERO);
-        let hits = renderer.pick(&device, &queue, &mut scene, &camera, cursor, 2);
+        let hits = renderer.pick(0, &device, &queue, &mut scene, &camera, cursor, 2);
         assert_eq!(hits.first(), Some(&PickElement::Face { node: quad, face: 0 }));
         assert!(
             hits.iter().all(|e| !matches!(e, PickElement::Edge { .. })),

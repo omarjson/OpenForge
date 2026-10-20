@@ -29,6 +29,100 @@ const ORTHO_EYE: f32 = 500.0;
 /// free perspective. Each is the same camera at a fixed pair of angles with a
 /// different projection, so picking, the gizmo and the grid all keep working:
 /// they only ever read [`Camera::view_proj`] and [`Camera::ray_from_ndc`].
+/// How the viewport area is split into panes.
+///
+/// The reference application calls these *Layout 1*, *Layout 2* and *Layout 3*:
+/// one viewport, two side by side, and four in a grid. Each pane keeps its own
+/// camera, so the projections are independent — which is the point of them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LayoutKind {
+    /// One viewport, the whole area.
+    #[default]
+    One,
+    /// Two viewports side by side.
+    Two,
+    /// Four viewports in a grid.
+    Four,
+}
+
+impl LayoutKind {
+    /// Every layout, in the order the menu lists them.
+    pub const ALL: [LayoutKind; 3] = [LayoutKind::One, LayoutKind::Two, LayoutKind::Four];
+
+    /// How many viewports the layout has.
+    pub fn panes(self) -> usize {
+        match self {
+            LayoutKind::One => 1,
+            LayoutKind::Two => 2,
+            LayoutKind::Four => 4,
+        }
+    }
+
+    /// The name the menu shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            LayoutKind::One => "Layout 1",
+            LayoutKind::Two => "Layout 2",
+            LayoutKind::Four => "Layout 3",
+        }
+    }
+}
+
+/// The gap between two panes, in points.
+pub const PANE_GUTTER: f32 = 4.0;
+
+/// The panes the viewport area is split into: the pane each one shows and the
+/// rectangle it takes, in reading order.
+///
+/// A maximized layout gives the whole area to the active pane, which is what
+/// the reference application's *Maximize/Restore* does.
+pub fn pane_rects(
+    area: egui::Rect,
+    layout: LayoutKind,
+    maximized: bool,
+    active: usize,
+) -> Vec<(usize, egui::Rect)> {
+    if maximized {
+        return vec![(active, area)];
+    }
+    match layout {
+        LayoutKind::One => vec![(0, area)],
+        LayoutKind::Two => {
+            let w = (area.width() - PANE_GUTTER).max(1.0) * 0.5;
+            let left = egui::Rect::from_min_max(
+                area.min,
+                egui::pos2(area.left() + w, area.bottom()),
+            );
+            let right = egui::Rect::from_min_max(
+                egui::pos2(area.left() + w + PANE_GUTTER, area.top()),
+                area.max,
+            );
+            vec![(0, left), (1, right)]
+        }
+        LayoutKind::Four => {
+            let w = (area.width() - PANE_GUTTER).max(1.0) * 0.5;
+            let h = (area.height() - PANE_GUTTER).max(1.0) * 0.5;
+            let (x0, x1) = (area.left(), area.left() + w + PANE_GUTTER);
+            let (y0, y1) = (area.top(), area.top() + h + PANE_GUTTER);
+            vec![
+                (0, egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x0 + w, y0 + h))),
+                (1, egui::Rect::from_min_max(egui::pos2(x1, y0), egui::pos2(x1 + w, y0 + h))),
+                (2, egui::Rect::from_min_max(egui::pos2(x0, y1), egui::pos2(x0 + w, y1 + h))),
+                (3, egui::Rect::from_min_max(egui::pos2(x1, y1), egui::pos2(x1 + w, y1 + h))),
+            ]
+        }
+    }
+}
+
+/// The pane under `pos`, if any.
+pub fn pane_at(rects: &[(usize, egui::Rect)], pos: egui::Pos2) -> Option<usize> {
+    rects
+        .iter()
+        .find(|(_, rect)| rect.contains(pos))
+        .map(|(pane, _)| *pane)
+}
+
+/// A camera, one per pane.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum ViewKind {
     /// The free orbit camera.
@@ -2370,5 +2464,74 @@ mod tests {
         );
     }
 
-}
+    #[test]
+    fn the_layout_splits_the_area_into_panes() {
+        let area = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0));
 
+        // One pane: the whole area.
+        let rects = pane_rects(area, LayoutKind::One, false, 0);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, 0);
+        assert_eq!(rects[0].1, area);
+
+        // Two: side by side, with a gutter between them.
+        let rects = pane_rects(area, LayoutKind::Two, false, 0);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].0, 0);
+        assert_eq!(rects[1].0, 1);
+        assert!(rects[0].1.right() < rects[1].1.left(), "the panes do not overlap");
+        assert_eq!(
+            rects[1].1.left() - rects[0].1.right(),
+            PANE_GUTTER,
+            "and a gutter separates them"
+        );
+        assert_eq!(rects[0].1.height(), area.height());
+        assert!((rects[0].1.width() - rects[1].1.width()).abs() < 0.01, "evenly split");
+
+        // Four: a grid, two by two.
+        let rects = pane_rects(area, LayoutKind::Four, false, 0);
+        assert_eq!(rects.len(), 4);
+        assert_eq!(
+            rects.iter().map(|(pane, _)| *pane).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert!(rects[0].1.right() < rects[1].1.left());
+        assert!(rects[0].1.bottom() < rects[2].1.top());
+        // And every pane is the same size.
+        let first = rects[0].1.size();
+        for (_, rect) in &rects {
+            assert!((rect.size() - first).abs().max_elem() < 0.01, "the panes are even");
+        }
+
+        // A maximized layout gives the whole area to the active pane.
+        let rects = pane_rects(area, LayoutKind::Four, true, 2);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].0, 2, "the active pane is the one shown");
+        assert_eq!(rects[0].1, area);
+    }
+
+    #[test]
+    fn the_pane_under_the_pointer_is_the_one_it_names() {
+        let area = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1000.0, 800.0));
+        let rects = pane_rects(area, LayoutKind::Two, false, 0);
+        assert_eq!(pane_at(&rects, egui::pos2(100.0, 100.0)), Some(0));
+        assert_eq!(pane_at(&rects, egui::pos2(900.0, 100.0)), Some(1));
+        // The gutter between the panes belongs to neither.
+        let gutter = (rects[0].1.right() + rects[1].1.left()) * 0.5;
+        assert_eq!(pane_at(&rects, egui::pos2(gutter, 100.0)), None);
+        // Outside the area: nothing.
+        assert_eq!(pane_at(&rects, egui::pos2(-10.0, 100.0)), None);
+    }
+
+    #[test]
+    fn the_layouts_name_themselves_and_count_their_panes() {
+        assert_eq!(LayoutKind::default(), LayoutKind::One);
+        assert_eq!(LayoutKind::ALL.len(), 3);
+        assert_eq!(LayoutKind::One.panes(), 1);
+        assert_eq!(LayoutKind::Two.panes(), 2);
+        assert_eq!(LayoutKind::Four.panes(), 4);
+        let names: Vec<&str> = LayoutKind::ALL.iter().map(|l| l.label()).collect();
+        assert_eq!(names, vec!["Layout 1", "Layout 2", "Layout 3"]);
+    }
+
+}

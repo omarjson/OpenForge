@@ -297,7 +297,6 @@ pub struct OpenForgeApp {
     scene: Scene,
     selection: Selection,
     undo: UndoStack<AppSnapshot>,
-    camera: Camera,
     tool: ActiveTool,
     /// Scene state captured at the start of the current edit (for undo).
     edit_before: Option<Scene>,
@@ -414,6 +413,14 @@ pub struct OpenForgeApp {
     /// The theme the egui context currently carries, so a changed one is
     /// applied once rather than re-styling every frame.
     applied_theme: Option<Theme>,
+    /// One camera per viewport pane, so each pane has its own view.
+    cameras: [Camera; 4],
+    /// Which pane the pointer is in — the one the tools work through.
+    active_pane: usize,
+    /// How the viewport area is split.
+    layout: viewport::LayoutKind,
+    /// Whether the active pane takes the whole area.
+    maximized: bool,
     /// The window's size in points, as the last frame saw it — what the
     /// workspace record keeps so the next start comes back the same size.
     window_size: [f32; 2],
@@ -455,7 +462,6 @@ impl OpenForgeApp {
             scene,
             selection: Selection::new(),
             undo: UndoStack::new(100),
-            camera: Camera::default(),
             tool: ActiveTool::Select,
             edit_before: None,
             status: format!(
@@ -475,6 +481,10 @@ impl OpenForgeApp {
             dirty: true,
             show_outliner: true,
             show_properties: true,
+            cameras: [Camera::default(); 4],
+            active_pane: 0,
+            layout: viewport::LayoutKind::One,
+            maximized: false,
             window_size: [1280.0, 800.0],
             select_through: false,
             axes: gizmo::Axes::World,
@@ -2593,8 +2603,16 @@ impl OpenForgeApp {
         }
         let Some(state) = render_state else { return None };
         let Some(gpu) = self.gpu.as_mut() else { return None };
-        let camera = gpu_viewport::orbit_camera(&self.camera);
-        let hits = gpu.pick(state, rect, pos, scale, &mut self.scene, &camera);
+        let camera = gpu_viewport::orbit_camera(&self.cameras[self.active_pane]);
+        let hits = gpu.pick(
+            state,
+            self.active_pane,
+            rect,
+            pos,
+            scale,
+            &mut self.scene,
+            &camera,
+        );
         gpu_viewport::chosen_hit(level, &hits)
     }
 
@@ -2621,12 +2639,13 @@ impl OpenForgeApp {
                 SelectLevel::Face => viewport::pick_face(&mut self.scene, ray)
                     .map(|hit| PickElement::Face { node: hit.node, face: hit.face }),
                 SelectLevel::Vertex => {
-                    let tol = (self.camera.distance * 0.02).max(0.01);
-                    viewport::pick_vertex(&mut self.scene, ray, self.camera.eye(), tol)
+                    let camera = self.cameras[self.active_pane].clone();
+                    let tol = (camera.distance * 0.02).max(0.01);
+                    viewport::pick_vertex(&mut self.scene, ray, camera.eye(), tol)
                         .map(|hit| PickElement::Vertex { node: hit.node, vertex: hit.vertex })
                 }
                 SelectLevel::Edge => {
-                    let tol = (self.camera.distance * 0.02).max(0.01);
+                    let tol = (self.camera().distance * 0.02).max(0.01);
                     viewport::pick_edge(&mut self.scene, ray, tol)
                         .map(|hit| PickElement::Edge { node: hit.node, edge: hit.edge })
                 }
@@ -2657,10 +2676,11 @@ impl OpenForgeApp {
             // Select Through sends the rectangle to the projection below, so
             // the walk through the ID pass is skipped, not re-run.
             if Self::occluding_picks(self.select_through, true) {
-                let camera = gpu_viewport::orbit_camera(&self.camera);
+                let camera = gpu_viewport::orbit_camera(&self.cameras[self.active_pane]);
                 return gpu
                     .pick_rect(
                         state,
+                        self.active_pane,
                         rect,
                         box_.min,
                         box_.max,
@@ -2735,7 +2755,7 @@ impl OpenForgeApp {
         self.cursor_ray = ui
             .input(|i| i.pointer.hover_pos())
             .filter(|p| rect.contains(*p))
-            .map(|p| Self::pick_ray(&self.camera, p, rect, aspect));
+            .map(|p| Self::pick_ray(self.camera(), p, rect, aspect));
 
         // Camera controls: middle mouse orbits, shift+middle pans, scroll zooms.
         let middle = response.dragged_by(egui::PointerButton::Middle);
@@ -2755,7 +2775,7 @@ impl OpenForgeApp {
         // hit-testing below and the painting later in the frame, so the arm that
         // lights up is exactly the arm that was grabbed.
         let size = [rect.width(), rect.height()];
-        let vp = self.camera.view_proj(aspect);
+        let vp = self.camera().view_proj(aspect);
         let gizmo_mode = match self.tool {
             ActiveTool::Select => None,
             ActiveTool::Move => Some(TransformMode::Move),
@@ -2778,7 +2798,7 @@ impl OpenForgeApp {
         let basis = self.gizmo_basis();
         let frame = match (gizmo_mode, origin) {
             (Some(_), Some(origin)) => Some(gizmo::Frame::for_camera(
-                &self.camera,
+                self.camera(),
                 rect.height(),
                 gizmo::HANDLE_PIXELS,
                 origin,
@@ -2827,7 +2847,7 @@ impl OpenForgeApp {
         if self.gizmo.is_dragging() {
             consumed = true;
             if let Some(pos) = cursor {
-                let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
+                let ray = Self::pick_ray(self.camera(), pos, rect, aspect);
                 // Snapping is resolved per frame, so a held modifier takes
                 // effect the moment it goes down or comes up, mid-drag.
                 let snap = if ui.input(|i| i.modifiers.ctrl) {
@@ -2857,8 +2877,8 @@ impl OpenForgeApp {
                     None => None,
                 };
                 if let Some(handle) = handle {
-                    let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
-                    let view = self.camera.forward();
+                    let ray = Self::pick_ray(self.camera(), pos, rect, aspect);
+                    let view = self.camera().forward();
                     if let Some(anchor) =
                         gizmo::Anchor::new(mode, handle, frame.origin, frame.basis, ray, view)
                     {
@@ -2906,7 +2926,8 @@ impl OpenForgeApp {
         let mut marquee_pick: Option<(egui::Pos2, egui::Pos2)> = None;
         if let Some(pos) = response.interact_pointer_pos() {
             let ndc = Self::viewport_ndc(pos, rect);
-            let ray = Self::pick_ray(&self.camera, pos, rect, aspect);
+            let camera = self.cameras[self.active_pane].clone();
+            let ray = Self::pick_ray(&camera, pos, rect, aspect);
             let pointer = Pointer { ray, ndc };
 
             // Rectangle selection: in the Select tool a primary drag draws a
@@ -2985,7 +3006,7 @@ impl OpenForgeApp {
             let box_ = egui::Rect::from_two_pos(a, b);
             let scale = ui.ctx().pixels_per_point();
             if box_.width() <= 0.0 && box_.height() <= 0.0 {
-                let ray = Self::pick_ray(&self.camera, b, rect, aspect);
+                let ray = Self::pick_ray(self.camera(), b, rect, aspect);
                 if let Some(element) = self.resolve_click(render_state, rect, ray, b, scale, level)
                 {
                     self.apply_marquee(level, &[element], false);
@@ -3036,10 +3057,10 @@ impl OpenForgeApp {
         };
     }
 
-    fn paint_viewport(&mut self, ui: &mut egui::Ui, rect: egui::Rect) {
+    fn paint_viewport(&mut self, ui: &mut egui::Ui, rect: egui::Rect, pane: usize) {
         let size = [rect.width(), rect.height()];
         let aspect = size[0] / size[1].max(1.0);
-        let vp = self.camera.view_proj(aspect);
+        let vp = self.cameras[pane].view_proj(aspect);
         let painter = ui.painter_at(rect);
 
         // Clip to the viewport.
@@ -3050,7 +3071,7 @@ impl OpenForgeApp {
 
         // Collect and depth-sort triangles (painter's algorithm).
         self.tris = viewport::collect_triangles(&mut self.scene, &self.selection);
-        let cam = self.camera.eye();
+        let cam = self.camera().eye();
         let mut order: Vec<(f32, usize)> = Vec::with_capacity(self.tris.len());
         for (i, t) in self.tris.iter().enumerate() {
             let centroid = (t.v[0].pos + t.v[1].pos + t.v[2].pos) / 3.0;
@@ -3137,21 +3158,24 @@ impl OpenForgeApp {
         }
 
         // Overlay selected vertices as small dots (vertex level editing aid).
-        self.paint_vertex_dots(&painter, rect);
+        self.paint_vertex_dots(&painter, rect, pane);
         self.paint_wireframe(&painter, rect);
         // The picked edges over that, in the element highlight (edge level
         // editing aid): drawn last so the bold line wins where they overlap.
-        self.paint_selected_edges(&painter, rect);
+        self.paint_selected_edges(&painter, rect, pane);
         // The transform gizmo sits above the geometry so its handles stay
-        // grabbable even when they overlap the mesh.
-        self.paint_gizmo(&painter, rect);
-        self.paint_marquee(&painter);
+        // grabbable even when they overlap the mesh — and it belongs to the
+        // pane the tools work through.
+        if pane == self.active_pane {
+            self.paint_gizmo(&painter, rect);
+            self.paint_marquee(&painter);
+        }
 
         // Overlay label: which projection this viewport shows, and what is in
         // it.
         let label = format!(
             "{}  |  {} tris  |  {} selected",
-            self.camera.view.label(),
+            self.cameras[pane].view.label(),
             self.tris.len(),
             self.selection.node_count()
         );
@@ -3169,8 +3193,39 @@ impl OpenForgeApp {
     /// gizmo read the same view matrix either way, and the corner label is
     /// what tells the user which projection is showing.
     fn set_view(&mut self, view: viewport::ViewKind) {
-        self.camera.set_view(view);
+        self.camera_mut().set_view(view);
         self.dirty = true;
+    }
+
+    /// Split the viewport area into panes, or back to one.
+    fn set_layout(&mut self, layout: viewport::LayoutKind) {
+        self.layout = layout;
+        self.maximized = false;
+        self.dirty = true;
+        self.status = format!("Viewport layout: {}.", layout.label());
+    }
+
+    /// Give the active pane the whole area, or give the panes back.
+    fn set_maximized(&mut self, maximized: bool) {
+        self.maximized = maximized;
+        self.dirty = true;
+        self.status = if maximized {
+            "Pane maximized.".into()
+        } else {
+            "Panes restored.".into()
+        };
+    }
+
+    /// The camera of the pane the pointer is in — the one the tools and the
+    /// picks work through.
+    fn camera(&self) -> &Camera {
+        &self.cameras[self.active_pane]
+    }
+
+    /// The same camera, mutably: the orbit, the pan and the zoom change the
+    /// pane they happen in.
+    fn camera_mut(&mut self) -> &mut Camera {
+        &mut self.cameras[self.active_pane]
     }
 
     /// The gizmo's origin when no pivot is placed: a sub-object selection's
@@ -3204,7 +3259,7 @@ impl OpenForgeApp {
                 .and_then(|id| self.scene.world_matrix(id).ok())
                 .map(gizmo::Basis::of_matrix)
                 .unwrap_or(gizmo::Basis::WORLD),
-            gizmo::Axes::Screen => gizmo::Basis::of_camera(&self.camera),
+            gizmo::Axes::Screen => gizmo::Basis::of_camera(self.camera()),
         }
     }
 
@@ -3275,17 +3330,18 @@ impl OpenForgeApp {
     fn drag_camera(&mut self, delta: egui::Vec2, shift: bool) {
         if shift {
             let speed = self.settings.pan_step();
-            self.camera.pan(delta.x * speed, delta.y * speed);
+            self.camera_mut().pan(delta.x * speed, delta.y * speed);
         } else {
             let speed = self.settings.orbit_step();
-            self.camera.orbit(delta.x * speed, delta.y * speed);
+            self.camera_mut().orbit(delta.x * speed, delta.y * speed);
         }
         self.dirty = true;
     }
 
     /// Scroll on the viewport: zoom, through the settings' multiplier.
     fn scroll_camera(&mut self, scroll: f32) {
-        self.camera.zoom(scroll * 0.01 * self.settings.zoom_step());
+        let step = self.settings.zoom_step();
+        self.camera_mut().zoom(scroll * 0.01 * step);
         self.dirty = true;
     }
 
@@ -3729,7 +3785,7 @@ impl OpenForgeApp {
                             let label =
                                 format!("{} ({:?})", view.label(), view.hotkey());
                             if ui
-                                .selectable_label(self.camera.view == view, label)
+                                .selectable_label(self.camera().view == view, label)
                                 .on_hover_text(if view.is_ortho() {
                                     "Axis-aligned orthographic view"
                                 } else {
@@ -3740,6 +3796,31 @@ impl OpenForgeApp {
                                 self.set_view(view);
                                 ui.close_menu();
                             }
+                        }
+                    });
+                    ui.menu_button("Layout", |ui| {
+                        for layout in viewport::LayoutKind::ALL {
+                            if ui
+                                .selectable_label(self.layout == layout, layout.label())
+                                .on_hover_text(format!(
+                                    "{} viewport{}",
+                                    layout.panes(),
+                                    if layout.panes() == 1 { "" } else { "s" }
+                                ))
+                                .clicked()
+                            {
+                                self.set_layout(layout);
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        if ui
+                            .selectable_label(self.maximized, "Maximize / Restore")
+                            .on_hover_text("Give the active pane the whole area, and back")
+                            .clicked()
+                        {
+                            self.set_maximized(!self.maximized);
+                            ui.close_menu();
                         }
                     });
                     ui.menu_button("Axes Mode", |ui| {
@@ -3825,7 +3906,7 @@ impl OpenForgeApp {
                         ui.close_menu();
                     }
                     if ui.button("Reset Camera").clicked() {
-                        self.camera = Camera::default();
+                        *self.camera_mut() = Camera::default();
                         self.dirty = true;
                         ui.close_menu();
                     }
@@ -5278,66 +5359,99 @@ impl OpenForgeApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::none())
             .show(ctx, |ui| {
-                let rect = ui.available_rect_before_wrap();
-                if rect.width() < 1.0 || rect.height() < 1.0 {
+                let area = ui.available_rect_before_wrap();
+                if area.width() < 1.0 || area.height() < 1.0 {
                     return;
                 }
-                self.handle_viewport_input(ui, rect, render_state);
-
-                // Render offscreen with wgpu when a device is available, and
-                // fall back to the CPU painter when it is not. Both paths show
-                // the same scene through the same camera state, so the only
-                // difference is shading quality and depth correctness.
-                // The per-face colours have to be resolved before `gpu` is
-                // borrowed mutably, and only the GPU path needs them.
-                // Textures upload on the library's revision, not per frame.
-                if let Some(state) = render_state {
-                    self.sync_gpu_textures(state);
+                // The viewport area, split into panes. Each pane has its own
+                // camera, so the views are independent.
+                let rects = viewport::pane_rects(area, self.layout, self.maximized, self.active_pane);
+                // The pane the pointer is in is the one the tools work
+                // through.
+                if let Some(pos) = ui.input(|i| i.pointer.hover_pos()) {
+                    if let Some(pane) = viewport::pane_at(&rects, pos) {
+                        if pane != self.active_pane {
+                            self.active_pane = pane;
+                            self.dirty = true;
+                        }
+                    }
                 }
-                let colors = match (render_state, self.gpu.is_some()) {
-                    (Some(_), true) => self.node_materials(),
-                    _ => NodeMaterials::new(),
-                };
-                let rendered = match (render_state, self.gpu.as_mut()) {
-                    (Some(state), Some(gpu)) => {
-                        let scale = ui.ctx().pixels_per_point();
-                        let size = [rect.width() * scale, rect.height() * scale];
-                        let camera = gpu_viewport::orbit_camera(&self.camera);
-                        let time = ui.input(|i| i.time) as f32;
-                        // The edge overlay is part of the GPU frame itself:
-                        // the renderer draws it as depth-tested lines, so the
-                        // app does not repaint it on top (the CPU fallback
-                        // below still does).
-                        let mode = overlay_mode(self.selection.level, self.wireframe);
-                        let edge_vertices = if mode == viewport::Wireframe::Off {
-                            Vec::new()
-                        } else {
-                            let eye = self.camera.eye();
-                            let edges =
-                                viewport::collect_edges(&mut self.scene, &self.selection, mode, eye);
-                            gpu_viewport::edge_vertices(&edges)
-                        };
-                        Some(gpu.render(
-                            state,
-                            size,
-                            &mut self.scene,
-                            &self.selection,
-                            &colors,
-                            &camera,
-                            time,
-                            &edge_vertices,
-                        ))
-                    }
-                    _ => None,
-                };
+                let active_rect = rects
+                    .iter()
+                    .find(|(pane, _)| *pane == self.active_pane)
+                    .map(|(_, rect)| *rect)
+                    .unwrap_or(area);
+                self.handle_viewport_input(ui, active_rect, render_state);
 
-                match rendered {
-                    Some((texture_id, stats)) => {
-                        self.paint_gpu_viewport(ui, rect, texture_id, stats)
-                    }
-                    None => self.paint_viewport(ui, rect),
+                // Every pane is painted, each through its own camera.
+                for (pane, rect) in &rects {
+                    self.paint_pane(ui, *rect, *pane, render_state);
                 }
             });
+    }
+
+    /// Paint one viewport pane: the scene through that pane's own camera.
+    ///
+    /// Render offscreen with wgpu when a device is available, and fall back
+    /// to the CPU painter when it is not. Both paths show the same scene
+    /// through the same camera state, so the only difference is shading
+    /// quality and depth correctness.
+    fn paint_pane(
+        &mut self,
+        ui: &mut egui::Ui,
+        rect: egui::Rect,
+        pane: usize,
+        render_state: Option<&RenderState>,
+    ) {
+        // The per-face colours have to be resolved before `gpu` is borrowed
+        // mutably, and only the GPU path needs them. Textures upload on the
+        // library's revision, not per frame.
+        if let Some(state) = render_state {
+            self.sync_gpu_textures(state);
+        }
+        let colors = match (render_state, self.gpu.is_some()) {
+            (Some(_), true) => self.node_materials(),
+            _ => NodeMaterials::new(),
+        };
+        let rendered = match (render_state, self.gpu.as_mut()) {
+            (Some(state), Some(gpu)) => {
+                let scale = ui.ctx().pixels_per_point();
+                let size = [rect.width() * scale, rect.height() * scale];
+                let camera = gpu_viewport::orbit_camera(&self.cameras[pane]);
+                let time = ui.input(|i| i.time) as f32;
+                // The edge overlay is part of the GPU frame itself: the
+                // renderer draws it as depth-tested lines, so the app does
+                // not repaint it on top (the CPU fallback below still does).
+                let mode = overlay_mode(self.selection.level, self.wireframe);
+                let edge_vertices = if mode == viewport::Wireframe::Off {
+                    Vec::new()
+                } else {
+                    let eye = self.cameras[pane].eye();
+                    let edges =
+                        viewport::collect_edges(&mut self.scene, &self.selection, mode, eye);
+                    gpu_viewport::edge_vertices(&edges)
+                };
+                Some(gpu.render(
+                    state,
+                    pane,
+                    size,
+                    &mut self.scene,
+                    &self.selection,
+                    &colors,
+                    &camera,
+                    time,
+                    &edge_vertices,
+                ))
+            }
+            _ => None,
+        };
+
+        match rendered {
+            Some((texture_id, stats)) => {
+                self.paint_gpu_viewport(ui, rect, pane, texture_id, stats)
+            }
+            None => self.paint_viewport(ui, rect, pane),
+        }
     }
 
     /// Present the wgpu-rendered image and draw the CPU overlays on top of it:
@@ -5348,6 +5462,7 @@ impl OpenForgeApp {
         &mut self,
         ui: &mut egui::Ui,
         rect: egui::Rect,
+        pane: usize,
         texture_id: egui::TextureId,
         stats: FrameStats,
     ) {
@@ -5358,14 +5473,18 @@ impl OpenForgeApp {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(texture_id, rect, uv, egui::Color32::WHITE);
 
-        self.paint_vertex_dots(&painter, rect);
-        self.paint_selected_edges(&painter, rect);
-        self.paint_gizmo(&painter, rect);
-        self.paint_marquee(&painter);
+        self.paint_vertex_dots(&painter, rect, pane);
+        self.paint_selected_edges(&painter, rect, pane);
+        // The gizmo and the marquee belong to the pane the tools work
+        // through.
+        if pane == self.active_pane {
+            self.paint_gizmo(&painter, rect);
+            self.paint_marquee(&painter);
+        }
 
         let label = format!(
             "{}  |  wgpu  |  {} tris  |  {} draws  |  {} selected",
-            self.camera.view.label(),
+            self.cameras[pane].view.label(),
             stats.indices / 3,
             stats.draws,
             self.selection.node_count()
@@ -5384,14 +5503,14 @@ impl OpenForgeApp {
     ///
     /// Shared by both viewports — each projects to the same normalized device
     /// coordinates, so the dots land in the same place either way.
-    fn paint_vertex_dots(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+    fn paint_vertex_dots(&mut self, painter: &egui::Painter, rect: egui::Rect, pane: usize) {
         if self.selection.level != SelectLevel::Vertex {
             return;
         }
         let dot = 3.0f32;
         let size = [rect.width(), rect.height()];
         let aspect = size[0] / size[1].max(1.0);
-        let vp = self.camera.view_proj(aspect);
+        let vp = self.cameras[pane].view_proj(aspect);
         for id in self.selection.selected_nodes() {
             let Ok(world) = self.scene.world_matrix(id) else { continue };
             let selected = self.selection.selected_elements(id).cloned();
@@ -5421,13 +5540,13 @@ impl OpenForgeApp {
     /// same normalized device coordinates, so the line lands in the same place
     /// either way. It is drawn over the shading, unoccluded — an editing aid
     /// rather than part of the shaded image, exactly like the dots.
-    fn paint_selected_edges(&mut self, painter: &egui::Painter, rect: egui::Rect) {
+    fn paint_selected_edges(&mut self, painter: &egui::Painter, rect: egui::Rect, pane: usize) {
         if self.selection.level != SelectLevel::Edge {
             return;
         }
         let size = [rect.width(), rect.height()];
         let aspect = size[0] / size[1].max(1.0);
-        let vp = self.camera.view_proj(aspect);
+        let vp = self.cameras[pane].view_proj(aspect);
         for id in self.selection.selected_nodes() {
             let selected = self.selection.selected_elements(id).cloned();
             let Some(selected) = selected else { continue };
@@ -5477,8 +5596,8 @@ impl OpenForgeApp {
         }
         let size = [rect.width(), rect.height()];
         let aspect = size[0] / size[1].max(1.0);
-        let vp = self.camera.view_proj(aspect);
-        let eye = self.camera.eye();
+        let vp = self.camera().view_proj(aspect);
+        let eye = self.camera().eye();
         let edges = viewport::collect_edges(&mut self.scene, &self.selection, mode, eye);
         for edge in edges {
             let (Some(a), Some(b)) = (
@@ -5528,7 +5647,7 @@ impl OpenForgeApp {
         if let Some(pivot) = self.pivot {
             let size = [rect.width(), rect.height()];
             let aspect = size[0] / size[1].max(1.0);
-            let vp = self.camera.view_proj(aspect);
+            let vp = self.camera().view_proj(aspect);
             if let Some((x, y, _)) = viewport::project(vp, pivot, size) {
                 let p = rect.min + egui::vec2(x, y);
                 let color = egui::Color32::from_rgb(190, 120, 255);
@@ -7008,9 +7127,9 @@ impl OpenForgeApp {
         let ids = self.scene.all_ids();
         let b = self.scene.world_bounds(&ids);
         if !b.is_empty() {
-            self.camera.target = b.center();
+            self.camera_mut().target = b.center();
             let radius = b.size().length() * 0.5;
-            self.camera.distance = (radius * 2.5).clamp(1.0, 500.0);
+            self.camera_mut().distance = (radius * 2.5).clamp(1.0, 500.0);
             self.dirty = true;
         }
     }
@@ -7506,8 +7625,8 @@ mod tests {
     /// Point the camera straight down -Z at the origin and return where the
     /// quad's centre lands on screen.
     fn face_quad(ctx: &egui::Context, app: &mut OpenForgeApp, id: NodeId) -> egui::Pos2 {
-        app.camera.yaw = std::f32::consts::FRAC_PI_2;
-        app.camera.pitch = 0.0;
+        app.camera_mut().yaw = std::f32::consts::FRAC_PI_2;
+        app.camera_mut().pitch = 0.0;
         gizmo_origin(ctx, app, id, 0.0)
     }
 
@@ -7663,7 +7782,7 @@ mod tests {
         // projection the app picks with — confirmed, like the snapping tests
         // do, against the gizmo the frame drew.
         let size = [SCREEN[0], SCREEN[1]];
-        let vp = app.camera.view_proj(size[0] / size[1]);
+        let vp = app.camera().view_proj(size[0] / size[1]);
         let (ex, ey, _) = viewport::project(vp, Vec3::new(0.0, -1.0, 0.0), size)
             .expect("the edge midpoint is in front");
         let (cx, cy, _) = viewport::project(vp, Vec3::ZERO, size).expect("the centre is in front");
@@ -7818,7 +7937,7 @@ mod tests {
         // And the marks land on the edges themselves: the top edge joins the
         // corners (1,1,0) and (-1,1,0), the left edge (-1,-1,0) and (-1,1,0).
         let size = [SCREEN[0], SCREEN[1]];
-        let vp = app.camera.view_proj(size[0] / size[1]);
+        let vp = app.camera().view_proj(size[0] / size[1]);
         let at = |p: Vec3| {
             let (x, y, _) = viewport::project(vp, p, size).expect("the quad faces the camera");
             egui::pos2(x, y)
@@ -7948,7 +8067,7 @@ mod tests {
         // The world -> screen mapping, confirmed against the gizmo itself: the
         // handles sit on the projected bounds centre.
         let size = [SCREEN[0], SCREEN[1]];
-        let vp = app.camera.view_proj(size[0] / size[1]);
+        let vp = app.camera().view_proj(size[0] / size[1]);
         let ids: Vec<NodeId> = app.selection.selected_nodes().collect();
         let centre = app.scene.world_bounds(&ids).center();
         let layout_origin = app.gizmo.layout.as_ref().expect("handles are laid out").origin;
@@ -8007,7 +8126,7 @@ mod tests {
         let (mut app, id) = app_ready_to_move();
 
         // Pick a vertex that faces the camera, so its axis arm is grabbable.
-        let eye = app.camera.eye();
+        let eye = app.camera().eye();
         let mesh = app.scene.get(id).unwrap().mesh().unwrap().clone();
         let front = (0..mesh.positions.len())
             .max_by(|a, b| {
@@ -8222,7 +8341,7 @@ mod tests {
         assert!(d.length() > 0.05, "the centre handle moved the node: {d:?}");
         // It works in the plane facing the camera: nothing goes towards or
         // away from the eye, however the view is orbited.
-        let forward = app.camera.forward();
+        let forward = app.camera().forward();
         assert!(d.dot(forward).abs() < 0.02, "stays in the view plane: {d:?}");
         // A view plane is not a world plane, so the motion has a share of at
         // least two world axes.
@@ -8286,10 +8405,10 @@ mod tests {
         let ctx = egui::Context::default();
         let (mut app, _id) = app_ready_to_move();
         step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
-        assert_eq!(app.camera.view, ViewKind::Perspective, "and it starts free");
+        assert_eq!(app.camera().view, ViewKind::Perspective, "and it starts free");
 
         step_with_keys(&ctx, &mut app, key_frame(1.0, ViewKind::Front.hotkey()));
-        assert_eq!(app.camera.view, ViewKind::Front);
+        assert_eq!(app.camera().view, ViewKind::Front);
 
         // The corner label says which projection is showing, and the frame is
         // laid out along the view: the X arm is level with the middle and the
@@ -8312,14 +8431,14 @@ mod tests {
 
         // Back to the free camera with 0, and the orbit resumes from there.
         step_with_keys(&ctx, &mut app, key_frame(3.0, ViewKind::Perspective.hotkey()));
-        assert_eq!(app.camera.view, ViewKind::Perspective);
+        assert_eq!(app.camera().view, ViewKind::Perspective);
         app.drag_camera(egui::vec2(15.0, 0.0), false);
-        assert_eq!(app.camera.view, ViewKind::Perspective, "still free after an orbit");
+        assert_eq!(app.camera().view, ViewKind::Perspective, "still free after an orbit");
 
         // Orbiting out of a fixed view does the same thing.
         app.set_view(ViewKind::Top);
         app.drag_camera(egui::vec2(0.0, 15.0), false);
-        assert_eq!(app.camera.view, ViewKind::Perspective, "orbiting leaves the fixed view");
+        assert_eq!(app.camera().view, ViewKind::Perspective, "orbiting leaves the fixed view");
     }
 
     #[test]
@@ -8333,9 +8452,9 @@ mod tests {
         // is parallel to the view, so what is drawn is what is picked, exactly
         // as in perspective.
         let centre = laid_out_pivot(&app);
-        let ray = app.camera.ray_from_ndc(0.0, 0.0, 1.6);
+        let ray = app.camera().ray_from_ndc(0.0, 0.0, 1.6);
         assert!(
-            (ray.direction - app.camera.forward()).length() < 1e-3,
+            (ray.direction - app.camera().forward()).length() < 1e-3,
             "the ray runs along the view: {:?}",
             ray.direction
         );
@@ -8352,10 +8471,10 @@ mod tests {
         );
 
         // Zooming moves the eye nowhere; it narrows what the eye can see.
-        let before = app.camera.eye();
+        let before = app.camera().eye();
         app.scroll_camera(30.0);
-        assert!((app.camera.eye() - before).length() < 1e-3, "the eye stays put in an axis view");
-        assert!(app.camera.distance < 8.0, "zooming in got closer: {}", app.camera.distance);
+        assert!((app.camera().eye() - before).length() < 1e-3, "the eye stays put in an axis view");
+        assert!(app.camera().distance < 8.0, "zooming in got closer: {}", app.camera().distance);
     }
 
     #[test]
@@ -8660,7 +8779,7 @@ mod tests {
         app.select_through = true;
 
         let size = [SCREEN[0], SCREEN[1]];
-        let vp = app.camera.view_proj(size[0] / size[1]);
+        let vp = app.camera().view_proj(size[0] / size[1]);
         let (x, y, _) = viewport::project(vp, Vec3::new(0.0, 0.0, -1.0), size)
             .expect("behind the quad, still in front of the camera");
         let pos = egui::pos2(x, y);
@@ -8796,7 +8915,7 @@ mod tests {
         // Rank the sphere's faces by how squarely they look at the camera: the
         // facing one's edges all survive, the one turned furthest away keeps
         // none of them.
-        let eye = app.camera.eye();
+        let eye = app.camera().eye();
         let mesh = app.scene.get(id).unwrap().mesh().unwrap().clone();
         let facing = |i: usize| {
             let face = &mesh.faces[i];
@@ -9559,7 +9678,7 @@ mod tests {
         let near = span(&app, gizmo::Axis::X);
 
         // Pull the camera back and the handle keeps its pixel length.
-        app.camera.distance *= 4.0;
+        app.camera_mut().distance *= 4.0;
         step(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None));
         let far = span(&app, gizmo::Axis::X);
         assert!(
@@ -10927,7 +11046,7 @@ mod tests {
         // The ground grid follows the settings: count the lines the painter
         // actually draws through a real view-projection.
         app.settings.grid_half = 2;
-        let vp = app.camera.view_proj(800.0 / 600.0);
+        let vp = app.camera().view_proj(800.0 / 600.0);
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(800.0, 600.0));
         let mut drawn = 0;
         let _ = ctx.run(frame(0.0, egui::pos2(10.0, 10.0), None), |ctx| {
@@ -10954,39 +11073,39 @@ mod tests {
     #[test]
     fn the_camera_speed_multipliers_scale_the_drag() {
         let mut app = OpenForgeApp::with_gpu(None);
-        let base = app.camera;
+        let base = app.camera().clone();
 
         app.drag_camera(egui::vec2(10.0, 0.0), false);
-        let single = app.camera.yaw - base.yaw;
+        let single = app.camera().yaw - base.yaw;
         assert!(single > 0.0, "the drag orbited");
 
-        app.camera = base;
+        *app.camera_mut() = base.clone();
         app.settings.orbit_speed = 2.0;
         app.drag_camera(egui::vec2(10.0, 0.0), false);
-        let doubled = app.camera.yaw - base.yaw;
+        let doubled = app.camera().yaw - base.yaw;
         assert!((doubled - single * 2.0).abs() < 1e-5, "{doubled} vs {single}");
 
         // Pan moves the target, through its own multiplier.
-        app.camera = base;
+        *app.camera_mut() = base.clone();
         app.settings.orbit_speed = 1.0;
         app.drag_camera(egui::vec2(0.0, 8.0), true);
-        let slow = (app.camera.target - base.target).length();
-        app.camera = base;
+        let slow = (app.camera().target - base.target).length();
+        *app.camera_mut() = base.clone();
         app.settings.pan_speed = 3.0;
         app.drag_camera(egui::vec2(0.0, 8.0), true);
-        let fast = (app.camera.target - base.target).length();
+        let fast = (app.camera().target - base.target).length();
         assert!((fast - slow * 3.0).abs() < 1e-4, "{fast} vs {slow}");
 
         // Zoom: the faster wheel takes a bigger step, and silly values are
         // ignored rather than stranding the camera.
         app.settings.pan_speed = 1.0;
-        app.camera = base;
+        *app.camera_mut() = base.clone();
         app.scroll_camera(1.0);
-        let slow_step = base.distance - app.camera.distance;
-        app.camera = base;
+        let slow_step = base.distance - app.camera().distance;
+        *app.camera_mut() = base.clone();
         app.settings.zoom_speed = 2.0;
         app.scroll_camera(1.0);
-        let fast_step = base.distance - app.camera.distance;
+        let fast_step = base.distance - app.camera().distance;
         assert!(fast_step > slow_step, "{fast_step} vs {slow_step}");
         app.settings.zoom_speed = 0.0;
         assert_eq!(app.settings.zoom_step(), 1.0, "a zero speed reads as the default");
@@ -11711,6 +11830,69 @@ mod tests {
         assert!(!fresh.show_outliner, "and the outliner is still hidden");
         assert_eq!(fresh.settings.window_size, [1024.0, 768.0]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_split_layout_paints_a_viewport_in_each_pane() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        let one = painted_labels(&paint_once(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None)));
+        let one_viewports = one.iter().filter(|l| l.contains("tris")).count();
+        assert_eq!(one_viewports, 1, "one pane, one viewport: {one:?}");
+
+        // Two panes: two viewports, each naming the projection it shows.
+        app.set_layout(viewport::LayoutKind::Two);
+        let two = painted_labels(&paint_once(&ctx, &mut app, frame(2.0, egui::pos2(500.0, 350.0), None)));
+        let two_viewports = two.iter().filter(|l| l.contains("tris")).count();
+        assert_eq!(two_viewports, 2, "two panes, two viewports: {two:?}");
+
+        // And four.
+        app.set_layout(viewport::LayoutKind::Four);
+        let four = painted_labels(&paint_once(&ctx, &mut app, frame(3.0, egui::pos2(500.0, 350.0), None)));
+        let four_viewports = four.iter().filter(|l| l.contains("tris")).count();
+        assert_eq!(four_viewports, 4, "four panes, four viewports: {four:?}");
+    }
+
+    #[test]
+    fn the_pane_the_pointer_is_in_is_the_one_the_tools_work_through() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.set_layout(viewport::LayoutKind::Two);
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        assert_eq!(app.active_pane, 0, "the left pane is the one at first");
+
+        // The pointer moves into the right-hand pane, and that is the pane
+        // the tools work through.
+        step(&ctx, &mut app, frame(1.0, egui::pos2(900.0, 350.0), None));
+        assert_eq!(app.active_pane, 1, "the pane under the pointer is active");
+
+        // A view change lands in that pane alone: each pane keeps its own
+        // camera.
+        app.set_view(ViewKind::Front);
+        assert_eq!(app.cameras[1].view, ViewKind::Front);
+        assert_eq!(app.cameras[0].view, ViewKind::Perspective);
+    }
+
+    #[test]
+    fn maximizing_gives_the_active_pane_the_whole_area() {
+        let ctx = egui::Context::default();
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.set_layout(viewport::LayoutKind::Four);
+        step(&ctx, &mut app, frame(0.0, egui::pos2(500.0, 350.0), None));
+        let four = painted_labels(&paint_once(&ctx, &mut app, frame(1.0, egui::pos2(500.0, 350.0), None)));
+        assert_eq!(four.iter().filter(|l| l.contains("tris")).count(), 4);
+
+        app.set_maximized(true);
+        let one = painted_labels(&paint_once(&ctx, &mut app, frame(2.0, egui::pos2(500.0, 350.0), None)));
+        assert_eq!(
+            one.iter().filter(|l| l.contains("tris")).count(),
+            1,
+            "a maximized layout shows one pane: {one:?}"
+        );
+        app.set_maximized(false);
+        let back = painted_labels(&paint_once(&ctx, &mut app, frame(3.0, egui::pos2(500.0, 350.0), None)));
+        assert_eq!(back.iter().filter(|l| l.contains("tris")).count(), 4);
     }
 
 }
