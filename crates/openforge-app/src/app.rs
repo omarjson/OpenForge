@@ -1785,6 +1785,11 @@ impl OpenForgeApp {
             self.status = "Selected node has no mesh.".into();
             return;
         };
+        // Where the object stands is part of what is exported: a cube that
+        // sits at (5, 0, 0) has to land there in the file, not at the origin.
+        if let Ok(world) = self.scene.world_matrix(id) {
+            mesh.transform(world);
+        }
         options.apply(&mut mesh, false);
         let name = self
             .scene
@@ -12383,6 +12388,75 @@ mod tests {
             .map(|i| i.weight)
             .unwrap_or(0.0);
         assert!(back < after, "and the stroke took it away again: {after} -> {back}");
+    }
+
+    /// The lowest corner of an OBJ file's vertices.
+    fn obj_min(path: &std::path::Path) -> Vec3 {
+        let text = std::fs::read_to_string(path).expect("the obj reads back");
+        let mut min = Vec3::splat(f32::INFINITY);
+        for line in text.lines() {
+            let Some(rest) = line.strip_prefix("v ") else {
+                continue;
+            };
+            let n: Vec<f32> = rest
+                .split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect();
+            if n.len() >= 3 {
+                min = min.min(Vec3::new(n[0], n[1], n[2]));
+            }
+        }
+        min
+    }
+
+    #[test]
+    fn an_export_writes_the_object_where_it_stands() {
+        // The same box twice: once at the origin, once five units along X.
+        let mut reference = OpenForgeApp::with_gpu(None);
+        reference.scene = Scene::new();
+        let id = reference.scene.create_mesh("Cube", primitive_box(2.0));
+        reference.selection.select_node(id);
+        let reference_path = temp_path("obj");
+        reference.export_selected_with(reference_path.clone(), FileOptions::default());
+        assert!(reference_path.exists(), "the host filter wrote the file");
+        let reference_min = obj_min(&reference_path);
+
+        let mut app = OpenForgeApp::with_gpu(None);
+        app.scene = Scene::new();
+        let id = app.scene.create_mesh("Cube", primitive_box(2.0));
+        if let Ok(node) = app.scene.get_mut(id) {
+            node.transform.translation = Vec3::new(5.0, 0.0, 0.0);
+        }
+        app.selection.select_node(id);
+        let path = temp_path("obj");
+        app.export_selected_with(path.clone(), FileOptions::default());
+        assert!(path.exists(), "the host filter wrote the file");
+
+        // The cube landed where it stands, and only along X.
+        let min = obj_min(&path);
+        assert!(
+            (min.x - reference_min.x - 5.0).abs() < 1e-4,
+            "the cube moved along X: {min:?} vs {reference_min:?}"
+        );
+        assert!((min.y - reference_min.y).abs() < 1e-4, "and nowhere else: {min:?}");
+        assert!((min.z - reference_min.z).abs() < 1e-4, "and nowhere else: {min:?}");
+
+        // A turned and stretched object turns with it: the box's long axis,
+        // which lay along X, now lies along Z.
+        if let Ok(node) = app.scene.get_mut(id) {
+            node.transform.scale = Vec3::new(2.0, 1.0, 1.0);
+            node.transform.rotation = glam::Quat::from_rotation_y(std::f32::consts::FRAC_PI_2);
+        }
+        let turned_path = temp_path("obj");
+        app.export_selected_with(turned_path.clone(), FileOptions::default());
+        let turned = obj_min(&turned_path);
+        assert!(
+            (turned.z - (reference_min.z - 1.0)).abs() < 1e-4,
+            "the long axis lies along Z now: {turned:?} vs {reference_min:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&reference_path);
+        let _ = std::fs::remove_file(&turned_path);
     }
 
 }

@@ -5,7 +5,7 @@
 //! which is the standard model for an interchange/editing mesh.
 
 use crate::math::Aabb;
-use glam::{Vec2, Vec3};
+use glam::{Mat3, Mat4, Vec2, Vec3};
 use std::collections::HashSet;
 
 /// A vertex position plus optional source data.
@@ -110,6 +110,30 @@ impl Mesh {
             }
         }
         self.normals = normals;
+    }
+
+    /// Move the mesh by `m`: the positions follow the matrix, and the normals
+    /// follow its inverse transpose, so a non-uniform scale does not tilt the
+    /// shading.
+    ///
+    /// The normals are transformed whichever way they are indexed — per face
+    /// or per position — because the transformation is the same either way and
+    /// the corners' indices do not change.
+    pub fn transform(&mut self, m: Mat4) {
+        for p in &mut self.positions {
+            *p = m.transform_point3(*p);
+        }
+        // The inverse transpose, so a scale that stretches one axis does not
+        // tilt the normals with it.
+        let linear = Mat3::from_mat4(m);
+        let normal_matrix = if linear.determinant().abs() > 1e-12 {
+            linear.inverse().transpose()
+        } else {
+            linear
+        };
+        for n in &mut self.normals {
+            *n = (normal_matrix * *n).normalize_or_zero();
+        }
     }
 
     /// Area-weighted smooth normals written per position index.
@@ -483,4 +507,54 @@ mod tests {
         m.add_vertex(Vec3::X);
         assert!(m.edges().is_empty(), "positions without faces are no edges");
     }
+    #[test]
+    fn a_mesh_follows_a_transform() {
+        let mut m = Mesh::new();
+        m.add_vertex(Vec3::new(0.0, 0.0, 0.0));
+        m.add_vertex(Vec3::new(1.0, 0.0, 0.0));
+        m.add_vertex(Vec3::new(1.0, 1.0, 0.0));
+        m.add_face(&[0, 1, 2]);
+        m.compute_flat_normals();
+        let normal = m.normals[0];
+
+        // A translation moves the positions and leaves the normals alone.
+        m.transform(Mat4::from_translation(Vec3::new(5.0, 0.0, 0.0)));
+        assert!((m.positions[0] - Vec3::new(5.0, 0.0, 0.0)).length() < 1e-6);
+        assert!((m.normals[0] - normal).length() < 1e-6, "the shading did not change");
+
+        // A rotation carries the normals with the surface.
+        m.transform(Mat4::from_rotation_y(std::f32::consts::FRAC_PI_2));
+        assert!(
+            (m.positions[0] - Vec3::new(0.0, 0.0, -5.0)).length() < 1e-5,
+            "the vertex turned with the mesh: {:?}",
+            m.positions[0]
+        );
+        let turned = m.normals[0];
+        assert!(
+            (turned - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-5,
+            "the normal turned with the face: {turned:?}"
+        );
+    }
+
+    #[test]
+    fn a_non_uniform_scale_does_not_tilt_the_normals() {
+        // A plane in XZ, scaled hard in X: its normal is straight up and
+        // stays straight up, where a plain 3x3 would have tilted it.
+        let mut m = Mesh::new();
+        m.add_vertex(Vec3::new(0.0, 0.0, 0.0));
+        m.add_vertex(Vec3::new(1.0, 0.0, 0.0));
+        m.add_vertex(Vec3::new(0.0, 0.0, 1.0));
+        m.add_face(&[0, 1, 2]);
+        m.compute_flat_normals();
+        let before = m.normals[0];
+        m.transform(Mat4::from_scale(Vec3::new(10.0, 1.0, 1.0)));
+        assert!(
+            (m.normals[0] - before).length() < 1e-5,
+            "the normal stayed put: {:?} vs {before:?}",
+            m.normals[0]
+        );
+        // The positions did stretch.
+        assert!((m.positions[1] - Vec3::new(10.0, 0.0, 0.0)).length() < 1e-5);
+    }
+
 }
