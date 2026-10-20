@@ -182,6 +182,45 @@ pub struct UvDrag {
 }
 
 /// Persistent state of the UV editor panel.
+/// The UV entries the given faces use.
+///
+/// A face's corners each name a UV entry, so this is the union over the
+/// faces: the entries the UV editor shows as belonging to them, and the
+/// entries a face-level selection in the 3D view lights up here.
+pub fn face_uv_indices(mesh: &Mesh, faces: &[u32]) -> Vec<u32> {
+    let mut out: BTreeSet<u32> = BTreeSet::new();
+    for &f in faces {
+        let Some(face) = mesh.faces.get(f as usize) else {
+            continue;
+        };
+        for c in &face.corners {
+            if (c.uv as usize) < mesh.uvs.len() {
+                out.insert(c.uv);
+            }
+        }
+    }
+    out.into_iter().collect()
+}
+
+/// The faces that use the given UV entries.
+///
+/// The reverse of [`face_uv_indices`]: a UV entry can belong to several faces
+/// (and to none, when it is an orphan), so picking one in the canvas selects
+/// every face that carries it.
+pub fn uv_face_indices(mesh: &Mesh, uvs: &[u32]) -> Vec<u32> {
+    if uvs.is_empty() {
+        return Vec::new();
+    }
+    let wanted: BTreeSet<u32> = uvs.iter().copied().collect();
+    let mut out: Vec<u32> = Vec::new();
+    for (i, face) in mesh.faces.iter().enumerate() {
+        if face.corners.iter().any(|c| wanted.contains(&c.uv)) {
+            out.push(i as u32);
+        }
+    }
+    out
+}
+
 pub struct UvEditor {
     /// Whether the panel is shown.
     pub open: bool,
@@ -708,4 +747,29 @@ mod tests {
         );
         assert!(snap_uv(Vec2::new(f32::NAN, 0.0), SNAP_STEP).x.is_nan());
     }
+    #[test]
+    fn a_faces_uv_entries_and_their_reverse_agree() {
+        let mesh = two_quads();
+        // The first face uses entries 0..4.
+        let uvs = face_uv_indices(&mesh, &[0]);
+        assert_eq!(uvs, vec![0, 1, 2, 3]);
+        // The second uses 4..8.
+        let uvs = face_uv_indices(&mesh, &[1]);
+        assert_eq!(uvs, vec![4, 5, 6, 7]);
+        // Both faces at once.
+        let uvs = face_uv_indices(&mesh, &[0, 1]);
+        assert_eq!(uvs, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+        // A face that does not exist has no entries, and does not upset the
+        // ones that do.
+        assert!(face_uv_indices(&mesh, &[99]).is_empty());
+        assert_eq!(face_uv_indices(&mesh, &[0, 99]), vec![0, 1, 2, 3]);
+
+        // The reverse: the faces an entry belongs to.
+        assert_eq!(uv_face_indices(&mesh, &[0]), vec![0]);
+        assert_eq!(uv_face_indices(&mesh, &[4]), vec![1]);
+        // An entry no face uses selects nothing.
+        assert!(uv_face_indices(&mesh, &[99]).is_empty());
+        assert!(uv_face_indices(&mesh, &[]).is_empty());
+    }
+
 }

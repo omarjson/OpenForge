@@ -6303,6 +6303,9 @@ impl OpenForgeApp {
             return;
         };
         self.uv.retarget(Some(id), self.uv_count(id));
+        // The 3D view and the UV canvas look at the same thing: a face-level
+        // selection in the viewport is what the canvas highlights.
+        self.uv_sync_from_selection(id);
 
         self.uv_controls(ui, id);
         ui.separator();
@@ -6378,6 +6381,42 @@ impl OpenForgeApp {
                 .clicked()
             {
                 self.uv_select_island(id);
+            }
+        });
+
+        // A face's material can be set from the canvas, the way it can from
+        // the materials panel: the selected faces take the chosen material.
+        ui.horizontal(|ui| {
+            ui.label("Material:");
+            let names: Vec<String> = self
+                .materials
+                .materials
+                .iter()
+                .map(|m| m.name.clone())
+                .collect();
+            egui::ComboBox::from_id_salt("uv_material")
+                .selected_text(
+                    names
+                        .get(self.current_material)
+                        .cloned()
+                        .unwrap_or_else(|| "none".into()),
+                )
+                .show_ui(ui, |ui| {
+                    for (index, name) in names.iter().enumerate() {
+                        if ui
+                            .selectable_label(self.current_material == index, name)
+                            .clicked()
+                        {
+                            self.current_material = index;
+                        }
+                    }
+                });
+            if ui
+                .add_enabled(faces_selected, egui::Button::new("Assign to Faces"))
+                .on_hover_text("Give the faces the canvas selected this material")
+                .clicked()
+            {
+                self.assign_material_to_faces(self.current_material as u32);
             }
         });
 
@@ -6604,6 +6643,8 @@ impl OpenForgeApp {
                 } else {
                     self.uv.select_only(picked);
                 }
+                // The faces those UVs belong to are selected in the 3D view too.
+                self.uv_push_selection_to_faces(id);
                 self.status = format!("{} UV(s) in the band.", count);
             }
         } else if response.clicked() {
@@ -6622,6 +6663,8 @@ impl OpenForgeApp {
                         }
                     }
                 }
+                // The face that UV belongs to is selected in the 3D view too.
+                self.uv_push_selection_to_faces(id);
             }
         }
 
@@ -6653,6 +6696,48 @@ impl OpenForgeApp {
     /// The active mesh's UVs, if it has a mesh.
     fn uv_mesh_uvs(&self, id: NodeId) -> Option<&Mesh> {
         self.scene.get(id).ok().and_then(|n| n.mesh())
+    }
+
+    /// Show the 3D view's face selection in the UV canvas: the entries those
+    /// faces use are the ones the canvas highlights.
+    ///
+    /// Only at the face level — at any other level the canvas picks its own
+    /// UVs, and a vertex selection has no faces to show.
+    fn uv_sync_from_selection(&mut self, id: NodeId) {
+        if self.selection.level != SelectLevel::Face {
+            return;
+        }
+        let uvs = {
+            let Some(faces) = self.selection.selected_faces(id) else {
+                return;
+            };
+            let faces: Vec<u32> = faces.iter().copied().collect();
+            let Some(mesh) = self.uv_mesh_uvs(id) else {
+                return;
+            };
+            uv_editor::face_uv_indices(mesh, &faces)
+        };
+        self.uv.select_only(uvs);
+    }
+
+    /// The other way round: the faces the canvas's own selection points at
+    /// become the selected faces, so a pick in the canvas is a pick in the 3D
+    /// view too.
+    ///
+    /// Again only at the face level, where the two selections mean the same
+    /// thing; below it the canvas keeps its own UV selection.
+    fn uv_push_selection_to_faces(&mut self, id: NodeId) {
+        if self.selection.level != SelectLevel::Face {
+            return;
+        }
+        let faces = {
+            let Some(mesh) = self.uv_mesh_uvs(id) else {
+                return;
+            };
+            let uvs = self.uv.indices();
+            uv_editor::uv_face_indices(mesh, &uvs)
+        };
+        self.selection.set_elements(id, faces);
     }
 
     /// The UV entry under `pos`, if any.
@@ -11464,6 +11549,48 @@ mod tests {
             mesh.faces.iter().any(|f| f.material == 1),
             "and the second's moved past it"
         );
+    }
+
+    #[test]
+    fn the_uv_editor_and_the_3d_face_selection_show_the_same_thing() {
+        let mut app = OpenForgeApp::with_gpu(None);
+        let id = app
+            .scene
+            .iter()
+            .find(|n| n.is_mesh())
+            .map(|n| n.id)
+            .expect("the seed sphere");
+        app.selection.select_node(id);
+        let id = app.active_mesh_node().expect("the selected sphere");
+        let mesh = app.scene.get(id).unwrap().mesh().unwrap().clone();
+        let face = 0u32;
+        let uvs = uv_editor::face_uv_indices(&mesh, &[face]);
+        assert!(!uvs.is_empty(), "the sphere's first face has UVs");
+
+        // The 3D view's face selection is what the canvas highlights.
+        app.selection.level = SelectLevel::Face;
+        app.selection.set_elements(id, [face]);
+        app.uv_sync_from_selection(id);
+        assert_eq!(app.uv.indices(), uvs, "the canvas shows the selected face");
+
+        // And a pick in the canvas selects the face in the 3D view.
+        app.uv.select_only([uvs[0]]);
+        app.uv_push_selection_to_faces(id);
+        let faces = app
+            .selection
+            .selected_faces(id)
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            faces.contains(&face),
+            "the face that UV belongs to is selected: {faces:?}"
+        );
+
+        // Below the face level the two keep their own selections.
+        app.selection.level = SelectLevel::Vertex;
+        app.uv.select_only([uvs[0]]);
+        app.uv_sync_from_selection(id);
+        assert_eq!(app.uv.indices(), vec![uvs[0]], "the canvas keeps its own picks");
     }
 
 }
