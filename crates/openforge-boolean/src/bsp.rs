@@ -131,21 +131,30 @@ impl Plane {
                 // there — so the texture does not jump across the cut.
                 let mut fu: Vec<Vec2> = Vec::new();
                 let mut bu: Vec<Vec2> = Vec::new();
+                // The shading normals travel with their vertices too, and a
+                // cut interpolates them the same way — that is what keeps a
+                // boolean of a smooth surface smooth along the cut.
+                let mut fnorm: Vec<Vec3> = Vec::new();
+                let mut bnorm: Vec<Vec3> = Vec::new();
                 for i in 0..n {
                     let j = (i + 1) % n;
                     let vi = poly.vertices[i];
                     let vj = poly.vertices[j];
                     let ui = poly.uvs[i];
                     let uj = poly.uvs[j];
+                    let ni = poly.normals.get(i).copied().unwrap_or(poly.plane.normal);
+                    let nj = poly.normals.get(j).copied().unwrap_or(poly.plane.normal);
                     let ti = types[i];
                     let tj = types[j];
                     if ti != 2 {
                         f.push(vi); // not strictly behind → keep on front
                         fu.push(ui);
+                        fnorm.push(ni);
                     }
                     if ti != 1 {
                         b.push(vi); // not strictly in front → keep on back
                         bu.push(ui);
+                        bnorm.push(ni);
                     }
                     if (ti == 2 && tj == 1) || (ti == 1 && tj == 2) {
                         // Edge crosses the plane: insert the intersection.
@@ -154,19 +163,26 @@ impl Plane {
                         let t = si / (si - sj);
                         let p = vi + (vj - vi) * t;
                         let uv = ui + (uj - ui) * (t as f32);
+                        let normal = (ni + (nj - ni) * t).normalize();
                         f.push(p);
                         fu.push(uv);
+                        fnorm.push(normal);
                         b.push(p);
                         bu.push(uv);
+                        bnorm.push(normal);
                     }
                 }
                 if f.len() >= 3 {
-                    if let Some(p) = Polygon::from_points(f, fu, poly.plane, poly.material) {
+                    if let Some(p) =
+                        Polygon::from_points(f, fu, fnorm, poly.plane, poly.material)
+                    {
                         front.push(p);
                     }
                 }
                 if b.len() >= 3 {
-                    if let Some(p) = Polygon::from_points(b, bu, poly.plane, poly.material) {
+                    if let Some(p) =
+                        Polygon::from_points(b, bu, bnorm, poly.plane, poly.material)
+                    {
                         back.push(p);
                     }
                 }
@@ -177,15 +193,20 @@ impl Plane {
 
 /// A convex polygon (triangle, quad, or n-gon) plus the plane it lies on.
 ///
-/// The UV of each vertex travels with it, and the face's material travels
-/// with the polygon, so a boolean does not take the texture off the surface
-/// it cuts.
+/// The UV of each vertex travels with it, the face's *shading* normal travels
+/// with it too, and the face's material travels with the polygon, so a boolean
+/// does not take the texture, the smooth shading or the material off the
+/// surface it cuts.
 #[derive(Clone, Debug)]
 pub(crate) struct Polygon {
     pub vertices: Vec<Vec3>,
     pub plane: Plane,
     /// The UV of each vertex, in the same order.
     pub uvs: Vec<Vec2>,
+    /// The shading normal of each vertex, in the same order. Unlike the plane
+    /// normal this is the authored (often smooth) normal, interpolated wherever
+    /// a cut crosses an edge.
+    pub normals: Vec<Vec3>,
     /// The face's material, as an index into the owning node's slot list.
     pub material: u32,
 }
@@ -197,6 +218,7 @@ impl Polygon {
     fn from_points(
         vertices: Vec<Vec3>,
         uvs: Vec<Vec2>,
+        normals: Vec<Vec3>,
         plane: Plane,
         material: u32,
     ) -> Option<Self> {
@@ -204,8 +226,14 @@ impl Polygon {
         if kept.len() < 3 {
             return None;
         }
+        let pick = |data: &[Vec3]| -> Vec<Vec3> {
+            kept.iter()
+                .map(|&i| data.get(i).copied().unwrap_or(plane.normal))
+                .collect()
+        };
         let vertices: Vec<Vec3> = kept.iter().map(|&i| vertices[i]).collect();
         let uvs: Vec<Vec2> = kept.iter().map(|&i| uvs.get(i).copied().unwrap_or(Vec2::ZERO)).collect();
+        let normals = pick(&normals);
         if loop_area(&vertices, plane.normal) <= 0.0 {
             return None; // degenerate, or wound the wrong way for its plane
         }
@@ -213,6 +241,7 @@ impl Polygon {
             vertices,
             plane,
             uvs,
+            normals,
             material,
         })
     }
@@ -346,6 +375,7 @@ impl Node {
             poly.plane.flip();
             poly.vertices.reverse();
             poly.uvs.reverse();
+            poly.normals.reverse();
         }
         if let Some(f) = &mut self.front {
             f.invert();
@@ -427,21 +457,25 @@ impl Fit {
                 },
                 // A uniform scale and a translation leave the texture where
                 // it was: the UVs are a picture of the surface, not of where
-                // the surface sits.
+                // the surface sits. They leave a shading normal's direction
+                // alone too (only its length would scale, and it is normalized
+                // on the way back out).
                 uvs: p.uvs.clone(),
+                normals: p.normals.clone(),
                 material: p.material,
             })
             .collect()
     }
 
     /// A mesh built in normalized space, put back where it came from. Only the
-    /// positions move — by the same uniform map — so the faces, and the winding
-    /// the normals are computed from, come back unchanged.
+    /// positions move — by the same uniform map — so the faces keep their
+    /// winding. The shading normals travelled with the polygons and are
+    /// already on the mesh; unlike the old flat recomputation they survive the
+    /// cut unchanged.
     pub fn restore(&self, mut mesh: Mesh) -> Mesh {
         for p in &mut mesh.positions {
             *p = (p.as_dvec3() / self.scale + self.center).as_vec3();
         }
-        mesh.compute_flat_normals();
         mesh
     }
 }
@@ -473,11 +507,26 @@ pub(crate) fn mesh_to_polygons(mesh: &Mesh) -> Vec<Polygon> {
         for i in 1..pts.len() - 1 {
             let tri = vec![pts[0], pts[i], pts[i + 1]];
             let tri_uvs = vec![uvs[0], uvs[i], uvs[i + 1]];
+            // The authored shading normals travel with the corners. A mesh
+            // without a usable normal at a corner falls back to this triangle's
+            // own plane normal, so the engine still sees a sane direction.
+            let fallback = (tri[1] - tri[0]).cross(tri[2] - tri[0]).normalize_or_zero();
+            let tri_normals: Vec<Vec3> = [0usize, i, i + 1]
+                .iter()
+                .map(|&k| {
+                    mesh.normals
+                        .get(f.corners[k].normal as usize)
+                        .copied()
+                        .map(|n| n.as_dvec3())
+                        .unwrap_or(fallback)
+                })
+                .collect();
             if let Some(plane) = Plane::from_points(tri[0], tri[1], tri[2]) {
                 out.push(Polygon {
                     vertices: tri,
                     plane,
                     uvs: tri_uvs,
+                    normals: tri_normals,
                     material: f.material,
                 });
             }
@@ -497,20 +546,25 @@ pub(crate) fn mesh_to_polygons(mesh: &Mesh) -> Vec<Polygon> {
 fn expand_t_junctions(
     verts: &[Vec3],
     uvs: &[Vec2],
+    normals: &[Vec3],
     grid: &PointGrid,
     tol: f64,
-) -> (Vec<Vec3>, Vec<Vec2>) {
+) -> (Vec<Vec3>, Vec<Vec2>, Vec<Vec3>) {
     let tol2 = tol * tol;
     let mut out: Vec<Vec3> = Vec::with_capacity(verts.len());
     let mut out_uvs: Vec<Vec2> = Vec::with_capacity(verts.len());
+    let mut out_normals: Vec<Vec3> = Vec::with_capacity(verts.len());
     let n = verts.len();
     for i in 0..n {
         let a = verts[i];
         let b = verts[(i + 1) % n];
         let ua = uvs.get(i).copied().unwrap_or(Vec2::ZERO);
         let ub = uvs.get((i + 1) % n).copied().unwrap_or(Vec2::ZERO);
+        let na = normals.get(i).copied().unwrap_or(Vec3::Z);
+        let nb = normals.get((i + 1) % n).copied().unwrap_or(Vec3::Z);
         out.push(a);
         out_uvs.push(ua);
+        out_normals.push(na);
         let ab = b - a;
         let l2 = ab.length_squared();
         if l2 < tol2 {
@@ -533,13 +587,16 @@ fn expand_t_junctions(
             if t - last > tol {
                 out.push(a + ab * t);
                 // The point's UV is where it falls on the edge's own span, so
-                // the texture runs along the edge without a jump.
+                // the texture runs along the edge without a jump. Its shading
+                // normal is interpolated the same way, so a T-junction does
+                // not crease a smooth surface.
                 out_uvs.push(ua + (ub - ua) * (t as f32));
+                out_normals.push((na + (nb - na) * t).normalize());
                 last = t;
             }
         }
     }
-    (out, out_uvs)
+    (out, out_uvs, out_normals)
 }
 
 /// A uniform grid over a point cloud, for "which points lie within `tol` of
@@ -789,7 +846,8 @@ pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
         if poly.vertices.len() < 3 {
             continue;
         }
-        let (loop_pts, loop_uvs) = expand_t_junctions(&poly.vertices, &poly.uvs, &grid, WELD);
+        let (loop_pts, loop_uvs, loop_normals) =
+            expand_t_junctions(&poly.vertices, &poly.uvs, &poly.normals, &grid, WELD);
         let m = loop_pts.len();
         if m < 3 {
             continue;
@@ -799,6 +857,7 @@ pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
         // the same point, and welding them would flatten the texture there.
         let mut idx: Vec<u32> = Vec::with_capacity(m);
         let mut uv_index: Vec<u32> = Vec::with_capacity(m);
+        let mut normal_index: Vec<u32> = Vec::with_capacity(m);
         for (k, &v) in loop_pts.iter().enumerate() {
             match welder.find(v) {
                 Some(i) => idx.push(i),
@@ -811,6 +870,11 @@ pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
             }
             uv_index.push(mesh.uvs.len() as u32);
             mesh.uvs.push(loop_uvs[k]);
+            // The normal is a per-corner attribute like the UV: two faces at
+            // one position keep their own shading across a hard edge.
+            normal_index.push(mesh.normals.len() as u32);
+            let n = loop_normals[k].normalize_or_zero().as_vec3();
+            mesh.normals.push(n);
         }
         // The clipper works on the *welded* geometry — that is the geometry
         // the faces will point at — but it keeps the loop's own numbering, so
@@ -837,7 +901,7 @@ pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
                     let k = p as usize;
                     Corner {
                         position: idx[k],
-                        normal: 0,
+                        normal: normal_index[k],
                         uv: uv_index[k],
                     }
                 })
@@ -848,7 +912,6 @@ pub(crate) fn polygons_to_mesh(polygons: &[Polygon]) -> Mesh {
             });
         }
     }
-    mesh.compute_flat_normals();
     mesh
 }
 

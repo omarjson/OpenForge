@@ -19,6 +19,7 @@
 mod bsp;
 
 use bsp::{mesh_to_polygons, polygons_to_mesh, Fit};
+use glam::Vec3;
 use openforge_core::mesh::Mesh;
 use thiserror::Error;
 
@@ -28,6 +29,15 @@ pub enum BooleanError {
     /// One of the inputs had no faces to operate on.
     #[error("mesh has no faces")]
     EmptyInput,
+    /// The requested splitting plane had no usable direction.
+    #[error("plane has a zero direction")]
+    DegeneratePlane,
+    /// The face index named by a shave was not a face of the mesh.
+    #[error("face {0} does not exist")]
+    InvalidFace(usize),
+    /// A shave needs a positive depth.
+    #[error("shave depth must be positive")]
+    InvalidDepth,
 }
 
 /// Union of two meshes: everything inside `a` or `b` (or both).
@@ -43,6 +53,112 @@ pub fn subtract(a: &Mesh, b: &Mesh) -> Result<Mesh, BooleanError> {
 /// Intersection of two meshes: everything inside both `a` and `b`.
 pub fn intersect(a: &Mesh, b: &Mesh) -> Result<Mesh, BooleanError> {
     boolean(a, b, bsp::intersect)
+}
+
+/// Split a solid by a plane, returning `(front, back)` — the piece on the
+/// side the plane's normal points to first.
+///
+/// Both halves are closed solids: the cut face comes from the CSG, so there is
+/// no open boundary at the plane. The cutter is an oriented box whose near
+/// face is the plane and whose other five faces sit well outside the mesh, so
+/// only the requested plane can cut it.
+pub fn split_by_plane(
+    mesh: &Mesh,
+    origin: Vec3,
+    normal: Vec3,
+) -> Result<(Mesh, Mesh), BooleanError> {
+    if mesh.faces.is_empty() {
+        return Err(BooleanError::EmptyInput);
+    }
+    let n = normal.normalize_or_zero();
+    if !n.is_finite() || n.length_squared() < 0.5 {
+        return Err(BooleanError::DegeneratePlane);
+    }
+    let reach = mesh_extent(mesh) * 4.0;
+    let cutter = half_space_prism(origin, n, reach, reach);
+    let front = intersect(mesh, &cutter)?;
+    let back = subtract(mesh, &cutter)?;
+    Ok((front, back))
+}
+
+/// Shave a face inward by `depth`, returning the smaller solid.
+///
+/// The face's winding gives the outward direction. A half-space box starts
+/// `depth` behind that face and covers everything outside it, so subtracting
+/// it removes a uniform slab from that side and caps the new face.
+pub fn shave_face(mesh: &Mesh, face: usize, depth: f32) -> Result<Mesh, BooleanError> {
+    if mesh.faces.is_empty() {
+        return Err(BooleanError::EmptyInput);
+    }
+    let Some(target) = mesh.faces.get(face) else {
+        return Err(BooleanError::InvalidFace(face));
+    };
+    if !depth.is_finite() || depth <= 0.0 {
+        return Err(BooleanError::InvalidDepth);
+    }
+    let pts: Vec<Vec3> = target
+        .corners
+        .iter()
+        .filter_map(|c| mesh.positions.get(c.position as usize).copied())
+        .collect();
+    if pts.len() < 3 {
+        return Err(BooleanError::InvalidFace(0));
+    }
+    let mut outward = Vec3::ZERO;
+    for i in 1..pts.len() - 1 {
+        outward += (pts[i] - pts[0]).cross(pts[i + 1] - pts[0]);
+    }
+    let outward = outward.normalize_or_zero();
+    if !outward.is_finite() || outward.length_squared() < 0.5 {
+        return Err(BooleanError::InvalidFace(0));
+    }
+    let reach = mesh_extent(mesh) * 4.0;
+    let cutter = half_space_prism(pts[0] - outward * depth, outward, reach, reach);
+    subtract(mesh, &cutter)
+}
+
+/// The largest distance between two positions of `mesh`, with a floor of one
+/// so a tiny model still gets a cutter comfortably bigger than itself.
+fn mesh_extent(mesh: &Mesh) -> f32 {
+    let mut min = Vec3::splat(f32::INFINITY);
+    let mut max = Vec3::splat(f32::NEG_INFINITY);
+    for p in &mesh.positions {
+        min = min.min(*p);
+        max = max.max(*p);
+    }
+    (max - min).length().max(1.0)
+}
+
+/// An oriented box filling the half-space in front of `origin` (on the side
+/// `normal` points to). `depth` is its extent along the normal and `half` its
+/// extent along the two in-plane axes; callers make both much larger than the
+/// solid so only the near face can cut it.
+///
+/// `(u, v, n)` is right-handed: `u = n × helper`, `v = n × u`, so `u × v = n`
+/// and the six quads below wind outwards.
+fn half_space_prism(origin: Vec3, normal: Vec3, depth: f32, half: f32) -> Mesh {
+    let n = normal.normalize_or_zero();
+    let helper = if n.y.abs() < 0.9 { Vec3::Y } else { Vec3::X };
+    let u = n.cross(helper).normalize_or_zero();
+    let v = n.cross(u).normalize_or_zero();
+    let mut m = Mesh::new();
+    for face_z in [0.0, depth] {
+        for (a, b) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+            m.add_vertex(origin + u * (a * half) + v * (b * half) + n * face_z);
+        }
+    }
+    for q in [
+        [0u32, 3, 2, 1], // near face, outward -n
+        [4, 5, 6, 7],    // far face, outward +n
+        [0, 4, 7, 3],    // -u
+        [1, 2, 6, 5],    // +u
+        [0, 1, 5, 4],    // -v
+        [3, 7, 6, 2],    // +v
+    ] {
+        m.add_face(&q);
+    }
+    m.compute_flat_normals();
+    m
 }
 
 /// Run one CSG operation over two meshes.
@@ -629,6 +745,167 @@ mod tests {
         assert!(
             materials.contains(&7),
             "and the second solid's material came with it: {materials:?}"
+        );
+    }
+
+    // --- normals, splitting and shaving ----------------------------------------
+
+    /// A ball whose corners carry smooth normals: the normal index is the
+    /// position index, so every face meeting at a point shades it the same.
+    fn smooth_ball(center: Vec3, radius: f32) -> Mesh {
+        let mut m = ball(center, radius, 16, 8);
+        for c in m.faces.iter_mut().flat_map(|f| f.corners.iter_mut()) {
+            c.normal = c.position;
+        }
+        let normals: Vec<Vec3> = m
+            .positions
+            .iter()
+            .map(|p| (*p - center).normalize_or_zero())
+            .collect();
+        m.normals = normals;
+        m
+    }
+
+    #[test]
+    fn a_boolean_keeps_smooth_normals_instead_of_recomputing_them_flat() {
+        let a = smooth_ball(Vec3::ZERO, 1.0);
+        let b = smooth_ball(Vec3::new(0.8, 0.0, 0.0), 1.0);
+        let u = union(&a, &b).unwrap();
+        assert!(!u.normals.is_empty(), "the normals came through the cut");
+        let mut smooth_corner = false;
+        for f in &u.faces {
+            for c in &f.corners {
+                assert!(
+                    (c.normal as usize) < u.normals.len(),
+                    "a corner points past the normals"
+                );
+                assert!(
+                    (u.normals[c.normal as usize].length() - 1.0).abs() < 1e-3,
+                    "the carried normal is unit length"
+                );
+            }
+            let p: Vec<Vec3> = f
+                .corners
+                .iter()
+                .map(|c| u.positions[c.position as usize])
+                .collect();
+            if p.len() < 3 {
+                continue;
+            }
+            let flat = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+            if flat.length_squared() > 0.5 {
+                let n = u.normals[f.corners[0].normal as usize];
+                if flat.dot(n) < 0.95 {
+                    smooth_corner = true;
+                }
+            }
+        }
+        assert!(
+            smooth_corner,
+            "at least one result corner still shades smoothly across the cut"
+        );
+    }
+
+    #[test]
+    fn a_boolean_of_meshes_without_normals_still_has_usable_normals() {
+        let mut a = box_at(Vec3::ZERO, 2.0);
+        let mut b = box_at(Vec3::new(1.0, 0.0, 0.0), 2.0);
+        a.normals.clear();
+        b.normals.clear();
+        for f in a.faces.iter_mut().chain(b.faces.iter_mut()) {
+            for c in &mut f.corners {
+                c.normal = u32::MAX;
+            }
+        }
+        let u = union(&a, &b).unwrap();
+        assert_eq!(u.normals.len(), u.faces.iter().map(|f| f.corners.len()).sum());
+        assert!(u.normals.iter().all(|n| n.length() > 0.99));
+    }
+
+    #[test]
+    fn splitting_a_box_at_zero_gives_two_closed_halves() {
+        let box_mesh = box_at(Vec3::ZERO, 2.0);
+        let (front, back) = split_by_plane(&box_mesh, Vec3::ZERO, Vec3::X).unwrap();
+        assert!((mesh_volume(&front) - 4.0).abs() < 0.1, "front {}", mesh_volume(&front));
+        assert!((mesh_volume(&back) - 4.0).abs() < 0.1, "back {}", mesh_volume(&back));
+        assert!(is_watertight(&front), "the front half is capped");
+        assert!(is_watertight(&back), "the back half is capped");
+    }
+
+    #[test]
+    fn splitting_off_axis_keeps_both_halves_closed() {
+        let box_mesh = box_at(Vec3::ZERO, 2.0);
+        let (front, back) =
+            split_by_plane(&box_mesh, Vec3::ZERO, Vec3::new(1.0, 1.0, 0.0)).unwrap();
+        assert!((mesh_volume(&front) - 4.0).abs() < 0.15, "front {}", mesh_volume(&front));
+        assert!((mesh_volume(&back) - 4.0).abs() < 0.15, "back {}", mesh_volume(&back));
+        assert!(is_watertight(&front) && is_watertight(&back));
+    }
+
+    #[test]
+    fn splitting_away_from_the_centre_gives_the_expected_volumes() {
+        let box_mesh = box_at(Vec3::ZERO, 2.0);
+        let (front, back) =
+            split_by_plane(&box_mesh, Vec3::new(0.5, 0.0, 0.0), Vec3::X).unwrap();
+        // x 0.5..1 is 0.5 thick; x -1..0.5 is 1.5 thick. Both span 2×2.
+        assert!((mesh_volume(&front) - 2.0).abs() < 0.1, "front {}", mesh_volume(&front));
+        assert!((mesh_volume(&back) - 6.0).abs() < 0.1, "back {}", mesh_volume(&back));
+    }
+
+    /// The index of the face whose outward normal points most towards +Y.
+    fn top_face(mesh: &Mesh) -> usize {
+        let mut best = (0usize, -1.0f32);
+        for (i, f) in mesh.faces.iter().enumerate() {
+            let p: Vec<Vec3> = f
+                .corners
+                .iter()
+                .map(|c| mesh.positions[c.position as usize])
+                .collect();
+            if p.len() < 3 {
+                continue;
+            }
+            let n = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
+            if n.y > best.1 {
+                best = (i, n.y);
+            }
+        }
+        assert!(best.1 > 0.9, "the box has an upward face");
+        best.0
+    }
+
+    #[test]
+    fn shaving_the_top_face_removes_a_uniform_slab() {
+        let box_mesh = box_at(Vec3::ZERO, 2.0);
+        let top = top_face(&box_mesh);
+        let shaved = shave_face(&box_mesh, top, 0.5).unwrap();
+        // 2 × 1.5 × 2 = 6, down from 8.
+        assert!((mesh_volume(&shaved) - 6.0).abs() < 0.1, "volume {}", mesh_volume(&shaved));
+        assert!(is_watertight(&shaved), "the shaved solid is still closed");
+        for p in &shaved.positions {
+            assert!(p.y <= 0.51, "nothing is left above the new top: {p}");
+        }
+    }
+
+    #[test]
+    fn splitting_and_shaving_refuse_bad_arguments() {
+        let box_mesh = box_at(Vec3::ZERO, 2.0);
+        let empty = Mesh::new();
+        assert_eq!(
+            split_by_plane(&empty, Vec3::ZERO, Vec3::X),
+            Err(BooleanError::EmptyInput)
+        );
+        assert_eq!(
+            split_by_plane(&box_mesh, Vec3::ZERO, Vec3::ZERO),
+            Err(BooleanError::DegeneratePlane)
+        );
+        assert_eq!(
+            shave_face(&box_mesh, 999, 0.5),
+            Err(BooleanError::InvalidFace(999))
+        );
+        assert_eq!(shave_face(&box_mesh, 0, 0.0), Err(BooleanError::InvalidDepth));
+        assert_eq!(
+            shave_face(&box_mesh, 0, f32::NAN),
+            Err(BooleanError::InvalidDepth)
         );
     }
 }

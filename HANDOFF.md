@@ -397,9 +397,9 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **777 tests pass** (774 `#[test]`
+workspace builds with **0 warnings**, **785 tests pass** (782 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Fifty work-streams are done — the engine layer from the **wgpu
+Fifty-one work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
 through **gizmo axes modes and a placed pivot** (#39), **boolean CSG that
@@ -417,6 +417,16 @@ plus a progress report:
   because parity has no machine-checkable definition. Run it after every
   work-stream and re-score the area you touched.
 
+- **Normals across cuts, split and shave (#51).** `Polygon` now carries each
+  vertex's authored shading normal beside its UV; `split_polygon`, the T-junction
+  pass and the inverse tree interpolate it wherever a cut crosses an edge, and
+  the result keeps those normals instead of calling `compute_flat_normals` on
+  the way out. Two new public engine ops use an oriented half-space box as the
+  cutter: `split_by_plane` returns two capped solids, and `shave_face` removes a
+  uniform slab from a face. The Boolean toolbar row gained a depth field and a
+  Shave button; the shave is one undo entry. Still open in the boolean engine:
+  self-intersection repair, a solid-from-curve op, and normals for the *cut*
+  face itself (the cap comes from the cutter's flat normal).
 - **Viewport shading modes, ambient occlusion and contact shadows (#50).**
   `openforge-materials::shading` gained `ShadingMode` (Lit / Unlit / Clay /
   Normals), `ShadeOptions` and the pure `occlusion_terms` +
@@ -2394,14 +2404,14 @@ Prioritized next steps:
    viewport surface: a true **shadow map / SSAO** pass (the current occlusion is
    analytic), and configurable shading presets beyond the four modes already
    offered.
-2. **Deepen the boolean engine.** The three operations land closed solids
+2. **Deepen the boolean engine further.** The three operations land closed solids
    now (#40: normalized `f64`, slivers kept, tolerance welding, the
    T-junction pass on a grid), the app says whether the result came out
-   closed, and the texture and the materials come through the cut (#41). What
-   is still missing: the operations a modeller expects around them (split
-   along a plane, shave a face, a "solid from a curve" op), repairing
-   self-intersecting input rather than leaving the caller to fix it first,
-   and carrying the *normals* across a cut instead of recomputing them flat.
+   closed, the texture and the materials come through the cut (#41), the
+   authored normals survive it and `split_by_plane` / `shave_face` are in
+   (#51). What is still missing: repairing self-intersecting input rather than
+   leaving the caller to fix it first, a "solid from a curve" op, and giving
+   the cut face itself interpolated normals instead of the cutter's flat ones.
 
 3. **Extend the gizmo further** (`gizmo.rs`, all additive). Axis arms, rings,
    one square per coordinate plane and the screen-plane centre handle are in
@@ -2459,10 +2469,10 @@ Prioritized next steps:
 
 **Honest gap to parity:** format-specific game tooling (vehicles, TXD
 dictionaries, per-game export paths — the generic half, LOD tags, dummies,
-their triangle budget and the LOD generator, landed in #21/#25), the boolean
-engine beyond the three operations it has (no "split", no "shave" against a
-plane, and self-intersecting input is not repaired — the texture and the
-materials do come through now, #41), the
+their triangle budget and the LOD generator, landed in #21/#25), the boolean engine beyond the three operations it has (no "solid from a
+curve", and self-intersecting input is not repaired — the texture and the
+materials and the authored normals do come through now, and split/shave are in,
+#41/#51), the
 panel/dialog surface beyond the new shell (the preferences persist now, as
 machine choices rather than document state; there is no asset browser, no
 window-layout memory, and ZModeler's deeper dialogs have no home yet),

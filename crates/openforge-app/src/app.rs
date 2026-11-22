@@ -363,6 +363,8 @@ pub struct OpenForgeApp {
     /// many passes Smooth runs.
     rig_weight: f32,
     rig_smooth_passes: u32,
+    /// Depth a Boolean ▸ Shave removes from the selected face, in world units.
+    shave_depth: f32,
     /// Live transform-gizmo state (hover, drag, this frame's handle layout).
     gizmo: gizmo::Gizmo,
     /// Which way the gizmo's handles point: the world's axes, the selected
@@ -525,6 +527,7 @@ impl OpenForgeApp {
             rig_bones: 4,
             rig_weight: 0.5,
             rig_smooth_passes: 2,
+            shave_depth: 0.25,
             gizmo: gizmo::Gizmo::default(),
             snap: snap::Snap::default(),
             snap_marker: None,
@@ -1013,6 +1016,50 @@ impl OpenForgeApp {
                 );
             }
             Err(e) => self.status = format!("Boolean failed: {}", e),
+        }
+    }
+
+    /// Remove a uniform slab from the first selected face of the active mesh.
+    /// A single undo entry replaces that node's mesh; the face selection stays
+    /// so another Shave can be applied to the same face.
+    fn shave_selected_face(&mut self) {
+        let Some(id) = self
+            .selection
+            .selected_element_node()
+            .or_else(|| self.active_mesh_node())
+        else {
+            self.status = "Select a mesh face to shave.".into();
+            return;
+        };
+        let Some(face) = self
+            .selection
+            .selected_faces(id)
+            .and_then(|faces| faces.iter().next().copied())
+        else {
+            self.status = "Select a face (Face select level) to shave.".into();
+            return;
+        };
+        let Some((mesh, _slots)) = self.node_mesh_and_slots(id) else {
+            self.status = "Could not read the mesh to shave.".into();
+            return;
+        };
+        match openforge_boolean::shave_face(&mesh, face as usize, self.shave_depth) {
+            Ok(result) => {
+                let closed = openforge_boolean::is_watertight(&result);
+                self.with_edit("Shave face", |app| {
+                    if let Ok(node) = app.scene.get_mut(id) {
+                        if let NodeKind::Mesh { mesh: slot_mesh, .. } = &mut node.kind {
+                            *slot_mesh = result;
+                        }
+                    }
+                });
+                self.status = format!(
+                    "Shaved face {face} by {:.2}: {}.",
+                    self.shave_depth,
+                    if closed { "still closed" } else { "open — not a closed solid" }
+                );
+            }
+            Err(e) => self.status = format!("Shave failed: {}", e),
         }
     }
 
@@ -4570,6 +4617,26 @@ impl OpenForgeApp {
                     {
                         self.boolean_selected(kind);
                     }
+                }
+                ui.separator();
+                ui.add(
+                    egui::DragValue::new(&mut self.shave_depth)
+                        .speed(0.05)
+                        .range(0.01..=10.0)
+                        .fixed_decimals(2),
+                )
+                .on_hover_text("Depth removed by Shave");
+                let has_face = self
+                    .selection
+                    .selected_element_node()
+                    .or_else(|| self.active_mesh_node())
+                    .is_some();
+                if ui
+                    .add_enabled(has_face, egui::Button::new("Shave"))
+                    .on_hover_text("Remove a slab from the first selected face, capping the result")
+                    .clicked()
+                {
+                    self.shave_selected_face();
                 }
             });
             // Fourth row: rigging and skinning.
@@ -12535,6 +12602,52 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&reference_path);
         let _ = std::fs::remove_file(&turned_path);
+    }
+
+    #[test]
+    fn shaving_a_selected_face_shrinks_the_solid_in_one_undo_step() {
+        let (mut app, id) = app_ready_to_move();
+        let before = app.scene.get(id).unwrap().mesh().unwrap().clone();
+        let volume_before = openforge_boolean::mesh_volume(&before);
+        // The box's upward face shaves cleanly; any face index with an outward
+        // normal works, so pick the one the test mesh actually has at the top.
+        let top = before
+            .faces
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                let ny = |f: &openforge_core::mesh::Face| {
+                    let p: Vec<Vec3> = f
+                        .corners
+                        .iter()
+                        .map(|c| before.positions[c.position as usize])
+                        .collect();
+                    (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero().y
+                };
+                ny(a).partial_cmp(&ny(b)).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i as u32)
+            .expect("the box has faces");
+        app.selection.level = SelectLevel::Face;
+        app.selection.set_elements(id, [top]);
+        app.shave_depth = 0.25;
+
+        app.shave_selected_face();
+        assert!(app.status.contains("Shaved face"), "{}", app.status);
+        let after = app.scene.get(id).unwrap().mesh().unwrap().clone();
+        let volume_after = openforge_boolean::mesh_volume(&after);
+        assert!(
+            volume_after < volume_before - 0.1,
+            "{volume_after} should be less than {volume_before}"
+        );
+        assert!(openforge_boolean::is_watertight(&after), "the shaved solid is closed");
+
+        app.undo_edit();
+        let restored = app.scene.get(id).unwrap().mesh().unwrap().clone();
+        assert!(
+            (openforge_boolean::mesh_volume(&restored) - volume_before).abs() < 1e-3,
+            "one undo restores the original solid"
+        );
     }
 
 }
