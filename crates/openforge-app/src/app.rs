@@ -12606,7 +12606,16 @@ mod tests {
 
     #[test]
     fn shaving_a_selected_face_shrinks_the_solid_in_one_undo_step() {
-        let (mut app, id) = app_ready_to_move();
+        let (mut app, _seed) = app_ready_to_move();
+        // The boolean engine needs an outward-wound closed solid. The app's
+        // primitive_box fixture winds its faces inward, so flip them here and
+        // recompute the flat normals before handing it to the CSG.
+        let mut box_mesh = primitive_box(2.0);
+        for f in &mut box_mesh.faces {
+            f.corners.reverse();
+        }
+        box_mesh.compute_flat_normals();
+        let id = app.scene.create_mesh("Shave box", box_mesh);
         let before = app.scene.get(id).unwrap().mesh().unwrap().clone();
         let volume_before = openforge_boolean::mesh_volume(&before);
         // The box's upward face shaves cleanly; any face index with an outward
