@@ -627,7 +627,7 @@ mod tests {
         for &mode in &SnapMode::ALL[2..] {
             assert_eq!(Snap { mode, ..Snap::default() }.inverted().mode, SnapMode::Off);
         }
-        assert_eq!(SnapMode::Off.inverted(), SnapMode::Grid);
+        assert_eq!(Snap::default().inverted().mode, SnapMode::Grid);
     }
 
 }
