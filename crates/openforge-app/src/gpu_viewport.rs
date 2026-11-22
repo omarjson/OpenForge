@@ -72,6 +72,12 @@ impl GpuViewport {
         self.renderer.set_textures(&state.device, &state.queue, layers);
     }
 
+    /// Set the viewport shading mode and options for subsequent frames.
+    /// Forwarded to the renderer so the app never touches wgpu types.
+    pub fn set_shading(&mut self, mode: u32, options: [f32; 4]) {
+        self.renderer.set_shading(mode, options);
+    }
+
     /// Render one frame of `scene` at `size` in physical pixels, returning the
     /// egui image handle holding that frame plus [`FrameStats`] describing it.
     /// `edges` are the wireframe / selection-outline lines to draw inside the

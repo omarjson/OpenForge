@@ -59,6 +59,14 @@ struct FrameUniforms {
     _pad0: f32,
     light_dir: vec3<f32>,
     time: f32,
+    shading_mode: u32,
+    ambient: f32,
+    ao_strength: f32,
+    shadow_strength: f32,
+    contact_radius: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -125,6 +133,14 @@ struct FrameUniforms {
     _pad0: f32,
     light_dir: vec3<f32>,
     time: f32,
+    shading_mode: u32,
+    ambient: f32,
+    ao_strength: f32,
+    shadow_strength: f32,
+    contact_radius: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 };
 
 @group(0) @binding(0) var<uniform> frame: FrameUniforms;
@@ -195,9 +211,34 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let l = normalize(frame.light_dir);
     let v = normalize(frame.camera_pos - in.world_pos);
     let half = normalize(l + v);
+
+    // Shading mode is a view choice, not a material one. Unlit shows the
+    // resolved colour untouched; Normals paints the shading normal as RGB.
+    // Both are mirrored by shade_surface_configured on the CPU path.
+    if (frame.shading_mode == 1u) {
+        return vec4<f32>(in.color.rgb * base_texel.rgb, in.color.a * base_texel.a);
+    }
+    if (frame.shading_mode == 3u) {
+        let encoded = normal * 0.5 + vec3<f32>(0.5);
+        return vec4<f32>(encoded, in.color.a);
+    }
+    var surface = in.color.rgb;
+    if (frame.shading_mode == 2u) {
+        surface = vec3<f32>(176.0 / 255.0);
+    }
+
+    // Hemisphere ambient occlusion: an upward normal sees the whole sky, a
+    // downward one sees none. The contact shadow deepens the lower a point
+    // sits and the more it faces away from the key light; above the radius
+    // there is none. Both are analytic so the two paths agree exactly.
+    let sky = clamp(0.5 + 0.5 * normal.y, 0.0, 1.0);
+    let ao = 1.0 - frame.ao_strength * (1.0 - sky);
+    let grounded = 1.0 - clamp(in.world_pos.y / max(frame.contact_radius, 0.01), 0.0, 1.0);
+    let away = clamp(0.5 - 0.5 * dot(normal, l), 0.0, 1.0);
+    let shadow = 1.0 - frame.shadow_strength * grounded * away;
+
     let diffuse = max(dot(normal, l), 0.0);
-    let ambient = 0.18;
-    let lit = ambient + (1.0 - ambient) * diffuse;
+    let lit = frame.ambient * ao + (1.0 - frame.ambient) * diffuse * shadow;
 
     // The specular map scales the material's own highlight — the mean of its
     // texel's channels, as the CPU path reads it — and the exponent rides in
@@ -205,10 +246,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let spec_strength = dot(raw_texel(spec_texel.rgb), vec3<f32>(1.0 / 3.0));
     var specular = vec3<f32>(0.0);
     if (in.specular.w > 0.0) {
-        specular = in.specular.rgb * spec_strength * pow(max(dot(normal, half), 0.0), in.specular.w);
+        specular = in.specular.rgb * spec_strength
+            * pow(max(dot(normal, half), 0.0), in.specular.w) * shadow;
     }
     let emissive = in.emissive + emissive_texel.rgb;
-    return vec4<f32>(in.color.rgb * base_texel.rgb * lit + specular + emissive, in.color.a * base_texel.a);
+    return vec4<f32>(surface * base_texel.rgb * lit + specular + emissive, in.color.a * base_texel.a);
 }
 "#
 }
@@ -340,9 +382,14 @@ mod tests {
         assert!(src.contains("pow("));
         // Self-illumination is added, not multiplied.
         assert!(src.contains("in.emissive + emissive_texel.rgb"));
-        assert!(src.contains(
-            "in.color.rgb * base_texel.rgb * lit + specular + emissive"
-        ));
+        assert!(src.contains("surface * base_texel.rgb * lit + specular + emissive"));
+        // Viewport shading modes branch in the fragment stage, and the two
+        // occlusion terms are computed from the same normal both paths use.
+        assert!(src.contains("frame.shading_mode == 1u"));
+        assert!(src.contains("frame.shading_mode == 2u"));
+        assert!(src.contains("frame.shading_mode == 3u"));
+        assert!(src.contains("frame.ao_strength") && src.contains("frame.shadow_strength"));
+        assert!(src.contains("frame.contact_radius"));
         // A normal or specular map is data, not colour: the sRGB decode the
         // array applies to every texel is undone for those two, so byte 128
         // means 0.5 the way the CPU path reads it.

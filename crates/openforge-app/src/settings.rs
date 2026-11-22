@@ -11,6 +11,7 @@
 
 use eframe::egui;
 use glam::Vec3;
+use openforge_materials::ShadingMode;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -76,6 +77,16 @@ pub struct Settings {
     pub window_size: [f32; 2],
     /// Which panels the workspace shows.
     pub panels: WorkspacePanels,
+    /// How the viewport shades surfaces (View ▸ Shading).
+    pub shading_mode: ShadingMode,
+    /// Share of the light reaching a surface facing away from the key light.
+    pub ambient: f32,
+    /// Strength of the hemisphere ambient-occlusion term.
+    pub ao_strength: f32,
+    /// Strength of the ground-contact shadow term.
+    pub shadow_strength: f32,
+    /// Height above the ground over which the contact shadow fades.
+    pub contact_radius: f32,
 }
 
 /// Which panels the workspace shows.
@@ -121,11 +132,28 @@ impl Default for Settings {
             recent_files: Vec::new(),
             window_size: [1280.0, 800.0],
             panels: WorkspacePanels::default(),
+            shading_mode: ShadingMode::Lit,
+            ambient: 0.18,
+            ao_strength: 1.0,
+            shadow_strength: 1.0,
+            contact_radius: 0.75,
         }
     }
 }
 
 impl Settings {
+    /// The viewport's shading options, clamped to safe values. Both viewport
+    /// paths read these same numbers.
+    pub fn shade_options(&self) -> openforge_materials::ShadeOptions {
+        openforge_materials::ShadeOptions {
+            ambient: self.ambient,
+            ao_strength: self.ao_strength,
+            shadow_strength: self.shadow_strength,
+            contact_radius: self.contact_radius,
+        }
+        .clamped()
+    }
+
     /// The ground grid's lines, centred on the origin.
     ///
     /// A step the window could not mean (zero, negative, non-finite) falls
@@ -527,6 +555,7 @@ mod tests {
                 uv_editor: true,
                 timeline: true,
             },
+            ..Settings::default()
         };
         let json = settings.to_json();
         assert!(json.ends_with('\n'), "the file ends its last line");
@@ -601,6 +630,41 @@ mod tests {
         settings.save(&flat).expect("a bare name needs no directory made");
         assert_eq!(Settings::load(&flat), Some(settings));
         let _ = std::fs::remove_file(&flat);
+    }
+
+    #[test]
+    fn shading_choices_default_and_round_trip_through_the_file() {
+        let defaults = Settings::default();
+        assert_eq!(defaults.shading_mode, ShadingMode::Lit);
+        assert_eq!(
+            defaults.shade_options(),
+            openforge_materials::ShadeOptions::default()
+        );
+
+        let mut settings = Settings::default();
+        settings.shading_mode = ShadingMode::Clay;
+        settings.ambient = 0.3;
+        settings.ao_strength = 0.4;
+        settings.shadow_strength = 0.5;
+        settings.contact_radius = 2.0;
+        let json = settings.to_json();
+        assert!(json.contains("\"clay\""), "stored by name: {json}");
+        assert_eq!(
+            Settings::from_json(&json).expect("round trip"),
+            settings
+        );
+    }
+
+    #[test]
+    fn shading_options_from_a_file_are_clamped() {
+        let settings = Settings::from_json(
+            "{\"ambient\": 5.0, \"ao_strength\": -2.0, \"contact_radius\": 0.0}",
+        )
+        .expect("numbers parse");
+        let opts = settings.shade_options();
+        assert_eq!(opts.ambient, 1.0);
+        assert_eq!(opts.ao_strength, 0.0);
+        assert_eq!(opts.contact_radius, 0.01);
     }
 
     #[test]

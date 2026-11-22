@@ -24,7 +24,9 @@ use openforge_core::tool::{
 use openforge_core::undo::UndoStack;
 use openforge_core::NodeId;
 use openforge_ops::MeshOps;
-use openforge_materials::{MapKind, Material, MaterialLibrary, Texture};
+use openforge_materials::{
+    MapKind, Material, MaterialLibrary, ShadeOptions, ShadingMode, Texture,
+};
 use openforge_plugin::{builtin_plugins, PluginHost};
 use openforge_project::{Project, ProjectRig};
 use openforge_render::{FaceShading, FrameStats, NodeMaterials, PickElement, TextureLayer};
@@ -3273,7 +3275,12 @@ impl OpenForgeApp {
                 (t.v[2].pos, t.v[2].uv),
             );
             let normal = openforge_materials::apply_normal_map(t.v[0].normal, frame, maps.normal);
-            let [r, g, b, _] = openforge_materials::shade_surface(
+            // Viewport shading mode and occlusion come from the Preferences
+            // and View menu. The GPU path reads the same two values, so the
+            // fallback and the wgpu frame agree in every mode.
+            let opts: ShadeOptions = self.settings.shade_options();
+            let mode = self.settings.shading_mode;
+            let [r, g, b, _] = openforge_materials::shade_surface_configured(
                 base,
                 material.specular * maps.specular,
                 material.emissive + maps.emissive,
@@ -3281,6 +3288,9 @@ impl OpenForgeApp {
                 normal,
                 light,
                 view_dir,
+                centroid.y,
+                opts,
+                mode,
             );
             let color = egui::Color32::from_rgb(r, g, b);
             // A textured face paints its texels through an egui mesh, which
@@ -3947,6 +3957,23 @@ impl OpenForgeApp {
                                 .clicked()
                             {
                                 self.set_view(view);
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    ui.menu_button("Shading", |ui| {
+                        for mode in ShadingMode::ALL {
+                            if ui
+                                .selectable_label(self.settings.shading_mode == mode, mode.label())
+                                .on_hover_text(match mode {
+                                    ShadingMode::Lit => "Material colours, ambient occlusion and contact shadows",
+                                    ShadingMode::Unlit => "Material colours without lighting",
+                                    ShadingMode::Clay => "Neutral clay, to read the form",
+                                    ShadingMode::Normals => "World-space shading normals as RGB",
+                                })
+                                .clicked()
+                            {
+                                self.settings.shading_mode = mode;
                                 ui.close_menu();
                             }
                         }
@@ -4811,6 +4838,46 @@ impl OpenForgeApp {
                     .on_hover_text("World units between grid lines");
                     ui.label("lines each way:");
                     ui.add(egui::DragValue::new(&mut self.settings.grid_half).range(1..=64));
+                });
+                ui.separator();
+                ui.label("Shading");
+                ui.horizontal(|ui| {
+                    ui.label("Ambient:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.ambient)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text("Light reaching a surface facing away from the key light");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("AO:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.ao_strength)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text("Hemisphere ambient occlusion strength");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Contact:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.shadow_strength)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text("Ground contact-shadow strength");
+                    ui.label("radius:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.settings.contact_radius)
+                            .speed(0.05)
+                            .range(0.01..=10.0)
+                            .fixed_decimals(2),
+                    )
+                    .on_hover_text("Height over which the contact shadow fades");
                 });
                 ui.separator();
                 ui.label("Camera");
@@ -5755,8 +5822,19 @@ impl OpenForgeApp {
             (Some(_), true) => self.node_materials(),
             _ => NodeMaterials::new(),
         };
+        // Read the shading choices before borrowing the GPU mutably.
+        let shading = (
+            self.settings.shading_mode.as_u32(),
+            [
+                self.settings.ambient,
+                self.settings.ao_strength,
+                self.settings.shadow_strength,
+                self.settings.contact_radius,
+            ],
+        );
         let rendered = match (render_state, self.gpu.as_mut()) {
             (Some(state), Some(gpu)) => {
+                gpu.set_shading(shading.0, shading.1);
                 let scale = ui.ctx().pixels_per_point();
                 let size = [rect.width() * scale, rect.height() * scale];
                 let camera = gpu_viewport::orbit_camera(&self.cameras[pane]);

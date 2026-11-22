@@ -10,4 +10,5 @@ openforge-core = { path = "../openforge-core" }
 glam.workspace = true
 thiserror.workspace = true
 log.workspace = true
+serde.workspace = true
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

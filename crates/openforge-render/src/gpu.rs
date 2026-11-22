@@ -370,6 +370,10 @@ pub struct GpuRenderer {
     bind_group_layout: wgpu::BindGroupLayout,
     frame_uniforms: wgpu::Buffer,
     frame_bind_group: wgpu::BindGroup,
+    /// The grid and edge overlay share a helper pass that always uses Lit with
+    /// occlusion off, so their authored colours survive every viewport mode.
+    helper_uniforms: wgpu::Buffer,
+    helper_bind_group: wgpu::BindGroup,
     gizmo_uniforms: wgpu::Buffer,
     gizmo_bind_group: wgpu::BindGroup,
     face_texture: wgpu::Texture,
@@ -404,6 +408,10 @@ pub struct GpuRenderer {
     edge_vertices: wgpu::Buffer,
     edge_vertex_capacity: u64,
     edge_vertex_count: u32,
+    /// Viewport shading choices, mirrored into the frame uniforms each pass.
+    shading_mode: u32,
+    /// ambient, ao strength, shadow strength, contact radius.
+    shading_options: [f32; 4],
     stats: FrameStats,
 }
 
@@ -481,6 +489,14 @@ impl GpuRenderer {
                     _pad0: 0.0,
                     light_dir: KEY_LIGHT.normalize().to_array(),
                     time: 0.0,
+                    shading_mode: 0,
+                    ambient: 0.18,
+                    ao_strength: 0.0,
+                    shadow_strength: 0.0,
+                    contact_radius: 0.75,
+                    _pad1: 0.0,
+                    _pad2: 0.0,
+                    _pad3: 0.0,
                 }),
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             })
@@ -516,6 +532,13 @@ impl GpuRenderer {
         let frame_bind_group = bind_group(
             "openforge-frame-bind-group",
             &frame_uniforms,
+            &face_texture_view,
+            &face_sampler,
+        );
+        let helper_uniforms = uniform_buffer("openforge-helper-uniforms");
+        let helper_bind_group = bind_group(
+            "openforge-helper-bind-group",
+            &helper_uniforms,
             &face_texture_view,
             &face_sampler,
         );
@@ -770,6 +793,8 @@ impl GpuRenderer {
             bind_group_layout,
             frame_uniforms,
             frame_bind_group,
+            helper_uniforms,
+            helper_bind_group,
             gizmo_uniforms,
             gizmo_bind_group,
             face_texture,
@@ -799,8 +824,18 @@ impl GpuRenderer {
             edge_vertices,
             edge_vertex_capacity: 1024,
             edge_vertex_count: 0,
+            shading_mode: 0,
+            shading_options: [0.18, 1.0, 1.0, 0.75],
             stats: FrameStats::default(),
         }
+    }
+
+    /// Set the viewport's shading mode (0 Lit, 1 Unlit, 2 Clay, 3 Normals)
+    /// and its `[ambient, ao strength, shadow strength, contact radius]`
+    /// options. Applied to the scene pass on the next [`render`](Self::render).
+    pub fn set_shading(&mut self, mode: u32, options: [f32; 4]) {
+        self.shading_mode = mode;
+        self.shading_options = options;
     }
 
     /// Current offscreen size in pixels, of the pane given.
@@ -862,6 +897,14 @@ impl GpuRenderer {
                 &self.bind_group_layout,
                 "openforge-frame-bind-group",
                 &self.frame_uniforms,
+                &self.face_texture_view,
+                &self.face_sampler,
+            );
+            self.helper_bind_group = face_bind_group(
+                device,
+                &self.bind_group_layout,
+                "openforge-helper-bind-group",
+                &self.helper_uniforms,
                 &self.face_texture_view,
                 &self.face_sampler,
             );
@@ -1324,8 +1367,29 @@ impl GpuRenderer {
     ) {
         let size = self.size(slot);
         let aspect = size[0] as f32 / size[1].max(1) as f32;
-        let frame = FrameUniforms::new(camera, aspect, KEY_LIGHT, time);
+        let [ambient, ao, shadow, contact] = self.shading_options;
+        let frame = FrameUniforms::new(camera, aspect, KEY_LIGHT, time)
+            .with_shading(self.shading_mode, ambient, ao, shadow, contact);
         queue.write_buffer(&self.frame_uniforms, 0, bytemuck::bytes_of(&frame));
+
+        // Helper geometry keeps Lit with both occlusions off: the grid and the
+        // edge overlay must not change colour when the user switches modes.
+        let helper = FrameUniforms {
+            view_proj: camera.view_proj(aspect).to_cols_array_2d(),
+            camera_pos: camera.eye().to_array(),
+            _pad0: 0.0,
+            light_dir: KEY_LIGHT.normalize().to_array(),
+            time,
+            shading_mode: 0,
+            ambient: 0.18,
+            ao_strength: 0.0,
+            shadow_strength: 0.0,
+            contact_radius: 0.75,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
+        };
+        queue.write_buffer(&self.helper_uniforms, 0, bytemuck::bytes_of(&helper));
 
         let gizmo = FrameUniforms {
             view_proj: gizmo_view_proj(camera).to_cols_array_2d(),
@@ -1333,6 +1397,14 @@ impl GpuRenderer {
             _pad0: 0.0,
             light_dir: unlit_normal().to_array(),
             time,
+            shading_mode: 0,
+            ambient: 0.18,
+            ao_strength: 0.0,
+            shadow_strength: 0.0,
+            contact_radius: 0.75,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
         };
         queue.write_buffer(&self.gizmo_uniforms, 0, bytemuck::bytes_of(&gizmo));
     }
@@ -1372,7 +1444,7 @@ impl GpuRenderer {
 
         // 1. Ground grid: no depth write, so meshes composite over it.
         pass.set_pipeline(&self.grid_pipeline);
-        pass.set_bind_group(0, &self.frame_bind_group, &[]);
+        pass.set_bind_group(0, &self.helper_bind_group, &[]);
         pass.set_vertex_buffer(0, self.grid_vertices.slice(..));
         pass.draw(0..self.grid_vertex_count, 0..1);
 
@@ -1389,7 +1461,7 @@ impl GpuRenderer {
         //    occluded by the meshes in front of them.
         if self.edge_vertex_count > 0 {
             pass.set_pipeline(&self.edge_pipeline);
-            pass.set_bind_group(0, &self.frame_bind_group, &[]);
+            pass.set_bind_group(0, &self.helper_bind_group, &[]);
             pass.set_vertex_buffer(0, self.edge_vertices.slice(..));
             pass.draw(0..self.edge_vertex_count, 0..1);
         }

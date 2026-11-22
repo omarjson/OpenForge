@@ -397,9 +397,9 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **764 tests pass** (761 `#[test]`
+workspace builds with **0 warnings**, **777 tests pass** (774 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Forty-nine work-streams are done — the engine layer from the **wgpu
+Fifty work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
 through **gizmo axes modes and a placed pivot** (#39), **boolean CSG that
@@ -417,6 +417,18 @@ plus a progress report:
   because parity has no machine-checkable definition. Run it after every
   work-stream and re-score the area you touched.
 
+- **Viewport shading modes, ambient occlusion and contact shadows (#50).**
+  `openforge-materials::shading` gained `ShadingMode` (Lit / Unlit / Clay /
+  Normals), `ShadeOptions` and the pure `occlusion_terms` +
+  `shade_surface_configured` — the one CPU surface the GPU WGSL mirrors, so
+  both viewport paths agree in every mode. The GPU fragment shader reads the
+  mode and the three occlusion knobs from an enlarged `FrameUniforms`; the
+  grid and edge overlay use a separate helper pass pinned to Lit with
+  occlusion off, so their authored colours never change. View ▸ Shading picks
+  the mode and Preferences holds the ambient / AO / contact sliders, both
+  persisted in the settings file. The occlusion is deliberately analytic
+  (hemisphere AO from the shading normal, a ground-contact falloff from world
+  height): a shadow map / SSAO pass is a separate, larger follow-up.
 - **`openforge-render` grew a real GPU backend** behind the `gpu` feature.
   `gpu::GpuRenderer` builds pipelines from the existing WGSL, keeps a growable
   scene vertex/index buffer, writes per-frame uniforms, and draws into an
@@ -2377,11 +2389,11 @@ Prioritized next steps:
    invert, grow / shrink, hide / isolate / unhide), the edge loop / ring walks
    (#17), the select-through switch (#18: the ID pass or the projection, P) and
    the four material maps with a per-material highlight (#36) and the six
-   axis-aligned orthographic projections (#38) are in. What remains of the
-   viewport surface: a **multi-view layout** (ZModeler's Layout 1/2/3 put
-   several viewports side by side — that landed in #44, with a camera each and
-   a target per pane on the GPU path), shadowing / ambient occlusion and a
-   configurable shading mode.
+   axis-aligned orthographic projections (#38), and the shading modes with
+   hemisphere AO and contact shadows (#50) are in. What remains of the
+   viewport surface: a true **shadow map / SSAO** pass (the current occlusion is
+   analytic), and configurable shading presets beyond the four modes already
+   offered.
 2. **Deepen the boolean engine.** The three operations land closed solids
    now (#40: normalized `f64`, slivers kept, tolerance welding, the
    T-junction pass on a grid), the app says whether the result came out

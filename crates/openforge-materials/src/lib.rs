@@ -30,7 +30,10 @@ pub use error::MaterialError;
 pub use library::MaterialLibrary;
 pub use maps::{apply_normal_map, tangent_frame, MapTexels};
 pub use material::{MapKind, Material};
-pub use shading::{shade_lambert, shade_phong, shade_surface};
+pub use shading::{
+    occlusion_terms, shade_lambert, shade_phong, shade_surface, shade_surface_configured,
+    ShadeOptions, ShadingMode,
+};
 pub use texture::{Texture, MISSING_TEXEL};
 
 /// Returns the crate name, used by a smoke test to confirm linkage.

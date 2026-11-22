@@ -180,9 +180,15 @@ impl GpuVertex {
 /// | `_pad0`      | 76     | 4    |
 /// | `light_dir`  | 80     | 12   |
 /// | `time`       | 92     | 4    |
+/// | `shading_mode` | 96   | 4    |
+/// | `ambient`    | 100    | 4    |
+/// | `ao_strength` | 104   | 4    |
+/// | `shadow_strength` | 108 | 4  |
+/// | `contact_radius` | 112 | 4  |
+/// | `_pad1..3`   | 116    | 12   |
 ///
-/// Total: 96 bytes. `camera_pos`/`light_dir` are `vec3<f32>` in WGSL, which
-/// are 16-byte aligned; the explicit `_pad0` keeps this struct free of
+/// Total: 128 bytes. `camera_pos`/`light_dir` are `vec3<f32>` in WGSL, which
+/// are 16-byte aligned; the explicit pads keep this struct free of
 /// implicit padding (required by `bytemuck::Pod`).
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -197,11 +203,29 @@ pub struct FrameUniforms {
     pub light_dir: [f32; 3],
     /// Seconds since renderer start (reserved for shader animation).
     pub time: f32,
+    /// Numeric shading-mode code (0 Lit, 1 Unlit, 2 Clay, 3 Normals). Kept as
+    /// a plain `u32` so this crate needs no dependency on the materials crate.
+    pub shading_mode: u32,
+    /// Share of the light reaching a surface facing away from the key light.
+    pub ambient: f32,
+    /// Strength of the hemisphere ambient-occlusion term, `0..=1`.
+    pub ao_strength: f32,
+    /// Strength of the ground-contact shadow term, `0..=1`.
+    pub shadow_strength: f32,
+    /// Height over the ground plane over which the contact shadow fades.
+    pub contact_radius: f32,
+    /// Padding: keeps the block at 128 bytes, a multiple of WGSL's 16-byte
+    /// uniform struct alignment.
+    pub _pad1: f32,
+    pub _pad2: f32,
+    pub _pad3: f32,
 }
 
 impl FrameUniforms {
     /// Build the block for a camera at the given aspect ratio, with the key
-    /// light direction (normalized internally) and time.
+    /// light direction (normalized internally) and time. Shading defaults to
+    /// Lit with no occlusion; call [`with_shading`](Self::with_shading) to set
+    /// the viewport's choices.
     pub fn new(camera: &OrbitCamera, aspect: f32, light_dir: Vec3, time: f32) -> Self {
         Self {
             view_proj: camera.view_proj(aspect).to_cols_array_2d(),
@@ -209,7 +233,36 @@ impl FrameUniforms {
             _pad0: 0.0,
             light_dir: light_dir.normalize_or_zero().to_array(),
             time,
+            shading_mode: 0,
+            ambient: 0.18,
+            ao_strength: 0.0,
+            shadow_strength: 0.0,
+            contact_radius: 0.75,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
         }
+    }
+
+    /// Set the viewport's shading choices, clamping them to safe ranges.
+    /// Helper geometry passes use this with mode 0 and both strengths at zero
+    /// so the grid and gizmo keep their authored colours in every view mode.
+    #[must_use]
+    pub fn with_shading(
+        mut self,
+        mode: u32,
+        ambient: f32,
+        ao_strength: f32,
+        shadow_strength: f32,
+        contact_radius: f32,
+    ) -> Self {
+        let finite_or = |value: f32, fallback: f32| if value.is_finite() { value } else { fallback };
+        self.shading_mode = mode;
+        self.ambient = finite_or(ambient, 0.18).clamp(0.0, 1.0);
+        self.ao_strength = finite_or(ao_strength, 0.0).clamp(0.0, 1.0);
+        self.shadow_strength = finite_or(shadow_strength, 0.0).clamp(0.0, 1.0);
+        self.contact_radius = finite_or(contact_radius, 0.75).clamp(0.01, 100.0);
+        self
     }
 }
 
@@ -281,12 +334,20 @@ mod tests {
     }
 
     #[test]
-    fn frame_uniforms_layout_is_96_bytes() {
-        assert_eq!(size_of::<FrameUniforms>(), 96);
+    fn frame_uniforms_layout_is_128_bytes() {
+        assert_eq!(size_of::<FrameUniforms>(), 128);
         assert_eq!(offset_of!(FrameUniforms, view_proj), 0);
         assert_eq!(offset_of!(FrameUniforms, camera_pos), 64);
         assert_eq!(offset_of!(FrameUniforms, light_dir), 80);
         assert_eq!(offset_of!(FrameUniforms, time), 92);
+        assert_eq!(offset_of!(FrameUniforms, shading_mode), 96);
+        assert_eq!(offset_of!(FrameUniforms, ambient), 100);
+        assert_eq!(offset_of!(FrameUniforms, ao_strength), 104);
+        assert_eq!(offset_of!(FrameUniforms, shadow_strength), 108);
+        assert_eq!(offset_of!(FrameUniforms, contact_radius), 112);
+        assert_eq!(offset_of!(FrameUniforms, _pad1), 116);
+        assert_eq!(offset_of!(FrameUniforms, _pad2), 120);
+        assert_eq!(offset_of!(FrameUniforms, _pad3), 124);
     }
 
     #[test]
@@ -300,6 +361,21 @@ mod tests {
         assert!((Vec3::from(u.light_dir).length() - 1.0).abs() < 1e-6);
         assert_eq!(u.time, 0.25);
         assert_eq!(u._pad0, 0.0);
+        assert_eq!(u.shading_mode, 0);
+        assert_eq!(u._pad1, 0.0);
+        assert_eq!(u._pad2, 0.0);
+        assert_eq!(u._pad3, 0.0);
+    }
+
+    #[test]
+    fn with_shading_sets_the_mode_and_clamps_the_options() {
+        let u = FrameUniforms::new(&OrbitCamera::default(), 1.0, Vec3::Y, 0.0)
+            .with_shading(2, f32::NAN, -1.0, 4.0, 0.0);
+        assert_eq!(u.shading_mode, 2);
+        assert_eq!(u.ambient, 0.18, "NaN falls back to the default");
+        assert_eq!(u.ao_strength, 0.0);
+        assert_eq!(u.shadow_strength, 1.0);
+        assert_eq!(u.contact_radius, 0.01);
     }
 
     #[test]
