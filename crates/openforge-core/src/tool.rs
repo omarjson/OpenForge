@@ -360,7 +360,7 @@ mod tests {
 
     fn pointer(origin: Vec3, snap: Option<FreeSnap>) -> Pointer {
         Pointer {
-            ray: Ray { origin, direction: Vec3::NEG_Z },
+            ray: Ray { origin, direction: Vec3::NEG_Y },
             ndc: glam::Vec2::ZERO,
             snap,
         }
@@ -380,7 +380,7 @@ mod tests {
         };
         // The ray meets the drag plane at the origin, so the unsnapped
         // destination is (0, 0.2, 0): only y is off a quarter-unit step.
-        let at = pointer(Vec3::new(0.0, start.y, 5.0), None);
+        let at = pointer(Vec3::new(0.0, 5.0, 0.0), None);
         let mut tool = TransformTool::new(TransformMode::Move);
         let mut ctx = ToolContext {
             scene: &mut free,
@@ -390,7 +390,7 @@ mod tests {
         tool.on_pointer_move(&mut ctx, &at);
         assert!((free.get(id).unwrap().transform.translation.y - 0.2).abs() < 1e-6);
 
-        let at = pointer(Vec3::new(0.0, start.y, 5.0), Some(step));
+        let at = pointer(Vec3::new(0.0, 5.0, 0.0), Some(step));
         let mut ctx = ToolContext {
             scene: &mut snapped,
             selection: &mut Selection::new(),
@@ -415,7 +415,7 @@ mod tests {
             axis: Vec3::X,
         };
         // delta.x = 0.37, so the factor is 1.37 and snaps to 1.4.
-        let at = pointer(Vec3::new(0.37, 0.0, 5.0), Some(step));
+        let at = pointer(Vec3::new(0.37, 5.0, 0.0), Some(step));
         let mut tool = TransformTool::new(TransformMode::Scale);
         let mut ctx = ToolContext {
             scene: &mut scene,
@@ -436,11 +436,12 @@ mod tests {
             mode: TransformMode::Rotate,
             start_point: Vec3::ZERO,
             start_transforms: vec![(id, scene.get(id).unwrap().transform)],
-            axis: Vec3::Z,
+            axis: Vec3::X,
         };
-        // With axis Z the drag plane is y = 0; a ray at y = 0.23 gives an
-        // angle of 0.23 radians about Y, which snaps to 0.2.
-        let at = pointer(Vec3::new(0.0, 0.23, 5.0), Some(step));
+        // With axis X the drag plane is horizontal and the rotation runs
+        // along Z: a ray landing at z = 0.23 gives an angle of 0.23 radians,
+        // which snaps to 0.2.
+        let at = pointer(Vec3::new(0.0, 5.0, 0.23), Some(step));
         let mut tool = TransformTool::new(TransformMode::Rotate);
         let mut ctx = ToolContext {
             scene: &mut scene,
@@ -449,7 +450,7 @@ mod tests {
         };
         tool.on_pointer_move(&mut ctx, &at);
         let got = scene.get(id).unwrap().transform.rotation;
-        let expected = glam::Quat::from_axis_angle(Vec3::Y, 0.2);
+        let expected = glam::Quat::from_axis_angle(Vec3::X, 0.2);
         assert!(
             (got.x - expected.x).abs() < 1e-5 && (got.w - expected.w).abs() < 1e-5,
             "rotation {got:?} vs {expected:?}"
