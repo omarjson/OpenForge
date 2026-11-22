@@ -516,10 +516,13 @@ mod tests {
     }
 
     #[test]
-    fn the_mode_cycle_is_off_grid_vertex() {
+    fn the_mode_cycle_covers_every_mode() {
         assert_eq!(SnapMode::Off.next(), SnapMode::Grid);
         assert_eq!(SnapMode::Grid.next(), SnapMode::Vertex);
-        assert_eq!(SnapMode::Vertex.next(), SnapMode::Off);
+        assert_eq!(SnapMode::Vertex.next(), SnapMode::Edge);
+        assert_eq!(SnapMode::Edge.next(), SnapMode::Midpoint);
+        assert_eq!(SnapMode::Midpoint.next(), SnapMode::Face);
+        assert_eq!(SnapMode::Face.next(), SnapMode::Off);
         assert_eq!(SnapMode::Grid.label(), "Grid");
     }
     #[test]
