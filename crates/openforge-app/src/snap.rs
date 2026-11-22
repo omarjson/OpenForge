@@ -32,14 +32,41 @@ pub enum SnapMode {
     Grid,
     /// The nearest vertex under the cursor (Move only).
     Vertex,
+    /// The nearest point along an edge under the cursor (Move only).
+    Edge,
+    /// The midpoint of an edge under the cursor (Move only).
+    Midpoint,
+    /// The centre of a face under the cursor (Move only).
+    Face,
 }
 
 impl SnapMode {
+    /// All modes, in the order the toolbar and the `G` cycle offer them.
+    pub const ALL: [Self; 6] = [
+        Self::Off,
+        Self::Grid,
+        Self::Vertex,
+        Self::Edge,
+        Self::Midpoint,
+        Self::Face,
+    ];
+
+    /// Whether this mode snaps to scene geometry rather than to steps.
+    pub fn snaps_to_geometry(self) -> bool {
+        matches!(
+            self,
+            Self::Vertex | Self::Edge | Self::Midpoint | Self::Face
+        )
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             SnapMode::Off => "Off",
             SnapMode::Grid => "Grid",
             SnapMode::Vertex => "Vertex",
+            SnapMode::Edge => "Edge",
+            SnapMode::Midpoint => "Midpoint",
+            SnapMode::Face => "Face",
         }
     }
 
@@ -48,7 +75,10 @@ impl SnapMode {
         match self {
             SnapMode::Off => SnapMode::Grid,
             SnapMode::Grid => SnapMode::Vertex,
-            SnapMode::Vertex => SnapMode::Off,
+            SnapMode::Vertex => SnapMode::Edge,
+            SnapMode::Edge => SnapMode::Midpoint,
+            SnapMode::Midpoint => SnapMode::Face,
+            SnapMode::Face => SnapMode::Off,
         }
     }
 }
@@ -90,7 +120,9 @@ impl Snap {
     pub fn inverted(self) -> Self {
         let mode = match self.mode {
             SnapMode::Off => SnapMode::Grid,
-            SnapMode::Grid | SnapMode::Vertex => SnapMode::Off,
+            SnapMode::Grid | SnapMode::Vertex | SnapMode::Edge | SnapMode::Midpoint | SnapMode::Face => {
+                SnapMode::Off
+            }
         };
         Self { mode, ..self }
     }
@@ -149,19 +181,23 @@ pub fn snap_measure_in(
             let there = snap_point(here + d, axes, snap.grid);
             Measure::Translate(there - here)
         }
-        (SnapMode::Vertex, Measure::Translate(d)) if !axes.is_empty() => match vertex {
-            Some(v) => {
-                // The grabbed point lands on the vertex, but only along the
-                // axes this handle moves: the rest of the vertex is dropped.
-                let delta = basis.components(v - grab);
-                let mut out = Vec3::ZERO;
-                for &axis in axes {
-                    out = set_component(out, axis, component(delta, axis));
+        (SnapMode::Vertex | SnapMode::Edge | SnapMode::Midpoint | SnapMode::Face, Measure::Translate(d))
+            if !axes.is_empty() =>
+        {
+            match vertex {
+                Some(v) => {
+                    // The grabbed point lands on the target, but only along
+                    // the axes this handle moves: the rest is dropped.
+                    let delta = basis.components(v - grab);
+                    let mut out = Vec3::ZERO;
+                    for &axis in axes {
+                        out = set_component(out, axis, component(delta, axis));
+                    }
+                    Measure::Translate(out)
                 }
-                Measure::Translate(out)
+                None => Measure::Translate(d),
             }
-            None => Measure::Translate(d),
-        },
+        }
         (SnapMode::Grid, Measure::Rotate(axis, a)) => {
             Measure::Rotate(axis, snap_to_step(a, snap.angle))
         }
@@ -177,8 +213,8 @@ pub fn snap_measure_in(
             }
             Measure::Scale(out)
         }
-        // Vertex snapping has nothing to say about rotating or scaling.
-        (SnapMode::Vertex, m) => m,
+        // Geometry snapping has nothing to say about rotating or scaling.
+        (SnapMode::Vertex | SnapMode::Edge | SnapMode::Midpoint | SnapMode::Face, m) => m,
     }
 }
 
@@ -538,6 +574,60 @@ mod tests {
         assert_eq!(d.y, 0.0);
         assert_eq!(d.z, 0.0);
         assert!((basis.to_world(d) - Vec3::Z * expected).length() < 1e-5);
+    }
+
+    #[test]
+    fn all_geometry_modes_cycle_and_report_their_names() {
+        let labels = ["Off", "Grid", "Vertex", "Edge", "Midpoint", "Face"];
+        for (i, mode) in SnapMode::ALL.iter().enumerate() {
+            assert_eq!(mode.label(), labels[i]);
+            assert_eq!(mode.next(), SnapMode::ALL[(i + 1) % SnapMode::ALL.len()]);
+        }
+        assert!(SnapMode::ALL[2..].iter().all(|m| m.snaps_to_geometry()));
+        assert!(!SnapMode::Off.snaps_to_geometry());
+        assert!(!SnapMode::Grid.snaps_to_geometry());
+    }
+
+    #[test]
+    fn every_geometry_mode_lands_a_move_on_its_target() {
+        let target = Vec3::new(1.0, 2.0, 3.0);
+        let grab = Vec3::ZERO;
+        for mode in [SnapMode::Vertex, SnapMode::Edge, SnapMode::Midpoint, SnapMode::Face] {
+            let snap = Snap { mode, ..Snap::default() };
+            let Measure::Translate(d) = snap_measure(
+                snap,
+                &[Axis::X, Axis::Y, Axis::Z],
+                grab,
+                Measure::Translate(Vec3::ZERO),
+                Some(target),
+            ) else {
+                panic!("a translate stays a translate");
+            };
+            assert!((d - target).length() < 1e-6, "{mode:?}: {d} vs {target}");
+        }
+    }
+
+    #[test]
+    fn geometry_modes_leave_rotation_and_scale_alone() {
+        for mode in [SnapMode::Vertex, SnapMode::Edge, SnapMode::Midpoint, SnapMode::Face] {
+            let snap = Snap { mode, ..Snap::default() };
+            assert_eq!(
+                snap_measure(snap, &[Axis::X], Vec3::ZERO, Measure::Rotate(Axis::X, 0.3), None),
+                Measure::Rotate(Axis::X, 0.3)
+            );
+            assert_eq!(
+                snap_measure(snap, &[Axis::X], Vec3::ZERO, Measure::Scale(Vec3::ONE * 1.3), None),
+                Measure::Scale(Vec3::ONE * 1.3)
+            );
+        }
+    }
+
+    #[test]
+    fn the_invert_modifier_turns_every_geometry_mode_off() {
+        for &mode in &SnapMode::ALL[2..] {
+            assert_eq!(Snap { mode, ..Snap::default() }.inverted().mode, SnapMode::Off);
+        }
+        assert_eq!(SnapMode::Off.inverted(), SnapMode::Grid);
     }
 
 }

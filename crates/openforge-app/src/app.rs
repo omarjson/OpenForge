@@ -7,7 +7,7 @@ use crate::gpu_viewport::{self, GpuViewport};
 use crate::settings::{self, Settings, Theme, WorkspacePanels, SHORTCUTS};
 use crate::snap::{self, SnapMode};
 use crate::uv_editor::{self, UvEditor};
-use crate::viewport::{self, Camera, ViewKind};
+use crate::viewport::{self, Camera, SnapKind, ViewKind};
 use eframe::egui;
 use eframe::egui_wgpu::RenderState;
 use glam::{Mat4, Vec2, Vec3, Vec4};
@@ -2657,12 +2657,13 @@ impl OpenForgeApp {
         )
     }
 
-    /// The vertex a live Move drag would land on this frame: the one nearest
-    /// the cursor within [`snap::SNAP_RADIUS_PIXELS`] on screen, excluding the
-    /// geometry the drag itself is carrying.
+    /// The scene point a live Move drag would land on this frame: the vertex,
+    /// edge, edge midpoint or face centre nearest the cursor within
+    /// [`snap::SNAP_RADIUS_PIXELS`] on screen, excluding the geometry the drag
+    /// itself is carrying.
     ///
-    /// `None` unless vertex snapping is in force, so nothing else pays for the
-    /// scene walk.
+    /// `None` unless a geometry-snapping mode is in force, so nothing else pays
+    /// for the scene walk.
     fn snap_target(
         &mut self,
         cursor: egui::Pos2,
@@ -2670,14 +2671,27 @@ impl OpenForgeApp {
         vp: glam::Mat4,
         mode: SnapMode,
     ) -> Option<viewport::SnapCandidate> {
-        if mode != SnapMode::Vertex {
+        if !mode.snaps_to_geometry() {
             return None;
         }
+        let kind = match mode {
+            SnapMode::Vertex => SnapKind::Vertex,
+            SnapMode::Edge => SnapKind::Edge,
+            SnapMode::Midpoint => SnapKind::Midpoint,
+            SnapMode::Face => SnapKind::Face,
+            _ => return None,
+        };
         let targets = self.gizmo.drag.as_ref()?.targets.clone();
         let (moving_nodes, moving_vertices) = targets.moving();
         let size = [rect.width(), rect.height()];
-        let candidates =
-            viewport::snap_candidates(&mut self.scene, &moving_nodes, &moving_vertices, vp, size);
+        let candidates = viewport::snap_candidates_kind(
+            &mut self.scene,
+            &moving_nodes,
+            &moving_vertices,
+            vp,
+            size,
+            kind,
+        );
         // `project` yields viewport-relative pixels; the cursor is in window
         // space, so bring it into the same frame before measuring.
         let local = [cursor.x - rect.min.x, cursor.y - rect.min.y];
@@ -2712,6 +2726,9 @@ impl OpenForgeApp {
         let what = match snap.mode {
             SnapMode::Grid => format!("snap grid {}", snap.grid),
             SnapMode::Vertex => "snap vertex".to_string(),
+            SnapMode::Edge => "snap edge".to_string(),
+            SnapMode::Midpoint => "snap midpoint".to_string(),
+            SnapMode::Face => "snap face".to_string(),
             SnapMode::Off => return None,
         };
         Some(format!(
@@ -4256,7 +4273,7 @@ impl OpenForgeApp {
         if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::U)) {
             self.unhide_all_nodes();
         }
-        // Snapping: G cycles Off → Grid → Vertex.
+        // Snapping: G cycles Off → Grid → Vertex → Edge → Midpoint → Face.
         if ctx.input(|i| i.key_pressed(egui::Key::G)) {
             self.snap.mode = self.snap.mode.next();
             self.dirty = true;
@@ -4345,7 +4362,7 @@ impl OpenForgeApp {
                 }
                 ui.separator();
                 ui.label("Snap:");
-                for mode in [SnapMode::Off, SnapMode::Grid, SnapMode::Vertex] {
+                for mode in SnapMode::ALL {
                     let hover = match mode {
                         SnapMode::Off => "Free transforms (hold Ctrl to snap to the grid)",
                         SnapMode::Grid => {
@@ -4353,6 +4370,15 @@ impl OpenForgeApp {
                         }
                         SnapMode::Vertex => {
                             "Move lands the grabbed point on the vertex under the cursor (hold Ctrl to turn off)"
+                        }
+                        SnapMode::Edge => {
+                            "Move lands the grabbed point on the nearest point of an edge (hold Ctrl to turn off)"
+                        }
+                        SnapMode::Midpoint => {
+                            "Move lands the grabbed point on an edge midpoint (hold Ctrl to turn off)"
+                        }
+                        SnapMode::Face => {
+                            "Move lands the grabbed point on a face centre (hold Ctrl to turn off)"
                         }
                     };
                     if ui
@@ -8604,6 +8630,12 @@ mod tests {
         step_with_keys(&ctx, &mut app, key_frame(1.0, egui::Key::G));
         assert_eq!(app.snap.mode, SnapMode::Vertex);
         step_with_keys(&ctx, &mut app, key_frame(2.0, egui::Key::G));
+        assert_eq!(app.snap.mode, SnapMode::Edge);
+        step_with_keys(&ctx, &mut app, key_frame(3.0, egui::Key::G));
+        assert_eq!(app.snap.mode, SnapMode::Midpoint);
+        step_with_keys(&ctx, &mut app, key_frame(4.0, egui::Key::G));
+        assert_eq!(app.snap.mode, SnapMode::Face);
+        step_with_keys(&ctx, &mut app, key_frame(5.0, egui::Key::G));
         assert_eq!(app.snap.mode, SnapMode::Off, "the cycle comes round again");
     }
 

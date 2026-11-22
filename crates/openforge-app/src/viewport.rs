@@ -1064,16 +1064,43 @@ pub fn marquee_elements(
     out
 }
 
-/// A vertex a drag can snap to: where it is in the world, where it lands on
-/// screen (viewport-relative pixels, the frame [`project`] returns), and its
-/// depth, which breaks a screen-distance tie in favour of the nearer vertex.
+/// What geometry a snap candidate represents. The app maps its snap mode to
+/// one of these before asking for candidates.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SnapKind {
+    #[default]
+    Vertex,
+    Edge,
+    Midpoint,
+    Face,
+}
+
+/// The two ends of an edge candidate, in world space and on screen. Kept so
+/// [`nearest_candidate`] can resolve the closest point on the edge to the
+/// cursor rather than only its middle.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct SnapSegment {
+    pub a_screen: [f32; 2],
+    pub b_screen: [f32; 2],
+    pub a_world: Vec3,
+    pub b_world: Vec3,
+}
+
+/// A piece of geometry a drag can snap to: where it is in the world, where it
+/// lands on screen (viewport-relative pixels, the frame [`project`] returns),
+/// and its depth, which breaks a screen-distance tie in favour of the nearer
+/// one.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct SnapCandidate {
     pub node: NodeId,
+    /// The vertex / edge / face index, in the level the candidate was made at.
     pub vertex: u32,
     pub world: Vec3,
     pub screen: [f32; 2],
     pub depth: f32,
+    pub kind: SnapKind,
+    /// Set only for [`SnapKind::Edge`].
+    pub segment: Option<SnapSegment>,
 }
 
 /// Every vertex a drag may snap to: the vertices of the visible, unfrozen
@@ -1090,6 +1117,20 @@ pub fn snap_candidates(
     vp: Mat4,
     size: [f32; 2],
 ) -> Vec<SnapCandidate> {
+    snap_candidates_kind(scene, moving_nodes, moving_vertices, vp, size, SnapKind::Vertex)
+}
+
+/// [`snap_candidates`] for one kind of geometry. Edges and faces are built
+/// from the same visible, unfrozen meshes after the carried geometry is
+/// excluded, so a drag never snaps to the thing it is moving.
+pub fn snap_candidates_kind(
+    scene: &mut Scene,
+    moving_nodes: &[NodeId],
+    moving_vertices: &[(NodeId, u32)],
+    vp: Mat4,
+    size: [f32; 2],
+    kind: SnapKind,
+) -> Vec<SnapCandidate> {
     let mut out = Vec::new();
     let ids: Vec<NodeId> = scene
         .iter()
@@ -1101,14 +1142,86 @@ pub fn snap_candidates(
         let Ok(world) = scene.world_matrix(id) else { continue };
         let Ok(node) = scene.get(id) else { continue };
         let Some(mesh) = node.mesh() else { continue };
-        for (vi, p) in mesh.positions.iter().enumerate() {
-            let vi = vi as u32;
-            if moving_vertices.contains(&(id, vi)) {
-                continue;
+        let pushed = |out: &mut Vec<SnapCandidate>, world: Vec3, vertex: u32, segment: Option<SnapSegment>| {
+            let Some((sx, sy, depth)) = project(vp, world, size) else { return };
+            out.push(SnapCandidate {
+                node: id,
+                vertex,
+                world,
+                screen: [sx, sy],
+                depth,
+                kind,
+                segment,
+            });
+        };
+        let carried = |a: u32, b: u32| {
+            moving_vertices.contains(&(id, a)) || moving_vertices.contains(&(id, b))
+        };
+        match kind {
+            SnapKind::Vertex => {
+                for (vi, p) in mesh.positions.iter().enumerate() {
+                    let vi = vi as u32;
+                    if moving_vertices.contains(&(id, vi)) {
+                        continue;
+                    }
+                    pushed(&mut out, world.transform_point3(*p), vi, None);
+                }
             }
-            let wp = world.transform_point3(*p);
-            let Some((sx, sy, depth)) = project(vp, wp, size) else { continue };
-            out.push(SnapCandidate { node: id, vertex: vi, world: wp, screen: [sx, sy], depth });
+            SnapKind::Edge | SnapKind::Midpoint => {
+                for (ei, [a, b]) in mesh.edges().into_iter().enumerate() {
+                    if carried(a, b) {
+                        continue;
+                    }
+                    let wa = world.transform_point3(mesh.positions[a as usize]);
+                    let wb = world.transform_point3(mesh.positions[b as usize]);
+                    let mid = wa.lerp(wb, 0.5);
+                    if kind == SnapKind::Midpoint {
+                        pushed(&mut out, mid, ei as u32, None);
+                        continue;
+                    }
+                    // An edge candidate carries both projections so the
+                    // picker can land anywhere along it, not just its middle.
+                    if let (Some((ax, ay, da)), Some((bx, by, db))) =
+                        (project(vp, wa, size), project(vp, wb, size))
+                    {
+                        pushed(
+                            &mut out,
+                            mid,
+                            ei as u32,
+                            Some(SnapSegment {
+                                a_screen: [ax, ay],
+                                b_screen: [bx, by],
+                                a_world: wa,
+                                b_world: wb,
+                            }),
+                        );
+                        // The segment's own depth is the nearer end: the edge
+                        // cannot be occluded by something in front of both.
+                        if let Some(last) = out.last_mut() {
+                            last.depth = da.min(db);
+                        }
+                    }
+                }
+            }
+            SnapKind::Face => {
+                for (fi, face) in mesh.faces.iter().enumerate() {
+                    if face.corners.iter().any(|c| carried(c.position, c.position)) {
+                        continue;
+                    }
+                    let mut centre = Vec3::ZERO;
+                    let mut n = 0;
+                    for c in &face.corners {
+                        if let Some(p) = mesh.positions.get(c.position as usize) {
+                            centre += *p;
+                            n += 1;
+                        }
+                    }
+                    if n == 0 {
+                        continue;
+                    }
+                    pushed(&mut out, world.transform_point3(centre / n as f32), fi as u32, None);
+                }
+            }
         }
     }
     out
@@ -1123,9 +1236,40 @@ pub fn nearest_candidate(
 ) -> Option<SnapCandidate> {
     let mut best: Option<(f32, SnapCandidate)> = None;
     for c in candidates {
-        let dx = c.screen[0] - cursor[0];
-        let dy = c.screen[1] - cursor[1];
-        let dist = (dx * dx + dy * dy).sqrt();
+        // An edge resolves to the point on its projected segment nearest the
+        // cursor, and the returned world position is the same fraction along
+        // the edge. Other kinds resolve to their one projected point.
+        let (dist, world) = match c.segment {
+            Some(seg) => {
+                let ab = [
+                    seg.b_screen[0] - seg.a_screen[0],
+                    seg.b_screen[1] - seg.a_screen[1],
+                ];
+                let len2 = ab[0] * ab[0] + ab[1] * ab[1];
+                let t = if len2 <= 1e-9 {
+                    0.0
+                } else {
+                    (((cursor[0] - seg.a_screen[0]) * ab[0]
+                        + (cursor[1] - seg.a_screen[1]) * ab[1])
+                        / len2)
+                        .clamp(0.0, 1.0)
+                };
+                let point = [
+                    seg.a_screen[0] + ab[0] * t,
+                    seg.a_screen[1] + ab[1] * t,
+                ];
+                let distance = ((point[0] - cursor[0]).powi(2)
+                    + (point[1] - cursor[1]).powi(2))
+                .sqrt();
+                (distance, seg.a_world.lerp(seg.b_world, t))
+            }
+            None => {
+                let distance = ((c.screen[0] - cursor[0]).powi(2)
+                    + (c.screen[1] - cursor[1]).powi(2))
+                .sqrt();
+                (distance, c.world)
+            }
+        };
         if dist > radius {
             continue;
         }
@@ -1137,7 +1281,9 @@ pub fn nearest_candidate(
             }
         };
         if better {
-            best = Some((dist, *c));
+            let mut hit = *c;
+            hit.world = world;
+            best = Some((dist, hit));
         }
     }
     best.map(|(_, c)| c)
@@ -1655,6 +1801,8 @@ mod tests {
             world: Vec3::ZERO,
             screen: [100.0, 100.0],
             depth,
+            kind: SnapKind::Vertex,
+            segment: None,
         };
         let candidates = vec![on_the_pixel(NodeId(7), 3, 0.5), on_the_pixel(NodeId(9), 0, 0.2)];
         let hit = nearest_candidate(&candidates, [100.0, 100.0], 14.0).expect("both are on the cursor");
@@ -2532,6 +2680,84 @@ mod tests {
         assert_eq!(LayoutKind::Four.panes(), 4);
         let names: Vec<&str> = LayoutKind::ALL.iter().map(|l| l.label()).collect();
         assert_eq!(names, vec!["Layout 1", "Layout 2", "Layout 3"]);
+    }
+
+    #[test]
+    fn snap_candidates_kind_offers_edges_midpoints_and_face_centres() {
+        let mut scene = Scene::new();
+        let quad_id = scene.create_mesh("quad", quad(0.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z();
+
+        let edges = snap_candidates_kind(&mut scene, &[], &[], vp, size, SnapKind::Edge);
+        assert_eq!(edges.len(), 4, "a quad has four edges");
+        assert!(edges.iter().all(|c| c.node == quad_id && c.kind == SnapKind::Edge));
+        assert!(
+            edges.iter().all(|c| c.segment.is_some()),
+            "an edge carries both of its ends"
+        );
+
+        let mids = snap_candidates_kind(&mut scene, &[], &[], vp, size, SnapKind::Midpoint);
+        assert_eq!(mids.len(), 4);
+        assert!(mids.iter().all(|c| c.segment.is_none()));
+        // The four midpoint positions are (±1, 0) and (0, ±1) on the z=0 quad.
+        let midpoints: Vec<(f32, f32)> =
+            mids.iter().map(|c| (c.world.x, c.world.y)).collect();
+        assert!(midpoints.contains(&(0.0, -1.0)) && midpoints.contains(&(1.0, 0.0)));
+        assert!(midpoints.contains(&(0.0, 1.0)) && midpoints.contains(&(-1.0, 0.0)));
+
+        let faces = snap_candidates_kind(&mut scene, &[], &[], vp, size, SnapKind::Face);
+        assert_eq!(faces.len(), 1, "the quad is one face");
+        assert_eq!(faces[0].kind, SnapKind::Face);
+        assert!(
+            (faces[0].world - Vec3::ZERO).length() < 1e-5,
+            "the face centre is the quad's centre: {:?}",
+            faces[0].world
+        );
+    }
+
+    #[test]
+    fn snap_candidates_kind_excludes_the_geometry_being_dragged() {
+        let mut scene = Scene::new();
+        let a = scene.create_mesh("a", quad(0.0));
+        let size = [400.0, 400.0];
+        let vp = looking_down_z();
+        for kind in [SnapKind::Edge, SnapKind::Midpoint, SnapKind::Face] {
+            let moving = snap_candidates_kind(&mut scene, &[a], &[], vp, size, kind);
+            assert!(moving.is_empty(), "{kind:?} must not snap to the dragged node");
+        }
+    }
+
+    #[test]
+    fn the_nearest_edge_candidate_lands_on_the_closest_point_of_the_segment() {
+        let edge = SnapCandidate {
+            node: NodeId(1),
+            vertex: 0,
+            world: Vec3::ZERO,
+            screen: [200.0, 100.0],
+            depth: 0.5,
+            kind: SnapKind::Edge,
+            segment: Some(SnapSegment {
+                a_screen: [100.0, 100.0],
+                b_screen: [300.0, 100.0],
+                a_world: Vec3::new(-1.0, 0.0, 0.0),
+                b_world: Vec3::new(1.0, 0.0, 0.0),
+            }),
+        };
+        let middle = nearest_candidate(&[edge], [200.0, 100.0], 14.0).unwrap();
+        assert!((middle.world - Vec3::ZERO).length() < 1e-5, "{:?}", middle.world);
+        assert_eq!(middle.kind, SnapKind::Edge);
+
+        let near_end = nearest_candidate(&[edge], [110.0, 100.0], 14.0).unwrap();
+        assert!(
+            (near_end.world - Vec3::new(-0.9, 0.0, 0.0)).length() < 1e-4,
+            "{:?}",
+            near_end.world
+        );
+        assert!(
+            nearest_candidate(&[edge], [400.0, 100.0], 14.0).is_none(),
+            "past the end of the segment the distance is to the endpoint"
+        );
     }
 
 }

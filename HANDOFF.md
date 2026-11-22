@@ -397,9 +397,9 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **785 tests pass** (782 `#[test]`
+workspace builds with **0 warnings**, **792 tests pass** (789 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Fifty-one work-streams are done — the engine layer from the **wgpu
+Fifty-two work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
 through **gizmo axes modes and a placed pivot** (#39), **boolean CSG that
@@ -417,6 +417,14 @@ plus a progress report:
   because parity has no machine-checkable definition. Run it after every
   work-stream and re-score the area you touched.
 
+- **Geometry snapping: edges, edge midpoints and face centres (#52).**
+  `SnapMode` grew Edge / Midpoint / Face alongside Off / Grid / Vertex, cycled
+  by `G` and offered in the toolbar. `viewport::snap_candidates_kind` builds
+  candidates for the visible, unfrozen geometry minus what the drag carries;
+  an edge candidate keeps both projected ends so `nearest_candidate` resolves
+  the closest point along the segment (and the matching world point) rather
+  than only its middle. Every geometry mode lands a Move on its target, leaves
+  Rotate/Scale alone, and is turned off by the Ctrl invert modifier.
 - **Normals across cuts, split and shave (#51).** `Polygon` now carries each
   vertex's authored shading normal beside its UV; `split_polygon`, the T-junction
   pass and the inverse tree interpolate it wherever a cut crosses an edge, and
@@ -2420,13 +2428,13 @@ Prioritized next steps:
    pivot** landed in #39 — so the handles can point the way an object is turned
    or the way the screen sits, and a turn or a scale works about a point the
    user puts. Snapping landed in #10 but is deliberately partial:
-   only the gizmo's handles snap (the free-form view-plane drag does not) and
-   only the grid and *vertices* are targets — ZModeler also snaps to edges,
-   faces and midpoints, and its snapping works
-   during free drags too (the *screen-plane* grid now steps along the screen's
-   own axes when the Screen mode is on, #39). Soft selection and a numeric
-   readout of a drag's own measure while the pointer moves are the other honest
-   gaps. (Sub-object pivots are done: a
+   only the gizmo's handles snap (the free-form view-plane drag does not);
+   ZModeler's snapping works during free drags too — that is still missing.
+   The *screen-plane* grid steps along the screen's own axes when Screen mode
+   is on (#39). Soft selection and a numeric readout of a drag's own measure
+   while the pointer moves are the other honest gaps. Snapping itself now
+   covers vertices, edges, edge midpoints and face centres (#52), all reached
+   from the toolbar or the `G` cycle. (Sub-object pivots are done: a
    vertex/face-level drag moves only its own geometry, via `gizmo::Targets` +
    `viewport::element_centroid`.)
 4. **Deepen the UV editor.** The texture background (#11), island selection

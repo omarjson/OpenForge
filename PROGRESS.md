@@ -27,7 +27,7 @@ APPLICATION SURFACE
 
   OVERALL (unweighted mean of 16 areas)                ███████████████░░░░░  78%
 
-Measured from the repo: 13 crates · 782 test fns · 46,828 lines of Rust
+Measured from the repo: 13 crates · 789 test fns · 47,193 lines of Rust
 Exact mean of the curated area scores: 78.8% (sum 1262 over 16 areas)
 The per-area scores are curated estimates; only the counts above are measured.
 ```
