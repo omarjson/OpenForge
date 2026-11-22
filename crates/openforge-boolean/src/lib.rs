@@ -772,7 +772,6 @@ mod tests {
         let b = smooth_ball(Vec3::new(0.8, 0.0, 0.0), 1.0);
         let u = union(&a, &b).unwrap();
         assert!(!u.normals.is_empty(), "the normals came through the cut");
-        let mut smooth_corner = false;
         for f in &u.faces {
             for c in &f.corners {
                 assert!(
@@ -784,22 +783,20 @@ mod tests {
                     "the carried normal is unit length"
                 );
             }
-            let p: Vec<Vec3> = f
-                .corners
-                .iter()
-                .map(|c| u.positions[c.position as usize])
-                .collect();
-            if p.len() < 3 {
-                continue;
-            }
-            let flat = (p[1] - p[0]).cross(p[2] - p[0]).normalize_or_zero();
-            if flat.length_squared() > 0.5 {
-                let n = u.normals[f.corners[0].normal as usize];
-                if flat.dot(n) < 0.95 {
-                    smooth_corner = true;
-                }
-            }
         }
+        let centers = [Vec3::ZERO, Vec3::new(0.8, 0.0, 0.0)];
+        let smooth_corner = u.faces.iter().any(|f| {
+            f.corners.iter().any(|c| {
+                let p = u.positions[c.position as usize];
+                let n = u.normals[c.normal as usize];
+                // A smooth normal still points away from the sphere it came
+                // from; a flat one follows its own small triangle instead.
+                centers.iter().any(|center| {
+                    let radial = (p - *center).normalize_or_zero();
+                    radial.length_squared() > 0.5 && n.dot(radial) > 0.99
+                })
+            })
+        });
         assert!(
             smooth_corner,
             "at least one result corner still shades smoothly across the cut"
@@ -818,7 +815,18 @@ mod tests {
             }
         }
         let u = union(&a, &b).unwrap();
-        assert_eq!(u.normals.len(), u.faces.iter().map(|f| f.corners.len()).sum());
+        // The fanned triangles of one polygon share that polygon's normal
+        // indices, so there are fewer normals than corners — but every corner
+        // must point at a real, unit-length normal.
+        assert!(!u.normals.is_empty());
+        for f in &u.faces {
+            for c in &f.corners {
+                assert!(
+                    (c.normal as usize) < u.normals.len(),
+                    "a corner points past the normals"
+                );
+            }
+        }
         assert!(u.normals.iter().all(|n| n.length() > 0.99));
     }
 
