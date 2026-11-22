@@ -164,6 +164,26 @@ struct IslandPack {
 /// Returns the number of islands; `grid == 0` and meshes without faces change
 /// nothing and return `0`.
 pub(crate) fn uv_pack_islands(mesh: &mut Mesh, grid: u32, margin: f32) -> usize {
+    uv_pack_islands_inner(mesh, grid, margin, false)
+}
+
+/// [`uv_pack_islands`] with one shared scale for every island, so their
+/// *relative* sizes survive the pack: a small island stays small next to a
+/// large one instead of both filling their cells.
+pub(crate) fn uv_pack_islands_preserving_scale(
+    mesh: &mut Mesh,
+    grid: u32,
+    margin: f32,
+) -> usize {
+    uv_pack_islands_inner(mesh, grid, margin, true)
+}
+
+fn uv_pack_islands_inner(
+    mesh: &mut Mesh,
+    grid: u32,
+    margin: f32,
+    preserve_scale: bool,
+) -> usize {
     if grid == 0 || mesh.faces.is_empty() {
         return 0;
     }
@@ -183,6 +203,7 @@ pub(crate) fn uv_pack_islands(mesh: &mut Mesh, grid: u32, margin: f32) -> usize 
     let mut claimed = vec![false; mesh.uvs.len()];
     let total_cells = (grid as u64).saturating_mul(grid as u64);
     let mut packs: Vec<IslandPack> = Vec::with_capacity(islands.len());
+    let mut fits: Vec<f32> = Vec::with_capacity(islands.len());
     for (island, faces) in islands.iter().enumerate() {
         let mut entries: Vec<u32> = Vec::new();
         let (mut min, mut max) = (Vec2::ZERO, Vec2::ZERO);
@@ -225,6 +246,22 @@ pub(crate) fn uv_pack_islands(mesh: &mut Mesh, grid: u32, margin: f32) -> usize 
             (Vec2::ZERO, 1.0)
         };
         packs.push(IslandPack { entries, pack: Pack { center, scale, cell_center } });
+        fits.push(scale);
+    }
+
+    // A scale-preserving pack uses the tightest fit across all islands, so
+    // none overflows its cell and the island-size ratio is unchanged. The
+    // default pack keeps each island's own fit, filling its cell exactly.
+    if preserve_scale {
+        let common = fits
+            .iter()
+            .copied()
+            .filter(|f| f.is_finite() && *f > 0.0)
+            .fold(f32::INFINITY, f32::min);
+        let common = if common.is_finite() && common > 0.0 { common } else { 1.0 };
+        for pack in &mut packs {
+            pack.pack.scale = common;
+        }
     }
 
     // Phase 2 (apply): move each island's owned entries into its cell, every
@@ -587,5 +624,68 @@ mod tests {
         for uv in &m.uvs {
             assert!(uv.is_finite(), "non-finite uv after packing: {uv:?}");
         }
+    }
+
+    // --- scale-aware packing ---------------------------------------------------
+
+    /// Two separate islands: a unit square and a square twice as wide.
+    fn two_scaled_islands() -> Mesh {
+        let mut m = two_disjoint_quads();
+        // `add_face` gives every corner uv 0; hand each face its own four
+        // entries so the two squares are genuinely separate UV islands.
+        m.uvs.clear();
+        for (fi, scale) in [(0usize, 1.0f32), (1, 2.0)] {
+            let base = m.uvs.len() as u32;
+            for (i, corner) in m.faces[fi].corners.iter_mut().enumerate() {
+                corner.uv = base + i as u32;
+            }
+            for (u, v) in [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)] {
+                m.uvs.push(Vec2::new(u * scale, v * scale));
+            }
+        }
+        m
+    }
+
+    fn uv_width(m: &Mesh, face: usize) -> f32 {
+        let u: Vec<f32> = m.faces[face]
+            .corners
+            .iter()
+            .map(|c| m.uvs[c.uv as usize].x)
+            .collect();
+        u.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+            - u.iter().copied().fold(f32::INFINITY, f32::min)
+    }
+
+    #[test]
+    fn default_pack_blows_each_island_up_to_its_cell() {
+        let mut m = two_scaled_islands();
+        assert_eq!(uv_pack_islands(&mut m, 2, 0.0), 2);
+        let (small, large) = (uv_width(&m, 0), uv_width(&m, 1));
+        assert!(
+            (small - large).abs() < 1e-4,
+            "both fill their cell: {small} vs {large}"
+        );
+    }
+
+    #[test]
+    fn scale_preserving_pack_keeps_the_island_size_ratio() {
+        let mut m = two_scaled_islands();
+        assert_eq!(uv_pack_islands_preserving_scale(&mut m, 2, 0.0), 2);
+        let (small, large) = (uv_width(&m, 0), uv_width(&m, 1));
+        assert!(
+            (large - 2.0 * small).abs() < 1e-4,
+            "the large island stays twice the small one: {small} vs {large}"
+        );
+        assert!(large <= 0.5 + 1e-5, "and still fits its cell: {large}");
+        assert_uv_indices_valid(&m);
+    }
+
+    #[test]
+    fn scale_preserving_pack_handles_empty_and_zero_grid() {
+        let mut m = two_scaled_islands();
+        assert_eq!(uv_pack_islands_preserving_scale(&mut m, 0, 0.0), 0);
+        assert_eq!(uv_width(&m, 0), 1.0, "a zero grid changes nothing");
+        let mut empty = Mesh::new();
+        assert_eq!(uv_pack_islands_preserving_scale(&mut empty, 2, 0.0), 0);
     }
 }

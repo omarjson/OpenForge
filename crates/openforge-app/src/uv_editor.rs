@@ -234,6 +234,9 @@ pub struct UvEditor {
     pub band: Option<(egui::Pos2, egui::Pos2)>,
     /// Grid size used by the Pack button.
     pub grid: u32,
+    /// Whether Pack Islands keeps the islands' relative sizes instead of
+    /// blowing each one up to fill its cell.
+    pub preserve_scale: bool,
     /// Scale factor applied to the selection by the transform button.
     pub scale: f32,
     /// Rotation in degrees applied to the selection by the transform button.
@@ -251,6 +254,7 @@ impl Default for UvEditor {
             drag: None,
             band: None,
             grid: 2,
+            preserve_scale: false,
             scale: 1.0,
             rotate_deg: 0.0,
             snap: false,

@@ -166,6 +166,10 @@ pub trait UvOps {
     /// change nothing and return `0`.
     fn uv_pack_islands(&mut self, grid: u32, margin: f32) -> usize;
 
+    /// [`uv_pack_islands`](Self::uv_pack_islands) with one shared scale across
+    /// all islands, so their relative sizes survive the pack.
+    fn uv_pack_islands_preserving_scale(&mut self, grid: u32, margin: f32) -> usize;
+
     /// Bounding box of all UV entries, or `None` when there are no finite
     /// entries (e.g. an empty mesh).
     fn uv_bounds(&self) -> Option<UvBounds>;
@@ -281,6 +285,10 @@ impl UvOps for Mesh {
 
     fn uv_pack_islands(&mut self, grid: u32, margin: f32) -> usize {
         islands::uv_pack_islands(self, grid, margin)
+    }
+
+    fn uv_pack_islands_preserving_scale(&mut self, grid: u32, margin: f32) -> usize {
+        islands::uv_pack_islands_preserving_scale(self, grid, margin)
     }
 
     fn uv_bounds(&self) -> Option<UvBounds> {

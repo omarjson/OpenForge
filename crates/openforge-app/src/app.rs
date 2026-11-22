@@ -7205,10 +7205,20 @@ impl OpenForgeApp {
                 .clicked()
             {
                 let grid = self.uv.grid.max(1);
+                let preserve = self.uv.preserve_scale;
                 self.uv_apply(id, "UV Pack Islands", move |m| {
-                    m.uv_pack_islands(grid, uv_editor::ISLAND_MARGIN);
+                    if preserve {
+                        m.uv_pack_islands_preserving_scale(grid, uv_editor::ISLAND_MARGIN);
+                    } else {
+                        m.uv_pack_islands(grid, uv_editor::ISLAND_MARGIN);
+                    }
                 });
             }
+            ui.checkbox(
+                &mut self.uv.preserve_scale,
+                "Keep island sizes relative",
+            )
+            .on_hover_text("Use one shared scale, so a small island stays small next to a large one");
             ui.separator();
             let can_transform = selected > 0;
             ui.add_enabled(

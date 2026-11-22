@@ -50,7 +50,7 @@ Rigging & skinning|79|Engine
 UV math (project, unwrap, pack, edits)|87|Engine
 GPU viewport (depth, shading, grid, gizmo, multi-view)|95|UI
 Viewport editing UX (gizmos, axes modes, pivot, orthographic views, multi-view, wireframe, outlines, picking)|100|UI
-UV editor UI|74|UI
+UV editor UI|76|UI
 Panels & dialogs (outliner, properties, toolbars, Preferences, recents, find/replace, unsaved guard, workspace memory)|78|UI
 Import/export UX|78|UI
 Plugin / service host|64|UI

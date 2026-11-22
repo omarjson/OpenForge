@@ -397,9 +397,9 @@ export PATH="$HOME/bin:$PATH"          # gh CLI (v2.102.0), already authed as om
 ## 7. Current state & what's next
 
 **State:** every commit since baseline `2a201c8` is landed on `main`. Full
-workspace builds with **0 warnings**, **795 tests pass** (792 `#[test]`
+workspace builds with **0 warnings**, **798 tests pass** (795 `#[test]`
 functions plus 3 doc-tests, 2 more ignored), CI green on all 3 platforms.
-Fifty-three work-streams are done — the engine layer from the **wgpu
+Fifty-four work-streams are done — the engine layer from the **wgpu
 viewport** (#1) through **textures end to end** (#11), then the application
 surface from **sub-object picking that matches the drawn frame** (#12)
 through **gizmo axes modes and a placed pivot** (#39), **boolean CSG that
@@ -417,6 +417,11 @@ plus a progress report:
   because parity has no machine-checkable definition. Run it after every
   work-stream and re-score the area you touched.
 
+- **Scale-aware island packing (#54).** `uv_pack_islands_preserving_scale`
+  uses one shared scale — the tightest fit over all islands — so a small
+  island stays small next to a large one instead of both being blown up to
+  fill their cells. The UV panel offers it as a "Keep island sizes relative"
+  checkbox beside Pack Islands; the default packer is unchanged.
 - **Free-drag snapping (#53).** `Pointer` now carries an optional `FreeSnap`
   (grid / angle / factor steps), which the app fills from the resolved Grid
   settings — including the Ctrl invert modifier — for view-plane drags that
@@ -2448,9 +2453,9 @@ Prioritized next steps:
    plus per-island packing (#12), the island-scale tools — weld, split, mirror,
    grid snap (#23) — and the live link between the canvas and the 3D view's
    face selection (#42, with a per-face material assignable from the canvas)
-   landed; still missing: a real **unwrap** (the project's unwrap is a plain
-   projection), packing that respects a chosen scale, and baking a texture
-   into the layout.
+   landed, and packing can now either fill each cell or keep the islands'
+   relative sizes (#54); still missing: a real **unwrap** (the project's
+   unwrap is a plain projection), and baking a texture into the layout.
 5. **Deepen the plugin host.** The host is in, the app goes through it and the
    toolbar and hotkeys now walk the tool registry (#26), but two pieces are
    still hard-wired: a `Service` carries a name and a description rather than
