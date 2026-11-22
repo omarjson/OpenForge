@@ -11,6 +11,21 @@ use crate::selection::{SelectLevel, Selection};
 use crate::NodeId;
 use glam::Vec3;
 
+/// Step sizes for snapping a *free-form* (non-gizmo) transform drag.
+///
+/// The gizmo snaps through `openforge-app`'s grid/geometry machinery; a plain
+/// view-plane drag never reaches that machinery, so the app hands these steps
+/// to the tool with the pointer. `None` means the drag stays free.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct FreeSnap {
+    /// World units between translation values.
+    pub grid: f32,
+    /// Radians between rotation values.
+    pub angle: f32,
+    /// Multiples between scale factors.
+    pub factor: f32,
+}
+
 /// A 3D manipulation mode.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum TransformMode {
@@ -27,6 +42,8 @@ pub struct Pointer {
     pub ray: Ray,
     /// Normalized viewport position (0..1) for UI affordances.
     pub ndc: glam::Vec2,
+    /// Step sizes when this drag should snap, `None` for a free drag.
+    pub snap: Option<FreeSnap>,
 }
 
 /// The result of applying a tool operation to the scene.
@@ -154,20 +171,35 @@ impl Tool for TransformTool {
     fn on_pointer_move(&mut self, ctx: &mut ToolContext<'_>, p: &Pointer) {
         let Some(drag) = ctx.drag.clone() else { return };
         let delta = projected_delta(&drag, p.ray);
-        // Reset each node to its drag-start transform, then apply the delta.
+        // A free drag never sees the gizmo's snap machinery, so the pointer
+        // carries the steps here. Snapping lands the *destination* on a step,
+        // not the distance travelled, matching the gizmo's grid mode.
+        let snap = p.snap.filter(|s| {
+            s.grid.is_finite() && s.angle.is_finite() && s.factor.is_finite()
+        });
         for (id, start) in &drag.start_transforms {
             let Ok(node) = ctx.scene.get_mut(*id) else { continue };
             node.transform = *start;
             match drag.mode {
                 TransformMode::Move => {
-                    node.transform.translation += delta;
+                    let mut target = start.translation + delta;
+                    if let Some(s) = snap {
+                        target = snap_vec(target, s.grid);
+                    }
+                    node.transform.translation = target;
                 }
                 TransformMode::Scale => {
-                    let s = 1.0 + delta.dot(drag.axis);
-                    node.transform.scale *= s.max(0.01);
+                    let mut factor = 1.0 + delta.dot(drag.axis);
+                    if let Some(s) = snap {
+                        factor = snap_scalar(factor, s.factor).max(s.factor.max(1e-3));
+                    }
+                    node.transform.scale *= factor.max(0.01);
                 }
                 TransformMode::Rotate => {
-                    let angle = delta.dot(perpendicular(drag.axis));
+                    let mut angle = delta.dot(perpendicular(drag.axis));
+                    if let Some(s) = snap {
+                        angle = snap_scalar(angle, s.angle);
+                    }
                     node.transform.rotation =
                         glam::Quat::from_axis_angle(drag.axis.normalize_or_zero(), angle)
                             * start.rotation;
@@ -242,6 +274,25 @@ fn perpendicular(v: Vec3) -> Vec3 {
     n.cross(other).normalize_or_zero()
 }
 
+/// The multiple of `step` nearest `value`, or `value` for a step that cannot
+/// snap. Shared by the free-drag transform modes so all three agree on what a
+/// "step" means.
+fn snap_scalar(value: f32, step: f32) -> f32 {
+    if !(step > 0.0) || !value.is_finite() {
+        return value;
+    }
+    (value / step).round() * step
+}
+
+/// [`snap_scalar`] on each component of a world position.
+fn snap_vec(value: Vec3, step: f32) -> Vec3 {
+    Vec3::new(
+        snap_scalar(value.x, step),
+        snap_scalar(value.y, step),
+        snap_scalar(value.z, step),
+    )
+}
+
 fn projected_delta(drag: &DragState, ray: Ray) -> Vec3 {
     // Intersect the ray with a plane through the start point facing the camera-ish.
     let n = drag.axis.cross(Vec3::Y).cross(drag.axis).normalize_or_zero();
@@ -291,5 +342,117 @@ mod tests {
         scene.create_mesh("tri", cube);
         let ray = Ray { origin: Vec3::new(50.0, 50.0, 5.0), direction: Vec3::new(0.0, 0.0, -1.0) };
         assert_eq!(pick_node(&mut scene, ray), None);
+    }
+
+    // --- free-drag snapping ----------------------------------------------------
+
+    fn one_node(at: Vec3) -> (Scene, crate::NodeId) {
+        let mut scene = Scene::new();
+        let mut quad = Mesh::new();
+        quad.add_vertex(Vec3::ZERO);
+        quad.add_vertex(Vec3::X);
+        quad.add_vertex(Vec3::X + Vec3::Y);
+        quad.add_face(&[0, 1, 2]);
+        let id = scene.create_mesh("node", quad);
+        scene.get_mut(id).unwrap().transform.translation = at;
+        (scene, id)
+    }
+
+    fn pointer(origin: Vec3, snap: Option<FreeSnap>) -> Pointer {
+        Pointer {
+            ray: Ray { origin, direction: Vec3::NEG_Z },
+            ndc: glam::Vec2::ZERO,
+            snap,
+        }
+    }
+
+    #[test]
+    fn a_free_move_can_land_its_destination_on_the_grid() {
+        let start = Vec3::new(0.1, 0.2, 0.3);
+        let step = FreeSnap { grid: 0.25, angle: 0.1, factor: 0.1 };
+        let (mut free, id) = one_node(start);
+        let (mut snapped, _) = one_node(start);
+        let drag = DragState {
+            mode: TransformMode::Move,
+            start_point: start,
+            start_transforms: vec![(id, free.get(id).unwrap().transform)],
+            axis: Vec3::X,
+        };
+        // The ray meets the drag plane at the origin, so the unsnapped
+        // destination is (0, 0.2, 0): only y is off a quarter-unit step.
+        let at = pointer(Vec3::new(0.0, start.y, 5.0), None);
+        let mut tool = TransformTool::new(TransformMode::Move);
+        let mut ctx = ToolContext {
+            scene: &mut free,
+            selection: &mut Selection::new(),
+            drag: Some(drag.clone()),
+        };
+        tool.on_pointer_move(&mut ctx, &at);
+        assert!((free.get(id).unwrap().transform.translation.y - 0.2).abs() < 1e-6);
+
+        let at = pointer(Vec3::new(0.0, start.y, 5.0), Some(step));
+        let mut ctx = ToolContext {
+            scene: &mut snapped,
+            selection: &mut Selection::new(),
+            drag: Some(drag),
+        };
+        tool.on_pointer_move(&mut ctx, &at);
+        assert!(
+            (snapped.get(id).unwrap().transform.translation.y - 0.25).abs() < 1e-6,
+            "the destination lands on the next grid step: {:?}",
+            snapped.get(id).unwrap().transform.translation
+        );
+    }
+
+    #[test]
+    fn a_free_scale_snaps_its_factor_and_never_collapses_it() {
+        let step = FreeSnap { grid: 0.25, angle: 0.1, factor: 0.1 };
+        let (mut scene, id) = one_node(Vec3::ZERO);
+        let drag = DragState {
+            mode: TransformMode::Scale,
+            start_point: Vec3::ZERO,
+            start_transforms: vec![(id, scene.get(id).unwrap().transform)],
+            axis: Vec3::X,
+        };
+        // delta.x = 0.37, so the factor is 1.37 and snaps to 1.4.
+        let at = pointer(Vec3::new(0.37, 0.0, 5.0), Some(step));
+        let mut tool = TransformTool::new(TransformMode::Scale);
+        let mut ctx = ToolContext {
+            scene: &mut scene,
+            selection: &mut Selection::new(),
+            drag: Some(drag),
+        };
+        tool.on_pointer_move(&mut ctx, &at);
+        let scale = scene.get(id).unwrap().transform.scale;
+        assert!((scale.x - 1.4).abs() < 1e-5, "factor {scale}");
+        assert_eq!(scale.y, 1.0, "only the dragged axis scales");
+    }
+
+    #[test]
+    fn a_free_rotation_snaps_its_angle() {
+        let step = FreeSnap { grid: 0.25, angle: 0.1, factor: 0.1 };
+        let (mut scene, id) = one_node(Vec3::ZERO);
+        let drag = DragState {
+            mode: TransformMode::Rotate,
+            start_point: Vec3::ZERO,
+            start_transforms: vec![(id, scene.get(id).unwrap().transform)],
+            axis: Vec3::Z,
+        };
+        // With axis Z the drag plane is y = 0; a ray at y = 0.23 gives an
+        // angle of 0.23 radians about Y, which snaps to 0.2.
+        let at = pointer(Vec3::new(0.0, 0.23, 5.0), Some(step));
+        let mut tool = TransformTool::new(TransformMode::Rotate);
+        let mut ctx = ToolContext {
+            scene: &mut scene,
+            selection: &mut Selection::new(),
+            drag: Some(drag),
+        };
+        tool.on_pointer_move(&mut ctx, &at);
+        let got = scene.get(id).unwrap().transform.rotation;
+        let expected = glam::Quat::from_axis_angle(Vec3::Y, 0.2);
+        assert!(
+            (got.x - expected.x).abs() < 1e-5 && (got.w - expected.w).abs() < 1e-5,
+            "rotation {got:?} vs {expected:?}"
+        );
     }
 }

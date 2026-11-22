@@ -126,6 +126,20 @@ impl Snap {
         };
         Self { mode, ..self }
     }
+
+    /// Steps for a free-form (non-gizmo) drag. Grid mode is the only one that
+    /// can snap a view-plane drag; geometry modes need a candidate under the
+    /// cursor, which only the gizmo's target resolution supplies.
+    pub fn free_snap(self) -> Option<openforge_core::tool::FreeSnap> {
+        if self.mode != SnapMode::Grid {
+            return None;
+        }
+        Some(openforge_core::tool::FreeSnap {
+            grid: self.grid.max(1e-3),
+            angle: self.angle.max(1e-6),
+            factor: self.factor.max(1e-3),
+        })
+    }
 }
 
 /// The multiple of `step` nearest to `value`, or `value` untouched when `step`

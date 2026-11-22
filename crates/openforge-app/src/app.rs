@@ -3021,6 +3021,14 @@ impl OpenForgeApp {
         let mut gizmo_undo: Option<(String, Scene)> = None;
         // What a live snapped drag reports in the status bar, if anything.
         let mut snap_readout: Option<String> = None;
+        // Snapping is resolved per frame, so a held modifier takes effect the
+        // moment it goes down or comes up, mid-drag. Both the gizmo and the
+        // free-form tool drag below read the same resolved settings.
+        let snap_now = if ui.input(|i| i.modifiers.ctrl) {
+            self.snap.inverted()
+        } else {
+            self.snap
+        };
         // A snap marker only lives for the drag that shows it.
         if !self.gizmo.is_dragging() {
             self.snap_marker = None;
@@ -3029,13 +3037,7 @@ impl OpenForgeApp {
             consumed = true;
             if let Some(pos) = cursor {
                 let ray = Self::pick_ray(self.camera(), pos, rect, aspect);
-                // Snapping is resolved per frame, so a held modifier takes
-                // effect the moment it goes down or comes up, mid-drag.
-                let snap = if ui.input(|i| i.modifiers.ctrl) {
-                    self.snap.inverted()
-                } else {
-                    self.snap
-                };
+                let snap = snap_now;
                 let target = self.snap_target(pos, rect, vp, snap.mode);
                 self.snap_marker = target.map(|c| rect.min + egui::vec2(c.screen[0], c.screen[1]));
                 if self.gizmo.apply(&mut self.scene, ray, snap, target.map(|c| c.world)) {
@@ -3142,7 +3144,11 @@ impl OpenForgeApp {
             let ndc = Self::viewport_ndc(pos, rect);
             let camera = self.cameras[self.active_pane].clone();
             let ray = Self::pick_ray(&camera, pos, rect, aspect);
-            let pointer = Pointer { ray, ndc };
+            let pointer = Pointer {
+                ray,
+                ndc,
+                snap: snap_now.free_snap(),
+            };
 
             // Rectangle selection: in the Select tool a primary drag draws a
             // marquee instead of reaching the tool, which only reacts to
