@@ -425,7 +425,9 @@ mod tests {
         tool.on_pointer_move(&mut ctx, &at);
         let scale = scene.get(id).unwrap().transform.scale;
         assert!((scale.x - 1.4).abs() < 1e-5, "factor {scale}");
-        assert_eq!(scale.y, 1.0, "only the dragged axis scales");
+        // A free scale is uniform: the axis decides the measure, the factor
+        // scales the whole node (the existing TransformTool contract).
+        assert!((scale.y - 1.4).abs() < 1e-5 && (scale.z - 1.4).abs() < 1e-5);
     }
 
     #[test]
